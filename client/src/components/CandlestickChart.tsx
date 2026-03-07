@@ -7,6 +7,7 @@ import {
   type ISeriesApi,
   type CandlestickData,
   type HistogramData,
+  type WhitespaceData,
   ColorType,
 } from "lightweight-charts";
 
@@ -169,52 +170,63 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       const sorted = [...candles].sort((a, b) => a.time - b.time);
       const hasETHData = sorted.some((c) => c.rth === true || c.rth === false);
 
-      const candleData: CandlestickData[] = sorted.map((c) => {
-        const isUp = c.close >= c.open;
+      function getUTCDate(ts: number): string {
+        const d = new Date(ts * 1000);
+        return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+      }
 
-        // If ETH data is flagged, color ETH candles differently
+      function mapCandle(c: CandleBar): CandlestickData {
+        const isUp = c.close >= c.open;
         if (hasETHData && c.rth === false) {
-          const color = isUp ? ETH_UP : ETH_DOWN;
-          const wick = isUp ? ETH_UP_WICK : ETH_DOWN_WICK;
           return {
             time: c.time as any,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-            color,
-            wickColor: wick,
+            open: c.open, high: c.high, low: c.low, close: c.close,
+            color: isUp ? ETH_UP : ETH_DOWN,
+            wickColor: isUp ? ETH_UP_WICK : ETH_DOWN_WICK,
           };
         }
+        return { time: c.time as any, open: c.open, high: c.high, low: c.low, close: c.close };
+      }
 
-        return {
-          time: c.time as any,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-        };
-      });
+      const candleData: (CandlestickData | WhitespaceData)[] = [];
+      const volData: (HistogramData | WhitespaceData)[] = [];
+
+      const GAP_COUNT = 3;
+
+      for (let i = 0; i < sorted.length; i++) {
+        const c = sorted[i];
+
+        if (i > 0) {
+          const prevDate = getUTCDate(sorted[i - 1].time);
+          const curDate = getUTCDate(c.time);
+          if (prevDate !== curDate) {
+            const prevTime = sorted[i - 1].time;
+            const nextTime = c.time;
+            const step = Math.floor((nextTime - prevTime) / (GAP_COUNT + 1));
+            for (let g = 1; g <= GAP_COUNT; g++) {
+              const gapTime = (prevTime + step * g) as any;
+              candleData.push({ time: gapTime });
+              volData.push({ time: gapTime });
+            }
+          }
+        }
+
+        candleData.push(mapCandle(c));
+
+        const isUp = c.close >= c.open;
+        const isETH = hasETHData && c.rth === false;
+        let color: string;
+        if (isETH) {
+          color = isUp ? "rgba(134,239,172,0.3)" : "rgba(252,165,165,0.3)";
+        } else {
+          color = isUp ? "rgba(34,197,94,0.4)" : "rgba(239,68,68,0.4)";
+        }
+        volData.push({ time: c.time as any, value: c.volume ?? 0, color });
+      }
 
       candleSeriesRef.current.setData(candleData);
-
       if (volumeSeriesRef.current) {
-        const volData: HistogramData[] = sorted.map((c) => {
-          const isUp = c.close >= c.open;
-          const isETH = hasETHData && c.rth === false;
-          let color: string;
-          if (isETH) {
-            color = isUp ? "rgba(134,239,172,0.3)" : "rgba(252,165,165,0.3)";
-          } else {
-            color = isUp ? "rgba(34,197,94,0.4)" : "rgba(239,68,68,0.4)";
-          }
-          return {
-            time: c.time as any,
-            value: c.volume ?? 0,
-            color,
-          };
-        });
-        volumeSeriesRef.current.setData(volData);
+        volumeSeriesRef.current.setData(volData as HistogramData[]);
       }
 
       chartRef.current.timeScale().fitContent();

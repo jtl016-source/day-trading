@@ -1,0 +1,119 @@
+Build an algorithm that plots Milk's Yellow Box strategy for each trading day using historical OHLC market data.
+
+IMPORTANT LOGIC:
+1. Do NOT use one fixed yellow box or one fixed resistance/support zone for all days.
+2. Recalculate a new yellow box and new resistance/support zones for EACH trading day.
+3. The Yellow Box center is the current day's OPENING PRICE (where the market starts).
+4. The strategy must be percentage-based, not raw-price based. Price is only used to derive the percentage difference.
+5. Apply this logic across all historical days in the dataset.
+
+DEFINITIONS:
+For each trading day D:
+- opening_price = open of day D (the market's opening price = where it starts today)
+- prev_open = open of day D-1 (the previous day's opening price = previous Yellow Box center)
+
+YELLOW BOX:
+- The yellow box center = current day's opening price (where the market starts today)
+- The market opens at the previous day's close, so the opening price IS the previous close
+- The yellow box WIDTH is determined by the average candle range (High - Low) over the last 14 trading days
+- yellow_top = yellow_box + (avg_range / 2)
+- yellow_bottom = yellow_box - (avg_range / 2)
+
+PERCENT DIFFERENCE FORMULA (raw_diff):
+- raw_diff = abs(opening_price - prev_open) / opening_price
+- This measures how far today's opening price moved from the previous day's Yellow Box center
+- A minimum floor of 0.001 (0.1%) is applied when the difference is near zero
+
+RESISTANCE AND SUPPORT ZONES:
+The R/S zones START at a percentage distance AWAY from the Yellow Box edges (not from the center):
+- pct_distance = raw_diff * yellow_box (convert percentage to price distance)
+- R zone starts at: yellow_top + pct_distance
+- S zone starts at: yellow_bottom - pct_distance
+- Zone thickness = pct_distance * zone_thickness_fraction (default 0.3)
+- resistance_top = R_start + zone_thickness
+- resistance_bot = R_start
+- support_top = S_start
+- support_bot = S_start - zone_thickness
+
+HISTORICAL APPLICATION:
+Loop through historical data row by row:
+- Start from the THIRD trading day (need current open and previous open)
+- For each day, use:
+  - current day's open (opening price)
+  - previous day's open (prev_open)
+  - average candle range over last 14 days
+- Calculate:
+  - yellow_box center, top, bottom
+  - raw_diff
+  - resistance zone (top, bottom, level)
+  - support zone (top, bottom, level)
+- Store these values in new columns
+
+OUTPUT COLUMNS:
+For each day, create:
+- opening_price
+- prev_open
+- yellow_box (= opening_price)
+- raw_diff
+- avg_range (average H-L over lookback)
+- yellow_top, yellow_bottom
+- resistance_level, resistance_top, resistance_bot
+- support_level, support_top, support_bot
+
+CHARTING REQUIREMENTS:
+1. Plot candlesticks for the underlying market data.
+2. Plot a separate yellow box rectangle for each trading day.
+3. Plot separate support and resistance zone rectangles for each trading day.
+4. Do not reuse prior zones on future days without recalculating.
+5. POC = Yellow Box center = opening price (purple dash-dot line).
+6. Charts are color-coded only (no text labels on shapes):
+   - Yellow/olive = Yellow Box
+   - Red = Resistance zone
+   - Green = Support zone
+   - Purple dash-dot = POC line
+
+IMPLEMENTATION NOTES:
+- Use historical OHLC data from Yahoo Finance (yfinance).
+- Handle missing days safely.
+- Skip the first two rows because they lack sufficient prior data.
+- Make the calculation modular so parameters can be adjusted:
+  - avg_range lookback (default 14)
+  - zone thickness fraction (default 0.3)
+  - min raw_diff floor (default 0.001)
+
+PSEUDOCODE:
+
+candle_ranges = data.High - data.Low
+
+for each row i from 2 to len(data)-1:
+    cur_open = data[i].open
+    prev_open = data[i-1].open
+
+    yellow_box = cur_open
+    raw_diff = abs(cur_open - prev_open) / cur_open
+    raw_diff = max(raw_diff, 0.001)
+
+    avg_range = mean(candle_ranges[max(0, i-14):i])
+    yellow_top = yellow_box + avg_range / 2
+    yellow_bottom = yellow_box - avg_range / 2
+
+    pct_dist = raw_diff * yellow_box
+    r_start = yellow_top + pct_dist
+    s_start = yellow_bottom - pct_dist
+
+    zone_thick = pct_dist * 0.3
+    resistance_top = r_start + zone_thick
+    resistance_bot = r_start
+    support_top = s_start
+    support_bot = s_start - zone_thick
+
+    save values into row i
+
+Then plot:
+- candlesticks
+- yellow box rectangles (olive/yellow)
+- resistance zone rectangles (red)
+- support zone rectangles (green)
+- POC line at yellow_box center (purple dash-dot)
+
+Make the code clean, readable, and easy to modify.
