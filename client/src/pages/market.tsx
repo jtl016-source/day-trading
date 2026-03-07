@@ -219,6 +219,33 @@ function dateToTimestamp(dateStr: string, hour: number = 0): number {
   return Math.floor(new Date(Date.UTC(y, m - 1, d, hour, 0, 0)).getTime() / 1000);
 }
 
+function aggregate5mTo15m(candles: CandleBar[]): CandleBar[] {
+  if (candles.length === 0) return [];
+  const sorted = [...candles].sort((a, b) => a.time - b.time);
+  const result: CandleBar[] = [];
+  const FIFTEEN_MIN = 15 * 60;
+
+  let bucket: CandleBar | null = null;
+  let bucketStart = 0;
+
+  for (const c of sorted) {
+    const aligned = Math.floor(c.time / FIFTEEN_MIN) * FIFTEEN_MIN;
+    if (bucket && bucketStart === aligned) {
+      bucket.high = Math.max(bucket.high, c.high);
+      bucket.low = Math.min(bucket.low, c.low);
+      bucket.close = c.close;
+      bucket.volume = (bucket.volume ?? 0) + (c.volume ?? 0);
+      if (c.rth) bucket.rth = true;
+    } else {
+      if (bucket) result.push(bucket);
+      bucketStart = aligned;
+      bucket = { ...c, time: aligned };
+    }
+  }
+  if (bucket) result.push(bucket);
+  return result;
+}
+
 export default function MarketPage() {
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
   const [selectedCategory, setSelectedCategory] = useState<keyof SymbolsData>("etfs");
@@ -228,6 +255,7 @@ export default function MarketPage() {
   const [startDayIdx, setStartDayIdx] = useState(0);
   const [endDayIdx, setEndDayIdx] = useState(9);
   const [windowSize, setWindowSize] = useState(10);
+  const [interval, setInterval] = useState<"5m" | "15m" | "60m">("5m");
 
   const chartRef = useRef<ChartHandle>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -270,18 +298,28 @@ export default function MarketPage() {
     return dateToTimestamp(windowedDays[windowedDays.length - 1].date, 23) + 3600;
   }, [windowedDays]);
 
-  const { data: candleData, isLoading: candlesLoading } = useQuery<{
+  const fetchInterval = interval === "60m" ? "60m" : "5m";
+
+  const { data: rawCandleData, isLoading: candlesLoading } = useQuery<{
     symbol: string; interval: string; candles: CandleBar[]; source: string;
   }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "5m", fromTimestamp, toTimestamp],
+    queryKey: ["/api/data/cached-continuous", selectedSymbol, fetchInterval, fromTimestamp, toTimestamp],
     queryFn: async () => {
-      const res = await fetch(`/api/data/cached-continuous/${selectedSymbol}/5m?from=${fromTimestamp}&to=${toTimestamp}`);
+      const res = await fetch(`/api/data/cached-continuous/${selectedSymbol}/${fetchInterval}?from=${fromTimestamp}&to=${toTimestamp}`);
       if (!res.ok) throw new Error("Failed to fetch candles");
       return res.json();
     },
     enabled: hasCachedData && fromTimestamp > 0 && toTimestamp > 0,
     staleTime: 60 * 1000,
   });
+
+  const candleData = useMemo(() => {
+    if (!rawCandleData?.candles?.length) return rawCandleData;
+    if (interval === "15m") {
+      return { ...rawCandleData, candles: aggregate5mTo15m(rawCandleData.candles) };
+    }
+    return rawCandleData;
+  }, [rawCandleData, interval]);
 
   const yellowBoxZones = useMemo(() => {
     if (!cachedDaysData?.days?.length) return [];
@@ -417,6 +455,16 @@ export default function MarketPage() {
               Data
             </Button>
           </Link>
+          <Select value={interval} onValueChange={(v) => setInterval(v as "5m" | "15m" | "60m")}>
+            <SelectTrigger className="w-20 h-7 text-xs" data-testid="select-interval">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="5m">5 min</SelectItem>
+              <SelectItem value="15m">15 min</SelectItem>
+              <SelectItem value="60m">60 min</SelectItem>
+            </SelectContent>
+          </Select>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground border rounded-md px-2 py-1">
             <span className="w-2 h-2 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} />RTH
             <span className="w-2 h-2 rounded-sm inline-block ml-1" style={{ backgroundColor: "#26a69a80" }} />ETH
@@ -700,7 +748,7 @@ export default function MarketPage() {
                 <span data-testid="text-bar-count">
                   {windowedCandleData.length.toLocaleString()} bars ·
                   {windowedDays.length} days ·
-                  5-min cached · {sortedDays.length} total days available
+                  {interval} cached · {sortedDays.length} total days available
                 </span>
               </div>
             </>
