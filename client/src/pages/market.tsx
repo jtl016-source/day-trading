@@ -277,8 +277,7 @@ export default function MarketPage() {
 
   const { data: cachedDaysData, isLoading: daysLoading } = useQuery<{ symbol: string; days: DayInfo[] }>({
     queryKey: ["/api/data/cached-days", selectedSymbol],
-    staleTime: 5 * 60 * 1000,
-    refetchOnWindowFocus: false,
+    staleTime: 60 * 1000,
   });
 
   const sortedDays = useMemo(() => {
@@ -324,8 +323,7 @@ export default function MarketPage() {
       return res.json();
     },
     enabled: hasCachedData && fromTimestamp > 0 && toTimestamp > 0,
-    staleTime: 5 * 60 * 1000,
-    refetchOnWindowFocus: false,
+    staleTime: 60 * 1000,
   });
 
   const candleData = useMemo(() => {
