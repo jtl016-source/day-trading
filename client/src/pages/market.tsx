@@ -31,47 +31,53 @@ interface YellowBoxDay {
   poc: number;
   yellowTop: number;
   yellowBottom: number;
-  resistanceTop: number;
-  resistanceBot: number;
-  supportTop: number;
-  supportBot: number;
+  avgRangeHigh: number;
+  avgRangeLow: number;
+  maxRangeHigh: number;
+  maxRangeLow: number;
 }
 
-const YELLOW_BOX_POINTS = 8;
-const MIN_RAW_DIFF = 0.001;
+const LOOKBACK_DAYS = 50;
+const YELLOW_BOX_FRACTION = 0.35;
 
 function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
   const chronological = [...days].reverse();
   const zones: YellowBoxDay[] = [];
-  const halfBox = YELLOW_BOX_POINTS / 2;
 
-  for (let i = 0; i < chronological.length; i++) {
-    if (i < 1) continue;
-
-    const curOpen = chronological[i].open;
+  for (let i = 1; i < chronological.length; i++) {
     const prevClose = chronological[i - 1].close;
+    const poc = prevClose;
 
-    const yellowBox = curOpen;
-    const pointDiff = Math.abs(yellowBox - prevClose);
-    let pct = pointDiff / prevClose;
-    pct = Math.max(pct, MIN_RAW_DIFF);
+    const lookbackStart = Math.max(0, i - LOOKBACK_DAYS);
+    const upMoves: number[] = [];
+    const downMoves: number[] = [];
 
-    const yellowTop = yellowBox + halfBox;
-    const yellowBottom = yellowBox - halfBox;
+    for (let j = lookbackStart; j < i; j++) {
+      if (j < 1) continue;
+      const pc = chronological[j - 1].close;
+      upMoves.push(chronological[j].high - pc);
+      downMoves.push(pc - chronological[j].low);
+    }
 
-    const pctDist = pct * yellowBox;
-    const rStart = yellowTop + pctDist;
-    const sStart = yellowBottom - pctDist;
+    if (upMoves.length === 0) continue;
+
+    const avgUp = upMoves.reduce((a, b) => a + b, 0) / upMoves.length;
+    const avgDown = downMoves.reduce((a, b) => a + b, 0) / downMoves.length;
+    const maxUp = Math.max(...upMoves);
+    const maxDown = Math.max(...downMoves);
+
+    const avgRange = (avgUp + avgDown) / 2;
+    const halfBox = avgRange * YELLOW_BOX_FRACTION;
 
     zones.push({
       date: chronological[i].date,
-      poc: yellowBox,
-      yellowTop,
-      yellowBottom,
-      resistanceTop: rStart + pctDist,
-      resistanceBot: rStart,
-      supportTop: sStart,
-      supportBot: sStart - pctDist,
+      poc,
+      yellowTop: poc + halfBox,
+      yellowBottom: poc - halfBox,
+      avgRangeHigh: poc + avgUp,
+      avgRangeLow: poc - avgDown,
+      maxRangeHigh: poc + maxUp,
+      maxRangeLow: poc - maxDown,
     });
   }
 
@@ -106,10 +112,10 @@ function buildZoneOverlays(
   const pocData: Array<{ time: number; value: number }> = [];
   const ytData: Array<{ time: number; value: number }> = [];
   const ybData: Array<{ time: number; value: number }> = [];
-  const rtData: Array<{ time: number; value: number }> = [];
-  const rbData: Array<{ time: number; value: number }> = [];
-  const stData: Array<{ time: number; value: number }> = [];
-  const sbData: Array<{ time: number; value: number }> = [];
+  const arHData: Array<{ time: number; value: number }> = [];
+  const arLData: Array<{ time: number; value: number }> = [];
+  const mrHData: Array<{ time: number; value: number }> = [];
+  const mrLData: Array<{ time: number; value: number }> = [];
   const bands: BandOverlay[] = [];
 
   for (const [dateStr, bounds] of dayGroups) {
@@ -125,17 +131,17 @@ function buildZoneOverlays(
     ybData.push({ time: bounds.first, value: zone.yellowBottom });
     ybData.push({ time: bounds.last, value: zone.yellowBottom });
 
-    rtData.push({ time: bounds.first, value: zone.resistanceTop });
-    rtData.push({ time: bounds.last, value: zone.resistanceTop });
+    arHData.push({ time: bounds.first, value: zone.avgRangeHigh });
+    arHData.push({ time: bounds.last, value: zone.avgRangeHigh });
 
-    rbData.push({ time: bounds.first, value: zone.resistanceBot });
-    rbData.push({ time: bounds.last, value: zone.resistanceBot });
+    arLData.push({ time: bounds.first, value: zone.avgRangeLow });
+    arLData.push({ time: bounds.last, value: zone.avgRangeLow });
 
-    stData.push({ time: bounds.first, value: zone.supportTop });
-    stData.push({ time: bounds.last, value: zone.supportTop });
+    mrHData.push({ time: bounds.first, value: zone.maxRangeHigh });
+    mrHData.push({ time: bounds.last, value: zone.maxRangeHigh });
 
-    sbData.push({ time: bounds.first, value: zone.supportBot });
-    sbData.push({ time: bounds.last, value: zone.supportBot });
+    mrLData.push({ time: bounds.first, value: zone.maxRangeLow });
+    mrLData.push({ time: bounds.last, value: zone.maxRangeLow });
 
     bands.push({
       topPrice: zone.yellowTop,
@@ -145,16 +151,16 @@ function buildZoneOverlays(
       toTime: bounds.last,
     });
     bands.push({
-      topPrice: zone.resistanceTop,
-      bottomPrice: zone.resistanceBot,
-      fillColor: "rgba(200, 40, 40, 0.22)",
+      topPrice: zone.avgRangeHigh,
+      bottomPrice: zone.yellowTop,
+      fillColor: "rgba(200, 40, 40, 0.15)",
       fromTime: bounds.first,
       toTime: bounds.last,
     });
     bands.push({
-      topPrice: zone.supportTop,
-      bottomPrice: zone.supportBot,
-      fillColor: "rgba(30, 160, 60, 0.22)",
+      topPrice: zone.yellowBottom,
+      bottomPrice: zone.avgRangeLow,
+      fillColor: "rgba(30, 160, 60, 0.15)",
       fromTime: bounds.first,
       toTime: bounds.last,
     });
@@ -163,11 +169,11 @@ function buildZoneOverlays(
   const lines: ZoneOverlay[] = [
     { data: ytData, color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
     { data: ybData, color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
-    { data: pocData, color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "Pivot" },
-    { data: rtData, color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Top" },
-    { data: rbData, color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Bot" },
-    { data: stData, color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Top" },
-    { data: sbData, color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Bot" },
+    { data: pocData, color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "POC" },
+    { data: arHData, color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range H" },
+    { data: arLData, color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range L" },
+    { data: mrHData, color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range H" },
+    { data: mrLData, color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range L" },
   ];
 
   return { lines, bands };
@@ -285,7 +291,6 @@ export default function MarketPage() {
       return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
 
     const sorted = [...intradayData.candles].sort((a, b) => a.time - b.time);
-    const todayOpen = sorted[0].open;
 
     const todayDate = new Date(sorted[0].time * 1000);
     const todayStr = `${todayDate.getUTCFullYear()}-${String(todayDate.getUTCMonth() + 1).padStart(2, "0")}-${String(todayDate.getUTCDate()).padStart(2, "0")}`;
@@ -303,28 +308,39 @@ export default function MarketPage() {
     }
 
     const prevClose = chronoDays[prevDayIdx].close;
+    const poc = prevClose;
 
-    const yellowBox = todayOpen;
-    const pointDiff = Math.abs(yellowBox - prevClose);
-    let pct = pointDiff / prevClose;
-    pct = Math.max(pct, MIN_RAW_DIFF);
+    const targetIdx = prevDayIdx + 1 < chronoDays.length ? prevDayIdx + 1 : prevDayIdx;
+    const lookbackStart = Math.max(0, targetIdx - LOOKBACK_DAYS);
+    const upMoves: number[] = [];
+    const downMoves: number[] = [];
+    for (let k = lookbackStart; k < targetIdx; k++) {
+      if (k < 1) continue;
+      const pc = chronoDays[k - 1].close;
+      upMoves.push(chronoDays[k].high - pc);
+      downMoves.push(pc - chronoDays[k].low);
+    }
 
-    const halfBox = YELLOW_BOX_POINTS / 2;
-    const yellowTop = yellowBox + halfBox;
-    const yellowBottom = yellowBox - halfBox;
-    const pctDist = pct * yellowBox;
-    const rStart = yellowTop + pctDist;
-    const sStart = yellowBottom - pctDist;
+    if (upMoves.length === 0) {
+      return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
+    }
+
+    const avgUp = upMoves.reduce((a, b) => a + b, 0) / upMoves.length;
+    const avgDown = downMoves.reduce((a, b) => a + b, 0) / downMoves.length;
+    const maxUp = Math.max(...upMoves);
+    const maxDown = Math.max(...downMoves);
+    const avgRange = (avgUp + avgDown) / 2;
+    const halfBox = avgRange * YELLOW_BOX_FRACTION;
 
     const todayZone: YellowBoxDay = {
       date: "today",
-      poc: yellowBox,
-      yellowTop,
-      yellowBottom,
-      resistanceTop: rStart + pctDist,
-      resistanceBot: rStart,
-      supportTop: sStart,
-      supportBot: sStart - pctDist,
+      poc,
+      yellowTop: poc + halfBox,
+      yellowBottom: poc - halfBox,
+      avgRangeHigh: poc + avgUp,
+      avgRangeLow: poc - avgDown,
+      maxRangeHigh: poc + maxUp,
+      maxRangeLow: poc - maxDown,
     };
 
     const firstTime = sorted[0].time;
@@ -338,17 +354,17 @@ export default function MarketPage() {
     const lines: ZoneOverlay[] = [
       { data: makePair(todayZone.yellowTop), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
       { data: makePair(todayZone.yellowBottom), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
-      { data: makePair(todayZone.poc), color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "Pivot" },
-      { data: makePair(todayZone.resistanceTop), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Top" },
-      { data: makePair(todayZone.resistanceBot), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Bot" },
-      { data: makePair(todayZone.supportTop), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Top" },
-      { data: makePair(todayZone.supportBot), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Bot" },
+      { data: makePair(todayZone.poc), color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "POC" },
+      { data: makePair(todayZone.avgRangeHigh), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range H" },
+      { data: makePair(todayZone.avgRangeLow), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range L" },
+      { data: makePair(todayZone.maxRangeHigh), color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range H" },
+      { data: makePair(todayZone.maxRangeLow), color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range L" },
     ];
 
     const bands: BandOverlay[] = [
       { topPrice: todayZone.yellowTop, bottomPrice: todayZone.yellowBottom, fillColor: "rgba(180, 160, 40, 0.18)", fromTime: firstTime, toTime: lastTime },
-      { topPrice: todayZone.resistanceTop, bottomPrice: todayZone.resistanceBot, fillColor: "rgba(200, 40, 40, 0.22)", fromTime: firstTime, toTime: lastTime },
-      { topPrice: todayZone.supportTop, bottomPrice: todayZone.supportBot, fillColor: "rgba(30, 160, 60, 0.22)", fromTime: firstTime, toTime: lastTime },
+      { topPrice: todayZone.avgRangeHigh, bottomPrice: todayZone.yellowTop, fillColor: "rgba(200, 40, 40, 0.15)", fromTime: firstTime, toTime: lastTime },
+      { topPrice: todayZone.yellowBottom, bottomPrice: todayZone.avgRangeLow, fillColor: "rgba(30, 160, 60, 0.15)", fromTime: firstTime, toTime: lastTime },
     ];
 
     return { intradayZoneOverlays: lines, intradayBandOverlays: bands };
@@ -799,13 +815,13 @@ export default function MarketPage() {
                       <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(180, 160, 40, 0.35)" }} /> Yellow Box
                     </span>
                     <span className="flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(220, 220, 220, 0.8)" }} /> Pivot
+                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(220, 220, 220, 0.8)" }} /> POC
                     </span>
                     <span className="flex items-center gap-1">
-                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(200, 40, 40, 0.35)" }} /> Resistance
+                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(200, 40, 40, 0.25)" }} /> Avg Range
                     </span>
                     <span className="flex items-center gap-1">
-                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(30, 160, 60, 0.35)" }} /> Support
+                      <span className="w-3 h-1 rounded-sm inline-block border-dashed border-b" style={{ borderColor: "rgba(220, 80, 80, 0.5)" }} /> Max Range
                     </span>
                   </>
                 )}
