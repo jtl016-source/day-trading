@@ -73,6 +73,8 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
     const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+    const prevCandleKeyRef = useRef<string>("");
+    const bandOverlaysRef = useRef<BandOverlay[] | undefined>(bandOverlays);
 
     const [dragState, setDragState] = useState<{
       active: boolean;
@@ -285,10 +287,17 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       if (candles.length === 0) {
         candleSeriesRef.current.setData([]);
         volumeSeriesRef.current?.setData([]);
+        prevCandleKeyRef.current = "";
         return;
       }
 
+      const chart = chartRef.current;
+      const ts = chart.timeScale();
+      const prevRange = ts.getVisibleLogicalRange();
+
       const sorted = [...candles].sort((a, b) => a.time - b.time);
+      const candleKey = `${sorted[0].time}-${sorted[sorted.length - 1].time}-${sorted.length}`;
+      const isNewDataset = prevCandleKeyRef.current === "" || prevCandleKeyRef.current !== candleKey;
       const hasETHData = sorted.some((c) => c.rth === true || c.rth === false);
 
       function getUTCDate(ts: number): string {
@@ -349,14 +358,25 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         volumeSeriesRef.current.setData(volData as HistogramData[]);
       }
 
-      chartRef.current.timeScale().fitContent();
+      if (isNewDataset) {
+        ts.fitContent();
+      } else if (prevRange) {
+        ts.setVisibleLogicalRange(prevRange);
+      }
+
+      prevCandleKeyRef.current = candleKey;
     }, [candles]);
+
+    useEffect(() => {
+      bandOverlaysRef.current = bandOverlays;
+    }, [bandOverlays]);
 
     const drawBands = useCallback(() => {
       const canvas = bandCanvasRef.current;
       const chart = chartRef.current;
       const series = candleSeriesRef.current;
-      if (!canvas || !chart || !series || !bandOverlays || bandOverlays.length === 0) {
+      const overlays = bandOverlaysRef.current;
+      if (!canvas || !chart || !series || !overlays || overlays.length === 0) {
         if (canvas) {
           const ctx = canvas.getContext("2d");
           if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -379,7 +399,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       const ts = chart.timeScale();
 
-      for (const band of bandOverlays) {
+      for (const band of overlays) {
         const topY = series.priceToCoordinate(band.topPrice);
         const bottomY = series.priceToCoordinate(band.bottomPrice);
         if (topY == null || bottomY == null) continue;
@@ -398,7 +418,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           ctx.fillRect(x, y, w, h);
         }
       }
-    }, [bandOverlays]);
+    }, []);
 
     useEffect(() => {
       const chart = chartRef.current;
@@ -407,15 +427,17 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       drawBands();
 
       chart.timeScale().subscribeVisibleLogicalRangeChange(drawBands);
-      chart.subscribeCrosshairMove(drawBands);
 
       return () => {
         try {
           chart.timeScale().unsubscribeVisibleLogicalRangeChange(drawBands);
-          chart.unsubscribeCrosshairMove(drawBands);
         } catch {}
       };
     }, [drawBands]);
+
+    useEffect(() => {
+      drawBands();
+    }, [bandOverlays, drawBands]);
 
     useEffect(() => {
       const chart = chartRef.current;
