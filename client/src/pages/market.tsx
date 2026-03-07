@@ -261,6 +261,85 @@ export default function MarketPage() {
     return { zoneOverlays: result.lines, bandOverlayData: result.bands };
   }, [showYellowBox, yellowBoxZones, continuousData]);
 
+  const { intradayZoneOverlays, intradayBandOverlays } = useMemo(() => {
+    if (!showYellowBox || !historicalDays?.days?.length || !intradayData?.candles?.length)
+      return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
+
+    const sorted = [...intradayData.candles].sort((a, b) => a.time - b.time);
+    const todayOpen = sorted[0].open;
+
+    const todayDate = new Date(sorted[0].time * 1000);
+    const todayStr = `${todayDate.getUTCFullYear()}-${String(todayDate.getUTCMonth() + 1).padStart(2, "0")}-${String(todayDate.getUTCDate()).padStart(2, "0")}`;
+
+    const chronoDays = [...historicalDays.days].reverse();
+
+    const todayIdx = chronoDays.findIndex(d => d.date === todayStr);
+    let prevDayIdx: number;
+    if (todayIdx > 0) {
+      prevDayIdx = todayIdx - 1;
+    } else if (todayIdx === -1) {
+      prevDayIdx = chronoDays.length - 1;
+    } else {
+      return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
+    }
+
+    const prevClose = chronoDays[prevDayIdx].close;
+
+    const yellowBox = todayOpen;
+    const pointDiff = Math.abs(yellowBox - prevClose);
+    let pct = pointDiff / prevClose;
+    pct = Math.max(pct, MIN_RAW_DIFF);
+
+    const lookbackEnd = prevDayIdx + 1;
+    const lookbackStart = Math.max(0, lookbackEnd - LOOKBACK);
+    const lookbackRanges = chronoDays.slice(lookbackStart, lookbackEnd).map(d => d.high - d.low);
+    const avgRange = lookbackRanges.reduce((a, b) => a + b, 0) / lookbackRanges.length;
+
+    const yellowTop = yellowBox + avgRange / 2;
+    const yellowBottom = yellowBox - avgRange / 2;
+    const pctDist = pct * yellowBox;
+    const rStart = yellowTop + pctDist;
+    const sStart = yellowBottom - pctDist;
+    const zoneThick = pctDist * ZONE_THICKNESS_FRACTION;
+
+    const todayZone: YellowBoxDay = {
+      date: "today",
+      poc: yellowBox,
+      yellowTop,
+      yellowBottom,
+      resistanceTop: rStart + zoneThick,
+      resistanceBot: rStart,
+      supportTop: sStart,
+      supportBot: sStart - zoneThick,
+    };
+
+    const firstTime = sorted[0].time;
+    const lastTime = sorted[sorted.length - 1].time;
+
+    const makePair = (val: number) => [
+      { time: firstTime, value: val },
+      { time: lastTime, value: val },
+    ];
+
+    const lines: ZoneOverlay[] = [
+      { data: makePair(todayZone.yellowTop), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
+      { data: makePair(todayZone.yellowBottom), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
+      { data: makePair(todayZone.poc), color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "Pivot" },
+      { data: makePair(todayZone.resistanceTop), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Top" },
+      { data: makePair(todayZone.resistanceBot), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Bot" },
+      { data: makePair(todayZone.supportTop), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Top" },
+      { data: makePair(todayZone.supportBot), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Bot" },
+    ];
+
+    const bands: BandOverlay[] = [
+      { topPrice: todayZone.yellowTop, bottomPrice: todayZone.yellowBottom, fillColor: "rgba(180, 160, 40, 0.18)", fromTime: firstTime, toTime: lastTime },
+      { topPrice: todayZone.resistanceTop, bottomPrice: todayZone.resistanceBot, fillColor: "rgba(200, 40, 40, 0.22)", fromTime: firstTime, toTime: lastTime },
+      { topPrice: todayZone.supportTop, bottomPrice: todayZone.supportBot, fillColor: "rgba(30, 160, 60, 0.22)", fromTime: firstTime, toTime: lastTime },
+    ];
+
+    return { intradayZoneOverlays: lines, intradayBandOverlays: bands };
+  }, [showYellowBox, historicalDays, intradayData]);
+
   const currentPrice = quoteData?.regularMarketPrice ?? intradayData?.meta?.regularMarketPrice;
   const prevClose = quoteData?.regularMarketPreviousClose ?? intradayData?.meta?.previousClose;
   const priceChange = currentPrice != null && prevClose != null ? currentPrice - prevClose : null;
@@ -480,9 +559,20 @@ export default function MarketPage() {
                 )}
               </div>
             </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Activity className="w-4 h-4 text-primary" />
-              <span>Today's Session · {interval} candles · ETH + RTH</span>
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Activity className="w-4 h-4 text-primary" />
+                <span>Today's Session · {interval} candles · ETH + RTH</span>
+              </div>
+              <Button
+                size="sm"
+                variant={showYellowBox ? "default" : "outline"}
+                data-testid="button-toggle-yellowbox-intraday"
+                onClick={() => setShowYellowBox(!showYellowBox)}
+                className="text-xs h-7"
+              >
+                {showYellowBox ? "Yellow Box ON" : "Yellow Box OFF"}
+              </Button>
             </div>
           </div>
 
@@ -504,7 +594,13 @@ export default function MarketPage() {
                   </div>
                 </div>
               ) : (
-                <CandlestickChart candles={intradayData.candles} height={380} showVolume />
+                <CandlestickChart
+                  candles={intradayData.candles}
+                  height={380}
+                  showVolume
+                  zoneOverlays={intradayZoneOverlays}
+                  bandOverlays={intradayBandOverlays}
+                />
               )}
             </div>
           </section>
