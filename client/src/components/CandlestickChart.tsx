@@ -34,6 +34,9 @@ export interface ZoneOverlay {
 
 export interface ChartHandle {
   scrollToTime: (timestamp: number) => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  resetZoom: () => void;
 }
 
 interface CandlestickChartProps {
@@ -69,6 +72,30 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           from: (timestamp - range) as any,
           to: (timestamp + range) as any,
         });
+      },
+      zoomIn() {
+        if (!chartRef.current) return;
+        const ts = chartRef.current.timeScale();
+        const vr = ts.getVisibleLogicalRange();
+        if (!vr) return;
+        const center = (vr.from + vr.to) / 2;
+        const halfSpan = (vr.to - vr.from) / 2;
+        const newHalf = halfSpan * 0.6;
+        ts.setVisibleLogicalRange({ from: center - newHalf, to: center + newHalf });
+      },
+      zoomOut() {
+        if (!chartRef.current) return;
+        const ts = chartRef.current.timeScale();
+        const vr = ts.getVisibleLogicalRange();
+        if (!vr) return;
+        const center = (vr.from + vr.to) / 2;
+        const halfSpan = (vr.to - vr.from) / 2;
+        const newHalf = halfSpan * 1.6;
+        ts.setVisibleLogicalRange({ from: center - newHalf, to: center + newHalf });
+      },
+      resetZoom() {
+        if (!chartRef.current) return;
+        chartRef.current.timeScale().fitContent();
       },
     }));
 

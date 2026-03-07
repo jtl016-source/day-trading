@@ -15,6 +15,9 @@ import {
   ChevronRight,
   History,
   CalendarDays,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 
@@ -45,14 +48,15 @@ function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
   for (let i = 0; i < chronological.length; i++) {
     ranges.push(chronological[i].high - chronological[i].low);
 
-    if (i < 2) continue;
+    if (i < 1) continue;
 
     const curOpen = chronological[i].open;
-    const prevOpen = chronological[i - 1].open;
+    const prevClose = chronological[i - 1].close;
 
     const yellowBox = curOpen;
-    let rawDiff = Math.abs(curOpen - prevOpen) / curOpen;
-    rawDiff = Math.max(rawDiff, MIN_RAW_DIFF);
+    const pointDiff = Math.abs(yellowBox - prevClose);
+    let pct = pointDiff / prevClose;
+    pct = Math.max(pct, MIN_RAW_DIFF);
 
     const lookbackStart = Math.max(0, i - LOOKBACK);
     const lookbackRanges = ranges.slice(lookbackStart, i);
@@ -61,7 +65,7 @@ function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
     const yellowTop = yellowBox + avgRange / 2;
     const yellowBottom = yellowBox - avgRange / 2;
 
-    const pctDist = rawDiff * yellowBox;
+    const pctDist = pct * yellowBox;
     const rStart = yellowTop + pctDist;
     const sStart = yellowBottom - pctDist;
     const zoneThick = pctDist * ZONE_THICKNESS_FRACTION;
@@ -578,7 +582,36 @@ export default function MarketPage() {
               </Button>
             </div>
 
-            <div className="rounded-lg border bg-card overflow-hidden">
+            <div className="rounded-lg border bg-card overflow-hidden relative">
+              <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card/90 backdrop-blur-sm border rounded-md p-0.5">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  data-testid="button-zoom-in"
+                  className="h-7 w-7"
+                  onClick={() => histChartRef.current?.zoomIn()}
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  data-testid="button-zoom-out"
+                  className="h-7 w-7"
+                  onClick={() => histChartRef.current?.zoomOut()}
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  data-testid="button-zoom-reset"
+                  className="h-7 w-7"
+                  onClick={() => histChartRef.current?.resetZoom()}
+                >
+                  <Maximize2 className="w-3.5 h-3.5" />
+                </Button>
+              </div>
               {continuousLoading ? (
                 <div className="flex items-center justify-center" style={{ height: 440 }}>
                   <div className="flex flex-col items-center gap-3 text-muted-foreground">
