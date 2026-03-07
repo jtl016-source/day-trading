@@ -8,7 +8,8 @@ A real-time and historical market charting application using live Yahoo Finance 
 - **200-Day Continuous History**: Single continuous candlestick chart covering the full historical window — no per-day loading. ETH + RTH candles shown throughout. Supports zoom/pan via the chart and a draggable day-card timeline scrubber for jumping to specific dates.
   - 15m interval: last 60 days (Yahoo Finance API limit)
   - 60m interval: full 200 trading days
-- **ETH/RTH Color Coding**: Vivid green/red for Regular Trading Hours candles; muted light green/light red for Extended Trading Hours candles. Shown on both the intraday and historical charts.
+- **TradingView-Style Theme**: Chart styling matches TradingView's dark theme exactly — background #131722, grid #1e222d, crosshair #758696, scale text #787b86, scale borders #2a2e39. Font matches TradingView's system font stack.
+- **ETH/RTH Color Coding**: TradingView candle colors — teal #26a69a for up, red #ef5350 for down. ETH candles use same palette with reduced opacity. Volume bars match candle colors.
 - **Symbol Support**: Stocks (AAPL, MSFT, etc.), ETFs (SPY, QQQ, etc.), Futures (ES=F, GC=F, etc.), Indices (^GSPC, ^VIX, etc.). Futures use a wider intraday window starting 5 PM ET the previous day to capture overnight Globex sessions.
 - **Volume bars** shown below each candlestick chart
 - **Live quote data** showing price, change, day high/low, volume

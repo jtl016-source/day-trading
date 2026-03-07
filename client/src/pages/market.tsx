@@ -463,8 +463,8 @@ export default function MarketPage() {
 
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground border rounded-md px-2 py-1">
-            <span className="w-2 h-2 rounded-sm bg-green-500 inline-block" />RTH
-            <span className="w-2 h-2 rounded-sm bg-green-300 inline-block ml-1" />ETH
+            <span className="w-2 h-2 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} />RTH
+            <span className="w-2 h-2 rounded-sm inline-block ml-1" style={{ backgroundColor: "#26a69a80" }} />ETH
           </div>
           <Select value={interval} onValueChange={(v) => setInterval(v as "15m" | "60m")}>
             <SelectTrigger className="w-24" data-testid="select-interval">
@@ -522,7 +522,7 @@ export default function MarketPage() {
                 )}
                 {priceChange != null && (
                   <div
-                    className={`flex items-center gap-1 ${isPositive ? "text-green-500" : "text-red-500"}`}
+                    className={`flex items-center gap-1 ${isPositive ? "text-[#26a69a]" : "text-[#ef5350]"}`}
                     data-testid="text-price-change"
                   >
                     {isPositive ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
@@ -670,11 +670,11 @@ export default function MarketPage() {
                             }`}
                           >
                             <div className="text-[9px] text-muted-foreground mb-0.5">{formatDate(day.date)}</div>
-                            <div className={`text-[10px] font-semibold font-mono ${isUp ? "text-green-500" : "text-red-500"}`}>
+                            <div className={`text-[10px] font-semibold font-mono ${isUp ? "text-[#26a69a]" : "text-[#ef5350]"}`}>
                               {isUp ? "+" : ""}{changePct.toFixed(1)}%
                             </div>
                             <div className="text-[9px] text-muted-foreground font-mono">{formatPrice(day.close)}</div>
-                            <div className={`h-0.5 rounded-full mt-1 ${isUp ? "bg-green-500" : "bg-red-500"}`} />
+                            <div className="h-0.5 rounded-full mt-1" style={{ backgroundColor: isUp ? "#26a69a" : "#ef5350" }} />
                           </button>
                         );
                       })}
@@ -747,16 +747,16 @@ export default function MarketPage() {
             <div className="mt-2 flex gap-3 text-xs text-muted-foreground justify-between flex-wrap">
               <div className="flex items-center gap-3 flex-wrap">
                 <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm bg-green-500 inline-block" /> RTH up
+                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} /> RTH up
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm bg-red-500 inline-block" /> RTH down
+                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#ef5350" }} /> RTH down
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm bg-green-300 inline-block" /> ETH up
+                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#26a69a80" }} /> ETH up
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm bg-red-300 inline-block" /> ETH down
+                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#ef535080" }} /> ETH down
                 </span>
                 {showYellowBox && (
                   <>

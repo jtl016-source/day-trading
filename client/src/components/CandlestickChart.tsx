@@ -55,15 +55,15 @@ interface CandlestickChartProps {
   onDragZoomDone?: () => void;
 }
 
-const RTH_UP = "#22c55e";
-const RTH_DOWN = "#ef4444";
-const RTH_UP_WICK = "#22c55e";
-const RTH_DOWN_WICK = "#ef4444";
+const RTH_UP = "#26a69a";
+const RTH_DOWN = "#ef5350";
+const RTH_UP_WICK = "#26a69a";
+const RTH_DOWN_WICK = "#ef5350";
 
-const ETH_UP = "#86efac";
-const ETH_DOWN = "#fca5a5";
-const ETH_UP_WICK = "#4ade80";
-const ETH_DOWN_WICK = "#f87171";
+const ETH_UP = "#26a69a80";
+const ETH_DOWN = "#ef535080";
+const ETH_UP_WICK = "#26a69a99";
+const ETH_DOWN_WICK = "#ef535099";
 
 export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
   function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays, bandOverlays, dragZoomEnabled = false, onDragZoomDone }, ref) {
@@ -172,41 +172,45 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         layout: {
           background: {
             type: ColorType.Solid,
-            color: isDark ? "hsl(220, 10%, 4%)" : "hsl(210, 5%, 98%)",
+            color: isDark ? "#131722" : "#ffffff",
           },
-          textColor: isDark ? "rgba(180,190,200,0.7)" : "rgba(30,40,50,0.55)",
-          fontFamily: "var(--font-sans, sans-serif)",
-          fontSize: 11,
+          textColor: isDark ? "#787b86" : "#131722",
+          fontFamily: "-apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif",
+          fontSize: 12,
         },
         grid: {
-          vertLines: { color: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" },
-          horzLines: { color: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" },
+          vertLines: { color: isDark ? "#1e222d" : "#e1ecf2" },
+          horzLines: { color: isDark ? "#1e222d" : "#e1ecf2" },
         },
         crosshair: {
+          mode: 0,
           vertLine: {
-            color: isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.2)",
+            color: isDark ? "#758696" : "#9598a1",
             width: 1,
-            style: 3,
+            style: LineStyle.Dashed,
+            labelBackgroundColor: isDark ? "#363c4e" : "#131722",
           },
           horzLine: {
-            color: isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.2)",
+            color: isDark ? "#758696" : "#9598a1",
             width: 1,
-            style: 3,
+            style: LineStyle.Dashed,
+            labelBackgroundColor: isDark ? "#363c4e" : "#131722",
           },
         },
         timeScale: {
-          borderColor: isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)",
+          borderColor: isDark ? "#2a2e39" : "#e1ecf2",
           timeVisible: true,
           secondsVisible: false,
           fixLeftEdge: false,
           fixRightEdge: true,
-          rightOffset: 3,
+          rightOffset: 5,
         },
         rightPriceScale: {
-          borderColor: isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)",
+          borderColor: isDark ? "#2a2e39" : "#e1ecf2",
           scaleMargins: showVolume
             ? { top: 0.05, bottom: 0.22 }
             : { top: 0.05, bottom: 0.05 },
+          textColor: isDark ? "#787b86" : "#131722",
         },
         handleScale: {
           axisPressedMouseMove: { time: true, price: true },
@@ -233,7 +237,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       if (showVolume) {
         const volumeSeries = chart.addSeries(HistogramSeries, {
-          color: "#6366f1",
+          color: "#26a69a80",
           priceFormat: { type: "volume" },
           priceScaleId: "volume",
         });
@@ -333,9 +337,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         const isETH = hasETHData && c.rth === false;
         let color: string;
         if (isETH) {
-          color = isUp ? "rgba(134,239,172,0.3)" : "rgba(252,165,165,0.3)";
+          color = isUp ? "rgba(38,166,154,0.2)" : "rgba(239,83,80,0.2)";
         } else {
-          color = isUp ? "rgba(34,197,94,0.4)" : "rgba(239,68,68,0.4)";
+          color = isUp ? "rgba(38,166,154,0.5)" : "rgba(239,83,80,0.5)";
         }
         volData.push({ time: c.time as any, value: c.volume ?? 0, color });
       }
