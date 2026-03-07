@@ -36,7 +36,6 @@ interface YellowBoxDay {
 }
 
 const YELLOW_BOX_POINTS = 8;
-const ZONE_THICKNESS_FRACTION = 0.3;
 const MIN_RAW_DIFF = 0.001;
 
 function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
@@ -61,17 +60,16 @@ function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
     const pctDist = pct * yellowBox;
     const rStart = yellowTop + pctDist;
     const sStart = yellowBottom - pctDist;
-    const zoneThick = pctDist * ZONE_THICKNESS_FRACTION;
 
     zones.push({
       date: chronological[i].date,
       poc: yellowBox,
       yellowTop,
       yellowBottom,
-      resistanceTop: rStart + zoneThick,
+      resistanceTop: rStart + pctDist,
       resistanceBot: rStart,
       supportTop: sStart,
-      supportBot: sStart - zoneThick,
+      supportBot: sStart - pctDist,
     });
   }
 
@@ -290,17 +288,16 @@ export default function MarketPage() {
     const pctDist = pct * yellowBox;
     const rStart = yellowTop + pctDist;
     const sStart = yellowBottom - pctDist;
-    const zoneThick = pctDist * ZONE_THICKNESS_FRACTION;
 
     const todayZone: YellowBoxDay = {
       date: "today",
       poc: yellowBox,
       yellowTop,
       yellowBottom,
-      resistanceTop: rStart + zoneThick,
+      resistanceTop: rStart + pctDist,
       resistanceBot: rStart,
       supportTop: sStart,
-      supportBot: sStart - zoneThick,
+      supportBot: sStart - pctDist,
     };
 
     const firstTime = sorted[0].time;
