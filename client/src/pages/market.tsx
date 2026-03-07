@@ -1,6 +1,6 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CandlestickChart, type CandleBar, type ChartHandle } from "@/components/CandlestickChart";
+import { CandlestickChart, type CandleBar, type ChartHandle, type ZoneOverlay } from "@/components/CandlestickChart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -21,6 +21,135 @@ import { Input } from "@/components/ui/input";
 interface SymbolInfo { symbol: string; name: string }
 interface SymbolsData { stocks: SymbolInfo[]; etfs: SymbolInfo[]; futures: SymbolInfo[]; indices: SymbolInfo[] }
 interface DayInfo { date: string; open: number; high: number; low: number; close: number; volume: number }
+
+interface YellowBoxDay {
+  date: string;
+  poc: number;
+  yellowTop: number;
+  yellowBottom: number;
+  resistanceTop: number;
+  resistanceBot: number;
+  supportTop: number;
+  supportBot: number;
+}
+
+const LOOKBACK = 14;
+const ZONE_THICKNESS_FRACTION = 0.3;
+const MIN_RAW_DIFF = 0.001;
+
+function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
+  const chronological = [...days].reverse();
+  const zones: YellowBoxDay[] = [];
+  const ranges: number[] = [];
+
+  for (let i = 0; i < chronological.length; i++) {
+    ranges.push(chronological[i].high - chronological[i].low);
+
+    if (i < 2) continue;
+
+    const curOpen = chronological[i].open;
+    const prevOpen = chronological[i - 1].open;
+
+    const yellowBox = curOpen;
+    let rawDiff = Math.abs(curOpen - prevOpen) / curOpen;
+    rawDiff = Math.max(rawDiff, MIN_RAW_DIFF);
+
+    const lookbackStart = Math.max(0, i - LOOKBACK);
+    const lookbackRanges = ranges.slice(lookbackStart, i);
+    const avgRange = lookbackRanges.reduce((a, b) => a + b, 0) / lookbackRanges.length;
+
+    const yellowTop = yellowBox + avgRange / 2;
+    const yellowBottom = yellowBox - avgRange / 2;
+
+    const pctDist = rawDiff * yellowBox;
+    const rStart = yellowTop + pctDist;
+    const sStart = yellowBottom - pctDist;
+    const zoneThick = pctDist * ZONE_THICKNESS_FRACTION;
+
+    zones.push({
+      date: chronological[i].date,
+      poc: yellowBox,
+      yellowTop,
+      yellowBottom,
+      resistanceTop: rStart + zoneThick,
+      resistanceBot: rStart,
+      supportTop: sStart,
+      supportBot: sStart - zoneThick,
+    });
+  }
+
+  return zones;
+}
+
+function buildZoneOverlays(
+  zones: YellowBoxDay[],
+  candles: CandleBar[]
+): ZoneOverlay[] {
+  if (zones.length === 0 || candles.length === 0) return [];
+
+  const sorted = [...candles].sort((a, b) => a.time - b.time);
+
+  const dayGroups = new Map<string, { first: number; last: number }>();
+  for (const c of sorted) {
+    const d = new Date(c.time * 1000);
+    const dateStr = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    const existing = dayGroups.get(dateStr);
+    if (!existing) {
+      dayGroups.set(dateStr, { first: c.time, last: c.time });
+    } else {
+      existing.last = c.time;
+    }
+  }
+
+  const zoneMap = new Map<string, YellowBoxDay>();
+  for (const z of zones) {
+    zoneMap.set(z.date, z);
+  }
+
+  const pocData: Array<{ time: number; value: number }> = [];
+  const ytData: Array<{ time: number; value: number }> = [];
+  const ybData: Array<{ time: number; value: number }> = [];
+  const rtData: Array<{ time: number; value: number }> = [];
+  const rbData: Array<{ time: number; value: number }> = [];
+  const stData: Array<{ time: number; value: number }> = [];
+  const sbData: Array<{ time: number; value: number }> = [];
+
+  for (const [dateStr, bounds] of dayGroups) {
+    const zone = zoneMap.get(dateStr);
+    if (!zone) continue;
+
+    pocData.push({ time: bounds.first, value: zone.poc });
+    pocData.push({ time: bounds.last, value: zone.poc });
+
+    ytData.push({ time: bounds.first, value: zone.yellowTop });
+    ytData.push({ time: bounds.last, value: zone.yellowTop });
+
+    ybData.push({ time: bounds.first, value: zone.yellowBottom });
+    ybData.push({ time: bounds.last, value: zone.yellowBottom });
+
+    rtData.push({ time: bounds.first, value: zone.resistanceTop });
+    rtData.push({ time: bounds.last, value: zone.resistanceTop });
+
+    rbData.push({ time: bounds.first, value: zone.resistanceBot });
+    rbData.push({ time: bounds.last, value: zone.resistanceBot });
+
+    stData.push({ time: bounds.first, value: zone.supportTop });
+    stData.push({ time: bounds.last, value: zone.supportTop });
+
+    sbData.push({ time: bounds.first, value: zone.supportBot });
+    sbData.push({ time: bounds.last, value: zone.supportBot });
+  }
+
+  return [
+    { data: ytData, color: "rgba(202, 178, 50, 0.7)", lineWidth: 1, lineStyle: 0, title: "YB Top" },
+    { data: ybData, color: "rgba(202, 178, 50, 0.7)", lineWidth: 1, lineStyle: 0, title: "YB Bot" },
+    { data: pocData, color: "rgba(168, 85, 247, 0.85)", lineWidth: 2, lineStyle: 4, title: "POC" },
+    { data: rtData, color: "rgba(239, 68, 68, 0.6)", lineWidth: 1, lineStyle: 2, title: "R Top" },
+    { data: rbData, color: "rgba(239, 68, 68, 0.6)", lineWidth: 1, lineStyle: 2, title: "R Bot" },
+    { data: stData, color: "rgba(34, 197, 94, 0.6)", lineWidth: 1, lineStyle: 2, title: "S Top" },
+    { data: sbData, color: "rgba(34, 197, 94, 0.6)", lineWidth: 1, lineStyle: 2, title: "S Bot" },
+  ];
+}
 
 function formatPrice(n: number | undefined | null): string {
   if (n == null) return "—";
@@ -55,6 +184,7 @@ export default function MarketPage() {
   const [interval, setInterval] = useState<"15m" | "60m">("15m");
   const [symbolSearch, setSymbolSearch] = useState("");
   const [highlightDayIndex, setHighlightDayIndex] = useState(0);
+  const [showYellowBox, setShowYellowBox] = useState(true);
 
   const histChartRef = useRef<ChartHandle>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -90,6 +220,16 @@ export default function MarketPage() {
     staleTime: 5 * 60 * 1000,
   });
 
+  const yellowBoxZones = useMemo(() => {
+    if (!historicalDays?.days) return [];
+    return computeYellowBoxZones(historicalDays.days);
+  }, [historicalDays]);
+
+  const zoneOverlays = useMemo(() => {
+    if (!showYellowBox || yellowBoxZones.length === 0 || !continuousData?.candles?.length) return [];
+    return buildZoneOverlays(yellowBoxZones, continuousData.candles);
+  }, [showYellowBox, yellowBoxZones, continuousData]);
+
   const currentPrice = quoteData?.regularMarketPrice ?? intradayData?.meta?.regularMarketPrice;
   const prevClose = quoteData?.regularMarketPreviousClose ?? intradayData?.meta?.previousClose;
   const priceChange = currentPrice != null && prevClose != null ? currentPrice - prevClose : null;
@@ -118,7 +258,6 @@ export default function MarketPage() {
   };
   const categorySymbols = symbolsData?.[selectedCategory] ?? [];
 
-  // Scroll timeline to show highlighted day
   useEffect(() => {
     if (!timelineRef.current || !historicalDays?.days) return;
     const cardWidth = 72;
@@ -127,7 +266,6 @@ export default function MarketPage() {
     timelineRef.current.scrollTo({ left: Math.max(0, scrollLeft), behavior: "smooth" });
   }, [highlightDayIndex, historicalDays]);
 
-  // Jump the continuous chart to a specific day
   const jumpToDay = useCallback((idx: number) => {
     setHighlightDayIndex(idx);
     setDragIndex(idx);
@@ -140,7 +278,6 @@ export default function MarketPage() {
     histChartRef.current.scrollToTime(t);
   }, [historicalDays]);
 
-  // Drag handlers for timeline
   const handleDragStart = useCallback((clientX: number) => {
     isDragging.current = true;
     dragStartX.current = clientX;
@@ -175,7 +312,6 @@ export default function MarketPage() {
 
   return (
     <div className="flex flex-col h-full overflow-auto bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur-sm px-4 py-3 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 mr-2">
           <BarChart3 className="w-5 h-5 text-primary" />
@@ -246,7 +382,6 @@ export default function MarketPage() {
       </header>
 
       <div className="flex flex-col lg:flex-row flex-1 min-h-0 overflow-auto">
-        {/* Sidebar */}
         <aside className="lg:w-52 border-b lg:border-b-0 lg:border-r bg-sidebar flex-shrink-0 overflow-auto">
           <div className="p-2 flex flex-row lg:flex-col gap-1 flex-wrap lg:flex-nowrap">
             {categorySymbols.map((sym) => {
@@ -268,9 +403,7 @@ export default function MarketPage() {
           </div>
         </aside>
 
-        {/* Main content */}
         <main className="flex-1 overflow-auto p-4 flex flex-col gap-6 min-w-0">
-          {/* Price header */}
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <div className="flex items-center gap-3 flex-wrap">
@@ -322,7 +455,6 @@ export default function MarketPage() {
             </div>
           </div>
 
-          {/* Today's intraday chart */}
           <section>
             <div className="rounded-lg border bg-card overflow-hidden">
               {intradayLoading ? (
@@ -346,7 +478,6 @@ export default function MarketPage() {
             </div>
           </section>
 
-          {/* Continuous historical section */}
           <section>
             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
               <div className="flex items-center gap-2">
@@ -362,17 +493,27 @@ export default function MarketPage() {
                   </p>
                 </div>
               </div>
-              {historicalDays?.days?.[highlightDayIndex] && (
-                <div className="flex items-center gap-2">
-                  <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
-                  <span className="text-sm font-medium" data-testid="text-selected-date">
-                    {formatDateFull(historicalDays.days[highlightDayIndex].date)}
-                  </span>
-                </div>
-              )}
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant={showYellowBox ? "default" : "outline"}
+                  data-testid="button-toggle-yellowbox"
+                  onClick={() => setShowYellowBox(!showYellowBox)}
+                  className="text-xs h-7"
+                >
+                  {showYellowBox ? "Yellow Box ON" : "Yellow Box OFF"}
+                </Button>
+                {historicalDays?.days?.[highlightDayIndex] && (
+                  <div className="flex items-center gap-1">
+                    <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
+                    <span className="text-sm font-medium" data-testid="text-selected-date">
+                      {formatDateFull(historicalDays.days[highlightDayIndex].date)}
+                    </span>
+                  </div>
+                )}
+              </div>
             </div>
 
-            {/* Timeline scrubber */}
             <div className="flex items-center gap-2 mb-3">
               <Button
                 size="icon"
@@ -437,13 +578,12 @@ export default function MarketPage() {
               </Button>
             </div>
 
-            {/* Continuous chart */}
             <div className="rounded-lg border bg-card overflow-hidden">
               {continuousLoading ? (
                 <div className="flex items-center justify-center" style={{ height: 440 }}>
                   <div className="flex flex-col items-center gap-3 text-muted-foreground">
                     <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                    <span className="text-sm">Loading 200-day continuous history...</span>
+                    <span className="text-sm">Loading continuous history...</span>
                     <span className="text-xs opacity-60">Fetching intraday data across multiple periods</span>
                   </div>
                 </div>
@@ -460,12 +600,13 @@ export default function MarketPage() {
                   candles={continuousData.candles}
                   height={440}
                   showVolume
+                  zoneOverlays={zoneOverlays}
                 />
               )}
             </div>
 
             <div className="mt-2 flex gap-3 text-xs text-muted-foreground justify-between flex-wrap">
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 flex-wrap">
                 <span className="flex items-center gap-1">
                   <span className="w-3 h-3 rounded-sm bg-green-500 inline-block" /> RTH up
                 </span>
@@ -478,6 +619,22 @@ export default function MarketPage() {
                 <span className="flex items-center gap-1">
                   <span className="w-3 h-3 rounded-sm bg-red-300 inline-block" /> ETH down
                 </span>
+                {showYellowBox && (
+                  <>
+                    <span className="border-l border-border pl-3 flex items-center gap-1">
+                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(202, 178, 50, 0.9)" }} /> Yellow Box
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(168, 85, 247, 0.9)" }} /> POC
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-3 h-1 rounded-sm bg-red-500 inline-block" /> Resistance
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-3 h-1 rounded-sm bg-green-500 inline-block" /> Support
+                    </span>
+                  </>
+                )}
               </div>
               <span>
                 {continuousData?.candles?.length?.toLocaleString()} candles ·

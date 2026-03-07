@@ -3,11 +3,14 @@ import {
   createChart,
   CandlestickSeries,
   HistogramSeries,
+  LineSeries,
   type IChartApi,
   type ISeriesApi,
   type CandlestickData,
   type HistogramData,
   type WhitespaceData,
+  type LineData,
+  LineStyle,
   ColorType,
 } from "lightweight-charts";
 
@@ -18,7 +21,15 @@ export interface CandleBar {
   low: number;
   close: number;
   volume?: number;
-  rth?: boolean; // true = regular trading hours, false/undefined = extended
+  rth?: boolean;
+}
+
+export interface ZoneOverlay {
+  data: Array<{ time: number; value: number }>;
+  color: string;
+  lineWidth: number;
+  lineStyle?: number;
+  title?: string;
 }
 
 export interface ChartHandle {
@@ -29,31 +40,31 @@ interface CandlestickChartProps {
   candles: CandleBar[];
   height?: number;
   showVolume?: boolean;
+  zoneOverlays?: ZoneOverlay[];
 }
 
-// RTH colors
 const RTH_UP = "#22c55e";
 const RTH_DOWN = "#ef4444";
 const RTH_UP_WICK = "#22c55e";
 const RTH_DOWN_WICK = "#ef4444";
 
-// ETH colors (muted / translucent feel)
 const ETH_UP = "#86efac";
 const ETH_DOWN = "#fca5a5";
 const ETH_UP_WICK = "#4ade80";
 const ETH_DOWN_WICK = "#f87171";
 
 export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
-  function CandlestickChart({ candles, height = 420, showVolume = true }, ref) {
+  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
     const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+    const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
 
     useImperativeHandle(ref, () => ({
       scrollToTime(timestamp: number) {
         if (!chartRef.current) return;
-        const range = 12 * 3600; // show ±12h around target
+        const range = 12 * 3600;
         chartRef.current.timeScale().setVisibleRange({
           from: (timestamp - range) as any,
           to: (timestamp + range) as any,
@@ -68,7 +79,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       const chart = createChart(containerRef.current, {
         width: containerRef.current.offsetWidth,
-        height: showVolume ? height : height,
+        height,
         layout: {
           background: {
             type: ColorType.Solid,
@@ -156,6 +167,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         chartRef.current = null;
         candleSeriesRef.current = null;
         volumeSeriesRef.current = null;
+        overlaySeriesRef.current = [];
       };
     }, [height, showVolume]);
 
@@ -190,7 +202,6 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       const candleData: (CandlestickData | WhitespaceData)[] = [];
       const volData: (HistogramData | WhitespaceData)[] = [];
-
       const GAP_COUNT = 3;
 
       for (let i = 0; i < sorted.length; i++) {
@@ -231,6 +242,38 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       chartRef.current.timeScale().fitContent();
     }, [candles]);
+
+    useEffect(() => {
+      const chart = chartRef.current;
+      if (!chart) return;
+
+      for (const s of overlaySeriesRef.current) {
+        try { chart.removeSeries(s); } catch {}
+      }
+      overlaySeriesRef.current = [];
+
+      if (!zoneOverlays || zoneOverlays.length === 0) return;
+
+      for (const overlay of zoneOverlays) {
+        if (overlay.data.length === 0) continue;
+        const series = chart.addSeries(LineSeries, {
+          color: overlay.color,
+          lineWidth: overlay.lineWidth as any,
+          lineStyle: (overlay.lineStyle ?? LineStyle.Solid) as any,
+          lastValueVisible: false,
+          priceLineVisible: false,
+          crosshairMarkerVisible: false,
+          title: overlay.title ?? "",
+        });
+
+        const lineData: LineData[] = overlay.data
+          .sort((a, b) => a.time - b.time)
+          .map((d) => ({ time: d.time as any, value: d.value }));
+
+        series.setData(lineData);
+        overlaySeriesRef.current.push(series);
+      }
+    }, [zoneOverlays]);
 
     return (
       <div

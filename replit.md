@@ -12,12 +12,13 @@ A real-time and historical market charting application using live Yahoo Finance 
 - **Symbol Support**: Stocks (AAPL, MSFT, etc.), ETFs (SPY, QQQ, etc.), Futures (ES=F, GC=F, etc.), Indices (^GSPC, ^VIX, etc.)
 - **Volume bars** shown below each candlestick chart
 - **Live quote data** showing price, change, day high/low, volume
+- **Milk's Yellow Box Strategy**: Per-day zone overlays on the historical chart, recalculated for each trading day. Includes Yellow Box (top/bottom), POC line (opening price), Resistance zone (top/bottom), and Support zone (top/bottom). Toggle on/off via button. Algorithm uses 14-day lookback average range, percentage-based distance, and 0.3 zone thickness fraction.
 
 ## Architecture
 
 ### Frontend
 - `client/src/pages/market.tsx` — Main market page: intraday chart, continuous history chart, timeline scrubber, symbol selector sidebar
-- `client/src/components/CandlestickChart.tsx` — TradingView lightweight-charts v5 component; supports ETH/RTH per-bar coloring and `scrollToTime()` via forwardRef
+- `client/src/components/CandlestickChart.tsx` — TradingView lightweight-charts v5 component; supports ETH/RTH per-bar coloring, `scrollToTime()` via forwardRef, and dynamic zone overlay rendering via `zoneOverlays` prop (LineSeries)
 
 ### Backend
 - `server/routes.ts` — Express API routes fetching from Yahoo Finance (yahoo-finance2 v3)
