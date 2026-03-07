@@ -413,7 +413,7 @@ export async function registerRoutes(
               high: r.h,
               low: r.l,
               close: r.c,
-              volume: r.v || 0,
+              volume: Math.round(r.v || 0),
             }));
             await db.insert(cachedCandles).values(values).onConflictDoNothing();
           }
