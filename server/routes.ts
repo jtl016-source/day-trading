@@ -498,12 +498,17 @@ export async function registerRoutes(
     const { symbol, interval } = req.params;
     const sym = symbol.toUpperCase();
     const resolution = interval === "60m" ? "60" : "5";
+    const { from, to } = req.query;
     try {
+      const conditions = [
+        eq(cachedCandles.symbol, sym),
+        eq(cachedCandles.resolution, resolution),
+      ];
+      if (from) conditions.push(gte(cachedCandles.timestamp, Number(from)));
+      if (to) conditions.push(lte(cachedCandles.timestamp, Number(to)));
+
       const rows = await db.select().from(cachedCandles)
-        .where(and(
-          eq(cachedCandles.symbol, sym),
-          eq(cachedCandles.resolution, resolution),
-        ))
+        .where(and(...conditions))
         .orderBy(asc(cachedCandles.timestamp));
 
       if (rows.length === 0) {

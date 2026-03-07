@@ -1,19 +1,14 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { CandlestickChart, type CandleBar, type ChartHandle, type ZoneOverlay, type BandOverlay } from "@/components/CandlestickChart";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  TrendingUp,
-  TrendingDown,
-  Activity,
   BarChart3,
   Search,
   ChevronLeft,
   ChevronRight,
-  History,
   CalendarDays,
   Crosshair,
   Maximize2,
@@ -216,178 +211,89 @@ function formatDate(dateStr: string): string {
 function formatDateFull(dateStr: string): string {
   const [y, m, d] = dateStr.split("-");
   const date = new Date(Number(y), Number(m) - 1, Number(d));
-  return date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+  return date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+
+function dateToTimestamp(dateStr: string, hour: number = 0): number {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return Math.floor(new Date(Date.UTC(y, m - 1, d, hour, 0, 0)).getTime() / 1000);
 }
 
 export default function MarketPage() {
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
   const [selectedCategory, setSelectedCategory] = useState<keyof SymbolsData>("etfs");
-  const [interval, setInterval] = useState<"15m" | "60m">("15m");
   const [symbolSearch, setSymbolSearch] = useState("");
-  const [highlightDayIndex, setHighlightDayIndex] = useState(0);
   const [showYellowBox, setShowYellowBox] = useState(true);
   const [dragZoomActive, setDragZoomActive] = useState(false);
+  const [startDayIdx, setStartDayIdx] = useState(0);
+  const [endDayIdx, setEndDayIdx] = useState(9);
+  const [windowSize, setWindowSize] = useState(10);
 
-  const histChartRef = useRef<ChartHandle>(null);
+  const chartRef = useRef<ChartHandle>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
-  const isDragging = useRef(false);
-  const dragStartX = useRef(0);
-  const dragStartIndex = useRef(0);
-  const [dragIndex, setDragIndex] = useState(0);
 
   const { data: symbolsData } = useQuery<SymbolsData>({ queryKey: ["/api/market/symbols"] });
 
-  const { data: quoteData } = useQuery<any>({
-    queryKey: ["/api/market/quote", selectedSymbol],
-    refetchInterval: 30000,
+  const { data: cachedDaysData, isLoading: daysLoading } = useQuery<{ symbol: string; days: DayInfo[] }>({
+    queryKey: ["/api/data/cached-days", selectedSymbol],
+    staleTime: 60 * 1000,
   });
 
-  const { data: intradayData, isLoading: intradayLoading } = useQuery<{
-    symbol: string; interval: string;
-    meta: { regularMarketPrice?: number; previousClose?: number; currency?: string; exchangeName?: string };
-    candles: CandleBar[];
-  }>({
-    queryKey: ["/api/market/intraday", selectedSymbol, interval],
-    refetchInterval: 60000,
-  });
+  const sortedDays = useMemo(() => {
+    if (!cachedDaysData?.days?.length) return [];
+    return [...cachedDaysData.days].sort((a, b) => a.date.localeCompare(b.date));
+  }, [cachedDaysData]);
 
-  const { data: historicalDays, isLoading: histDaysLoading } = useQuery<{
-    symbol: string; days: DayInfo[];
-  }>({ queryKey: ["/api/market/historical-days", selectedSymbol] });
+  const hasCachedData = sortedDays.length > 0;
 
-  const cachedInterval = interval === "60m" ? "60m" : "5m";
+  useEffect(() => {
+    if (sortedDays.length > 0) {
+      const end = sortedDays.length - 1;
+      const start = Math.max(0, end - windowSize + 1);
+      setStartDayIdx(start);
+      setEndDayIdx(end);
+    }
+  }, [sortedDays.length, selectedSymbol, windowSize]);
 
-  const { data: cachedContinuousData } = useQuery<{
+  const windowedDays = useMemo(() => {
+    if (sortedDays.length === 0) return [];
+    return sortedDays.slice(startDayIdx, endDayIdx + 1);
+  }, [sortedDays, startDayIdx, endDayIdx]);
+
+  const fromTimestamp = useMemo(() => {
+    if (windowedDays.length === 0) return 0;
+    return dateToTimestamp(windowedDays[0].date, 0);
+  }, [windowedDays]);
+
+  const toTimestamp = useMemo(() => {
+    if (windowedDays.length === 0) return 0;
+    return dateToTimestamp(windowedDays[windowedDays.length - 1].date, 23) + 3600;
+  }, [windowedDays]);
+
+  const { data: candleData, isLoading: candlesLoading } = useQuery<{
     symbol: string; interval: string; candles: CandleBar[]; source: string;
   }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, cachedInterval],
+    queryKey: ["/api/data/cached-continuous", selectedSymbol, "5m", fromTimestamp, toTimestamp],
+    queryFn: async () => {
+      const res = await fetch(`/api/data/cached-continuous/${selectedSymbol}/5m?from=${fromTimestamp}&to=${toTimestamp}`);
+      if (!res.ok) throw new Error("Failed to fetch candles");
+      return res.json();
+    },
+    enabled: hasCachedData && fromTimestamp > 0 && toTimestamp > 0,
     staleTime: 60 * 1000,
   });
-
-  const hasCachedData = (cachedContinuousData?.candles?.length ?? 0) > 0;
-
-  const { data: cachedDaysData } = useQuery<{ symbol: string; days: DayInfo[] }>({
-    queryKey: ["/api/data/cached-days", selectedSymbol],
-    enabled: hasCachedData,
-    staleTime: 60 * 1000,
-  });
-
-  const { data: liveContinuousData, isLoading: liveContinuousLoading } = useQuery<{
-    symbol: string; interval: string; candles: CandleBar[];
-  }>({
-    queryKey: ["/api/market/historical-continuous", selectedSymbol, interval],
-    staleTime: 5 * 60 * 1000,
-    enabled: !hasCachedData,
-  });
-
-  const continuousData = hasCachedData ? cachedContinuousData : liveContinuousData;
-  const continuousLoading = hasCachedData ? false : liveContinuousLoading;
-
-  const effectiveDays = hasCachedData && cachedDaysData?.days?.length
-    ? cachedDaysData
-    : historicalDays;
 
   const yellowBoxZones = useMemo(() => {
-    if (!effectiveDays?.days) return [];
-    return computeYellowBoxZones(effectiveDays.days);
-  }, [effectiveDays]);
+    if (!cachedDaysData?.days?.length) return [];
+    return computeYellowBoxZones(cachedDaysData.days);
+  }, [cachedDaysData]);
 
   const { zoneOverlays, bandOverlayData } = useMemo(() => {
-    if (!showYellowBox || yellowBoxZones.length === 0 || !continuousData?.candles?.length)
+    if (!showYellowBox || yellowBoxZones.length === 0 || !candleData?.candles?.length)
       return { zoneOverlays: [] as ZoneOverlay[], bandOverlayData: [] as BandOverlay[] };
-    const result = buildZoneOverlays(yellowBoxZones, continuousData.candles);
+    const result = buildZoneOverlays(yellowBoxZones, candleData.candles);
     return { zoneOverlays: result.lines, bandOverlayData: result.bands };
-  }, [showYellowBox, yellowBoxZones, continuousData]);
-
-  const { intradayZoneOverlays, intradayBandOverlays } = useMemo(() => {
-    if (!showYellowBox || !historicalDays?.days?.length || !intradayData?.candles?.length)
-      return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
-
-    const sorted = [...intradayData.candles].sort((a, b) => a.time - b.time);
-
-    const todayDate = new Date(sorted[0].time * 1000);
-    const todayStr = `${todayDate.getUTCFullYear()}-${String(todayDate.getUTCMonth() + 1).padStart(2, "0")}-${String(todayDate.getUTCDate()).padStart(2, "0")}`;
-
-    const chronoDays = [...historicalDays.days].reverse();
-
-    const todayIdx = chronoDays.findIndex(d => d.date === todayStr);
-    let prevDayIdx: number;
-    if (todayIdx > 0) {
-      prevDayIdx = todayIdx - 1;
-    } else if (todayIdx === -1) {
-      prevDayIdx = chronoDays.length - 1;
-    } else {
-      return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
-    }
-
-    const prevClose = chronoDays[prevDayIdx].close;
-    const poc = prevClose;
-
-    const targetIdx = prevDayIdx + 1 < chronoDays.length ? prevDayIdx + 1 : prevDayIdx;
-    const lookbackStart = Math.max(0, targetIdx - LOOKBACK_DAYS);
-    const upMoves: number[] = [];
-    const downMoves: number[] = [];
-    for (let k = lookbackStart; k < targetIdx; k++) {
-      if (k < 1) continue;
-      const pc = chronoDays[k - 1].close;
-      upMoves.push(chronoDays[k].high - pc);
-      downMoves.push(pc - chronoDays[k].low);
-    }
-
-    if (upMoves.length === 0) {
-      return { intradayZoneOverlays: [] as ZoneOverlay[], intradayBandOverlays: [] as BandOverlay[] };
-    }
-
-    const avgUp = upMoves.reduce((a, b) => a + b, 0) / upMoves.length;
-    const avgDown = downMoves.reduce((a, b) => a + b, 0) / downMoves.length;
-    const maxUp = Math.max(...upMoves);
-    const maxDown = Math.max(...downMoves);
-    const avgRange = (avgUp + avgDown) / 2;
-    const halfBox = avgRange * YELLOW_BOX_FRACTION;
-
-    const todayZone: YellowBoxDay = {
-      date: "today",
-      poc,
-      yellowTop: poc + halfBox,
-      yellowBottom: poc - halfBox,
-      avgRangeHigh: poc + avgUp,
-      avgRangeLow: poc - avgDown,
-      maxRangeHigh: poc + maxUp,
-      maxRangeLow: poc - maxDown,
-    };
-
-    const firstTime = sorted[0].time;
-    const lastTime = sorted[sorted.length - 1].time;
-
-    const makePair = (val: number) => [
-      { time: firstTime, value: val },
-      { time: lastTime, value: val },
-    ];
-
-    const lines: ZoneOverlay[] = [
-      { data: makePair(todayZone.yellowTop), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
-      { data: makePair(todayZone.yellowBottom), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
-      { data: makePair(todayZone.poc), color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "POC" },
-      { data: makePair(todayZone.avgRangeHigh), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range H" },
-      { data: makePair(todayZone.avgRangeLow), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range L" },
-      { data: makePair(todayZone.maxRangeHigh), color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range H" },
-      { data: makePair(todayZone.maxRangeLow), color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range L" },
-    ];
-
-    const bands: BandOverlay[] = [
-      { topPrice: todayZone.yellowTop, bottomPrice: todayZone.yellowBottom, fillColor: "rgba(180, 160, 40, 0.18)", fromTime: firstTime, toTime: lastTime },
-      { topPrice: todayZone.avgRangeHigh, bottomPrice: todayZone.yellowTop, fillColor: "rgba(200, 40, 40, 0.15)", fromTime: firstTime, toTime: lastTime },
-      { topPrice: todayZone.yellowBottom, bottomPrice: todayZone.avgRangeLow, fillColor: "rgba(30, 160, 60, 0.15)", fromTime: firstTime, toTime: lastTime },
-    ];
-
-    return { intradayZoneOverlays: lines, intradayBandOverlays: bands };
-  }, [showYellowBox, historicalDays, intradayData]);
-
-  const currentPrice = quoteData?.regularMarketPrice ?? intradayData?.meta?.regularMarketPrice;
-  const prevClose = quoteData?.regularMarketPreviousClose ?? intradayData?.meta?.previousClose;
-  const priceChange = currentPrice != null && prevClose != null ? currentPrice - prevClose : null;
-  const priceChangePct = priceChange != null && prevClose != null ? (priceChange / prevClose) * 100 : null;
-  const isPositive = priceChange != null ? priceChange >= 0 : null;
+  }, [showYellowBox, yellowBoxZones, candleData]);
 
   const allSymbolsForSearch = symbolsData
     ? [
@@ -411,61 +317,47 @@ export default function MarketPage() {
   };
   const categorySymbols = symbolsData?.[selectedCategory] ?? [];
 
+  const shiftWindow = useCallback((direction: number) => {
+    if (sortedDays.length === 0) return;
+    const newStart = Math.max(0, Math.min(sortedDays.length - 1, startDayIdx + direction));
+    const newEnd = Math.min(sortedDays.length - 1, newStart + windowSize - 1);
+    setStartDayIdx(newStart);
+    setEndDayIdx(newEnd);
+  }, [sortedDays.length, startDayIdx, windowSize]);
+
+  const jumpToRange = useCallback((idx: number) => {
+    if (sortedDays.length === 0) return;
+    const halfW = Math.floor(windowSize / 2);
+    const center = Math.max(halfW, Math.min(sortedDays.length - 1 - (windowSize - halfW - 1), idx));
+    const newStart = Math.max(0, center - halfW);
+    const newEnd = Math.min(sortedDays.length - 1, newStart + windowSize - 1);
+    setStartDayIdx(newStart);
+    setEndDayIdx(newEnd);
+  }, [sortedDays.length, windowSize]);
+
+  const handleWindowSizeChange = useCallback((newSize: number) => {
+    setWindowSize(newSize);
+    if (sortedDays.length === 0) return;
+    const newStart = Math.max(0, endDayIdx - newSize + 1);
+    setStartDayIdx(newStart);
+  }, [sortedDays.length, endDayIdx]);
+
   useEffect(() => {
-    if (!timelineRef.current || !effectiveDays?.days) return;
-    const cardWidth = 72;
+    if (!timelineRef.current || sortedDays.length === 0) return;
+    const cardWidth = 56;
     const containerWidth = timelineRef.current.offsetWidth;
-    const scrollLeft = highlightDayIndex * cardWidth - containerWidth / 2 + cardWidth / 2;
+    const centerIdx = Math.floor((startDayIdx + endDayIdx) / 2);
+    const scrollLeft = centerIdx * cardWidth - containerWidth / 2 + cardWidth / 2;
     timelineRef.current.scrollTo({ left: Math.max(0, scrollLeft), behavior: "smooth" });
-  }, [highlightDayIndex, effectiveDays]);
+  }, [startDayIdx, endDayIdx, sortedDays.length]);
 
-  const jumpToDay = useCallback((idx: number) => {
-    setHighlightDayIndex(idx);
-    setDragIndex(idx);
-    const days = effectiveDays?.days;
-    if (!days || !histChartRef.current) return;
-    const day = days[idx];
-    if (!day) return;
-    const [y, m, d] = day.date.split("-").map(Number);
-    const t = Math.floor(new Date(y, m - 1, d, 13, 30, 0).getTime() / 1000);
-    histChartRef.current.scrollToTime(t);
-  }, [effectiveDays]);
+  const windowedCandleData = candleData?.candles ?? [];
 
-  const handleDragStart = useCallback((clientX: number) => {
-    isDragging.current = true;
-    dragStartX.current = clientX;
-    dragStartIndex.current = highlightDayIndex;
-  }, [highlightDayIndex]);
-
-  const handleDragMove = useCallback((clientX: number) => {
-    if (!isDragging.current || !effectiveDays?.days) return;
-    const dx = dragStartX.current - clientX;
-    const step = Math.round(dx / 40);
-    const newIndex = Math.max(0, Math.min(effectiveDays.days.length - 1, dragStartIndex.current + step));
-    setDragIndex(newIndex);
-    setHighlightDayIndex(newIndex);
-  }, [effectiveDays]);
-
-  const handleDragEnd = useCallback(() => {
-    if (!isDragging.current) return;
-    isDragging.current = false;
-    jumpToDay(dragIndex);
-  }, [dragIndex, jumpToDay]);
-
-  useEffect(() => {
-    const onMouseUp = () => handleDragEnd();
-    const onMouseMove = (e: MouseEvent) => handleDragMove(e.clientX);
-    window.addEventListener("mouseup", onMouseUp);
-    window.addEventListener("mousemove", onMouseMove);
-    return () => {
-      window.removeEventListener("mouseup", onMouseUp);
-      window.removeEventListener("mousemove", onMouseMove);
-    };
-  }, [handleDragMove, handleDragEnd]);
+  const currentDayInfo = windowedDays.length > 0 ? windowedDays[windowedDays.length - 1] : null;
 
   return (
     <div className="flex flex-col h-full overflow-auto bg-background">
-      <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur-sm px-4 py-3 flex flex-wrap items-center gap-3">
+      <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur-sm px-4 py-2.5 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 mr-2">
           <BarChart3 className="w-5 h-5 text-primary" />
           <span className="font-semibold text-sm tracking-tight">MarketView</span>
@@ -479,7 +371,7 @@ export default function MarketPage() {
               placeholder="Search symbol..."
               value={symbolSearch}
               onChange={(e) => setSymbolSearch(e.target.value)}
-              className="pl-8 h-9 w-44 text-sm"
+              className="pl-8 h-8 w-40 text-sm"
             />
             {filteredSearch.length > 0 && (
               <div className="absolute top-full left-0 mt-1 w-64 bg-popover border border-popover-border rounded-md shadow-lg z-50 overflow-hidden">
@@ -487,7 +379,7 @@ export default function MarketPage() {
                   <button
                     key={s.symbol}
                     data-testid={`button-search-result-${s.symbol}`}
-                    className="w-full px-3 py-2 text-left hover-elevate flex items-center justify-between gap-2 text-sm"
+                    className="w-full px-3 py-2 text-left hover:bg-accent flex items-center justify-between gap-2 text-sm"
                     onClick={() => {
                       setSelectedSymbol(s.symbol);
                       setSelectedCategory(s.category as keyof SymbolsData);
@@ -510,6 +402,7 @@ export default function MarketPage() {
                 variant={selectedCategory === cat ? "default" : "outline"}
                 data-testid={`button-category-${cat}`}
                 onClick={() => setSelectedCategory(cat)}
+                className="h-7 text-xs"
               >
                 {categoryLabels[cat]}
               </Button>
@@ -519,7 +412,7 @@ export default function MarketPage() {
 
         <div className="flex items-center gap-2">
           <Link href="/data">
-            <Button size="sm" variant="outline" data-testid="button-data-download" className="text-xs gap-1.5">
+            <Button size="sm" variant="outline" data-testid="button-data-download" className="text-xs gap-1.5 h-7">
               <Database className="w-3.5 h-3.5" />
               Data
             </Button>
@@ -528,20 +421,11 @@ export default function MarketPage() {
             <span className="w-2 h-2 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} />RTH
             <span className="w-2 h-2 rounded-sm inline-block ml-1" style={{ backgroundColor: "#26a69a80" }} />ETH
           </div>
-          <Select value={interval} onValueChange={(v) => setInterval(v as "15m" | "60m")}>
-            <SelectTrigger className="w-24" data-testid="select-interval">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="15m">15 min</SelectItem>
-              <SelectItem value="60m">60 min</SelectItem>
-            </SelectContent>
-          </Select>
         </div>
       </header>
 
       <div className="flex flex-col lg:flex-row flex-1 min-h-0 overflow-auto">
-        <aside className="lg:w-52 border-b lg:border-b-0 lg:border-r bg-sidebar flex-shrink-0 overflow-auto">
+        <aside className="lg:w-48 border-b lg:border-b-0 lg:border-r bg-sidebar flex-shrink-0 overflow-auto">
           <div className="p-2 flex flex-row lg:flex-col gap-1 flex-wrap lg:flex-nowrap">
             {categorySymbols.map((sym) => {
               const isSelected = sym.symbol === selectedSymbol;
@@ -549,9 +433,9 @@ export default function MarketPage() {
                 <button
                   key={sym.symbol}
                   data-testid={`button-symbol-${sym.symbol}`}
-                  onClick={() => { setSelectedSymbol(sym.symbol); setHighlightDayIndex(0); }}
-                  className={`text-left rounded-md px-3 py-2 text-sm transition-colors hover-elevate w-full lg:w-auto ${
-                    isSelected ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium" : "text-sidebar-foreground"
+                  onClick={() => setSelectedSymbol(sym.symbol)}
+                  className={`text-left rounded-md px-3 py-1.5 text-sm transition-colors w-full lg:w-auto ${
+                    isSelected ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium" : "text-sidebar-foreground hover:bg-sidebar-accent/50"
                   }`}
                 >
                   <div className="font-semibold text-xs">{sym.symbol}</div>
@@ -562,289 +446,265 @@ export default function MarketPage() {
           </div>
         </aside>
 
-        <main className="flex-1 overflow-auto p-4 flex flex-col gap-6 min-w-0">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-3 flex-wrap">
-                <h1 className="text-2xl font-bold tracking-tight" data-testid="text-symbol">{selectedSymbol}</h1>
-                {quoteData?.shortName && (
-                  <span className="text-sm text-muted-foreground" data-testid="text-company-name">{quoteData.shortName}</span>
-                )}
-                <Badge variant="outline" className="text-xs" data-testid="badge-exchange">
-                  {quoteData?.fullExchangeName ?? intradayData?.meta?.exchangeName ?? "—"}
-                </Badge>
+        <main className="flex-1 overflow-auto p-3 flex flex-col gap-3 min-w-0">
+          {!hasCachedData && !daysLoading ? (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="text-center text-muted-foreground max-w-md">
+                <Database className="w-12 h-12 mx-auto mb-4 opacity-30" />
+                <h2 className="text-lg font-semibold mb-2">No Cached Data for {selectedSymbol}</h2>
+                <p className="text-sm mb-4">
+                  Download historical data first using the Data page to view charts with Yellow Box strategy overlays.
+                </p>
+                <Link href="/data">
+                  <Button data-testid="button-go-to-data">
+                    <Database className="w-4 h-4 mr-2" />
+                    Go to Data Download
+                  </Button>
+                </Link>
               </div>
-              <div className="flex items-center gap-3 mt-2 flex-wrap">
-                {currentPrice != null ? (
-                  <span className="text-3xl font-bold font-mono" data-testid="text-current-price">
-                    {formatPrice(currentPrice)}
-                  </span>
-                ) : (
-                  <Skeleton className="h-8 w-32" />
-                )}
-                {priceChange != null && (
-                  <div
-                    className={`flex items-center gap-1 ${isPositive ? "text-[#26a69a]" : "text-[#ef5350]"}`}
-                    data-testid="text-price-change"
+            </div>
+          ) : daysLoading ? (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="flex flex-col items-center gap-3 text-muted-foreground">
+                <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                <span className="text-sm">Loading cached data...</span>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-3">
+                  <h1 className="text-xl font-bold tracking-tight" data-testid="text-symbol">{selectedSymbol}</h1>
+                  {currentDayInfo && (
+                    <div className="flex items-center gap-3 text-sm">
+                      <span className="text-muted-foreground">
+                        O: <span className="text-foreground font-mono">{formatPrice(currentDayInfo.open)}</span>
+                      </span>
+                      <span className="text-muted-foreground">
+                        H: <span className="text-foreground font-mono">{formatPrice(currentDayInfo.high)}</span>
+                      </span>
+                      <span className="text-muted-foreground">
+                        L: <span className="text-foreground font-mono">{formatPrice(currentDayInfo.low)}</span>
+                      </span>
+                      <span className="text-muted-foreground">
+                        C: <span className="text-foreground font-mono">{formatPrice(currentDayInfo.close)}</span>
+                      </span>
+                      <span className="text-muted-foreground">
+                        V: <span className="text-foreground font-mono">{formatVolume(currentDayInfo.volume)}</span>
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant={showYellowBox ? "default" : "outline"}
+                    data-testid="button-toggle-yellowbox"
+                    onClick={() => setShowYellowBox(!showYellowBox)}
+                    className="text-xs h-7"
                   >
-                    {isPositive ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
-                    <span className="font-semibold font-mono">{isPositive ? "+" : ""}{formatPrice(priceChange)}</span>
-                    <span className="font-mono text-sm">({isPositive ? "+" : ""}{priceChangePct?.toFixed(2)}%)</span>
-                  </div>
-                )}
+                    {showYellowBox ? "Yellow Box ON" : "Yellow Box OFF"}
+                  </Button>
+                </div>
               </div>
-              <div className="flex gap-4 mt-1 text-xs text-muted-foreground flex-wrap">
-                {quoteData?.regularMarketVolume != null && (
-                  <span>Vol: <span className="text-foreground font-medium">{formatVolume(quoteData.regularMarketVolume)}</span></span>
-                )}
-                {quoteData?.regularMarketDayHigh != null && (
-                  <span>H: <span className="text-foreground font-medium">{formatPrice(quoteData.regularMarketDayHigh)}</span></span>
-                )}
-                {quoteData?.regularMarketDayLow != null && (
-                  <span>L: <span className="text-foreground font-medium">{formatPrice(quoteData.regularMarketDayLow)}</span></span>
-                )}
-                {prevClose != null && (
-                  <span>Prev Close: <span className="text-foreground font-medium">{formatPrice(prevClose)}</span></span>
-                )}
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <Activity className="w-4 h-4 text-primary" />
-                <span>Today's Session · {interval} candles · ETH + RTH</span>
-              </div>
-              <Button
-                size="sm"
-                variant={showYellowBox ? "default" : "outline"}
-                data-testid="button-toggle-yellowbox-intraday"
-                onClick={() => setShowYellowBox(!showYellowBox)}
-                className="text-xs h-7"
-              >
-                {showYellowBox ? "Yellow Box ON" : "Yellow Box OFF"}
-              </Button>
-            </div>
-          </div>
 
-          <section>
-            <div className="rounded-lg border bg-card overflow-hidden">
-              {intradayLoading ? (
-                <div className="flex items-center justify-center" style={{ height: 380 }}>
-                  <div className="flex flex-col items-center gap-3 text-muted-foreground">
-                    <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                    <span className="text-sm">Loading today's market data...</span>
-                  </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <CalendarDays className="w-4 h-4 text-muted-foreground" />
+                  <span className="text-xs text-muted-foreground">Date Window:</span>
                 </div>
-              ) : !intradayData?.candles?.length ? (
-                <div className="flex items-center justify-center" style={{ height: 380 }}>
-                  <div className="text-center text-muted-foreground">
-                    <BarChart3 className="w-10 h-10 mx-auto mb-2 opacity-30" />
-                    <p className="text-sm">No trading data available for today</p>
-                    <p className="text-xs mt-1">Market may be closed or pre-session</p>
-                  </div>
-                </div>
-              ) : (
-                <CandlestickChart
-                  candles={intradayData.candles}
-                  height={380}
-                  showVolume
-                  zoneOverlays={intradayZoneOverlays}
-                  bandOverlays={intradayBandOverlays}
-                />
-              )}
-            </div>
-          </section>
 
-          <section>
-            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-              <div className="flex items-center gap-2">
-                <History className="w-4 h-4 text-primary" />
-                <div>
-                  <h2 className="text-base font-semibold tracking-tight">
-                    {hasCachedData ? "Cached" : interval === "15m" ? "60-Day" : "200-Day"} Continuous History
-                  </h2>
-                  <p className="text-xs text-muted-foreground">
-                    {hasCachedData
-                      ? `5m cached data · ${continuousData?.candles?.length?.toLocaleString() ?? 0} bars · from Polygon.io`
-                      : interval === "15m"
-                      ? "15m ETH + RTH · last 60 days · switch to 60m for full 200-day view"
-                      : "60m ETH + RTH · full 200 trading days · drag timeline or zoom/pan"}
-                  </p>
+                {windowedDays.length > 0 && (
+                  <span className="text-xs font-medium" data-testid="text-date-range">
+                    {formatDateFull(windowedDays[0].date)} — {formatDateFull(windowedDays[windowedDays.length - 1].date)}
+                  </span>
+                )}
+
+                <div className="flex items-center gap-1 ml-auto">
+                  <span className="text-xs text-muted-foreground">Days:</span>
+                  <Select value={String(windowSize)} onValueChange={(v) => handleWindowSizeChange(Number(v))}>
+                    <SelectTrigger className="w-20 h-7 text-xs" data-testid="select-window-size">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="5">5 days</SelectItem>
+                      <SelectItem value="10">10 days</SelectItem>
+                      <SelectItem value="20">20 days</SelectItem>
+                      <SelectItem value="40">40 days</SelectItem>
+                      <SelectItem value="60">60 days</SelectItem>
+                      <SelectItem value="120">120 days</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+
+              <div className="flex items-center gap-1.5">
+                <Button
+                  size="icon"
+                  variant="outline"
+                  data-testid="button-window-prev"
+                  disabled={startDayIdx <= 0}
+                  onClick={() => shiftWindow(-windowSize)}
+                  className="h-7 w-7"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </Button>
                 <Button
                   size="sm"
-                  variant={showYellowBox ? "default" : "outline"}
-                  data-testid="button-toggle-yellowbox"
-                  onClick={() => setShowYellowBox(!showYellowBox)}
-                  className="text-xs h-7"
+                  variant="outline"
+                  data-testid="button-window-prev-day"
+                  disabled={startDayIdx <= 0}
+                  onClick={() => shiftWindow(-1)}
+                  className="h-7 text-xs px-2"
                 >
-                  {showYellowBox ? "Yellow Box ON" : "Yellow Box OFF"}
+                  -1
                 </Button>
-                {effectiveDays?.days?.[highlightDayIndex] && (
-                  <div className="flex items-center gap-1">
-                    <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
-                    <span className="text-sm font-medium" data-testid="text-selected-date">
-                      {formatDateFull(effectiveDays.days[highlightDayIndex].date)}
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
 
-            <div className="flex items-center gap-2 mb-3">
-              <Button
-                size="icon"
-                variant="outline"
-                data-testid="button-hist-prev"
-                disabled={highlightDayIndex <= 0}
-                onClick={() => jumpToDay(Math.max(0, highlightDayIndex - 1))}
-              >
-                <ChevronLeft className="w-4 h-4" />
-              </Button>
-
-              <div
-                ref={timelineRef}
-                data-testid="timeline-scroll"
-                className="flex-1 overflow-x-auto select-none"
-                style={{ cursor: isDragging.current ? "grabbing" : "grab", scrollbarWidth: "none" }}
-                onMouseDown={(e) => { e.preventDefault(); handleDragStart(e.clientX); }}
-                onTouchStart={(e) => handleDragStart(e.touches[0].clientX)}
-                onTouchMove={(e) => handleDragMove(e.touches[0].clientX)}
-                onTouchEnd={handleDragEnd}
-              >
-                <div className="flex gap-1 px-1 py-1" style={{ width: "max-content" }}>
-                  {histDaysLoading
-                    ? Array.from({ length: 20 }).map((_, i) => (
-                        <Skeleton key={i} className="w-16 h-14 rounded flex-shrink-0" />
-                      ))
-                    : (effectiveDays?.days ?? []).map((day, idx) => {
-                        const isUp = day.close >= day.open;
-                        const isSelected = idx === highlightDayIndex;
-                        const changePct = ((day.close - day.open) / day.open) * 100;
-                        return (
-                          <button
-                            key={day.date}
-                            data-testid={`button-day-${day.date}`}
-                            onClick={() => jumpToDay(idx)}
-                            className={`flex-shrink-0 w-16 rounded-md border px-1.5 py-1.5 text-center transition-all ${
-                              isSelected
-                                ? "border-primary bg-primary/10 ring-1 ring-primary"
-                                : "border-border bg-card hover-elevate"
-                            }`}
-                          >
-                            <div className="text-[9px] text-muted-foreground mb-0.5">{formatDate(day.date)}</div>
-                            <div className={`text-[10px] font-semibold font-mono ${isUp ? "text-[#26a69a]" : "text-[#ef5350]"}`}>
-                              {isUp ? "+" : ""}{changePct.toFixed(1)}%
-                            </div>
-                            <div className="text-[9px] text-muted-foreground font-mono">{formatPrice(day.close)}</div>
-                            <div className="h-0.5 rounded-full mt-1" style={{ backgroundColor: isUp ? "#26a69a" : "#ef5350" }} />
-                          </button>
-                        );
-                      })}
-                </div>
-              </div>
-
-              <Button
-                size="icon"
-                variant="outline"
-                data-testid="button-hist-next"
-                disabled={highlightDayIndex >= (effectiveDays?.days?.length ?? 1) - 1}
-                onClick={() => jumpToDay(Math.min((effectiveDays?.days?.length ?? 1) - 1, highlightDayIndex + 1))}
-              >
-                <ChevronRight className="w-4 h-4" />
-              </Button>
-            </div>
-
-            <div className="rounded-lg border bg-card overflow-hidden relative">
-              <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card/90 backdrop-blur-sm border rounded-md p-0.5">
-                <Button
-                  size="icon"
-                  variant={dragZoomActive ? "default" : "ghost"}
-                  data-testid="button-drag-zoom"
-                  className="h-7 w-7"
-                  title="Drag to zoom"
-                  onClick={() => setDragZoomActive(!dragZoomActive)}
+                <div
+                  ref={timelineRef}
+                  data-testid="timeline-scroll"
+                  className="flex-1 overflow-x-auto select-none"
+                  style={{ scrollbarWidth: "none" }}
                 >
-                  <Crosshair className="w-3.5 h-3.5" />
+                  <div className="flex gap-0.5 px-1 py-0.5" style={{ width: "max-content" }}>
+                    {sortedDays.map((day, idx) => {
+                      const isUp = day.close >= day.open;
+                      const isInWindow = idx >= startDayIdx && idx <= endDayIdx;
+                      const changePct = ((day.close - day.open) / day.open) * 100;
+                      return (
+                        <button
+                          key={day.date}
+                          data-testid={`button-day-${day.date}`}
+                          onClick={() => jumpToRange(idx)}
+                          className={`flex-shrink-0 w-12 rounded border px-1 py-1 text-center transition-all ${
+                            isInWindow
+                              ? "border-primary bg-primary/10 ring-1 ring-primary/50"
+                              : "border-border/50 bg-card/50 hover:bg-card"
+                          }`}
+                        >
+                          <div className="text-[8px] text-muted-foreground leading-tight">{formatDate(day.date)}</div>
+                          <div className={`text-[9px] font-semibold font-mono leading-tight ${isUp ? "text-[#26a69a]" : "text-[#ef5350]"}`}>
+                            {isUp ? "+" : ""}{changePct.toFixed(1)}%
+                          </div>
+                          <div className="h-0.5 rounded-full mt-0.5" style={{ backgroundColor: isUp ? "#26a69a" : "#ef5350", opacity: isInWindow ? 1 : 0.3 }} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <Button
+                  size="sm"
+                  variant="outline"
+                  data-testid="button-window-next-day"
+                  disabled={endDayIdx >= sortedDays.length - 1}
+                  onClick={() => shiftWindow(1)}
+                  className="h-7 text-xs px-2"
+                >
+                  +1
                 </Button>
                 <Button
                   size="icon"
-                  variant="ghost"
-                  data-testid="button-zoom-reset"
+                  variant="outline"
+                  data-testid="button-window-next"
+                  disabled={endDayIdx >= sortedDays.length - 1}
+                  onClick={() => shiftWindow(windowSize)}
                   className="h-7 w-7"
-                  title="Fit all data"
-                  onClick={() => { histChartRef.current?.resetZoom(); setDragZoomActive(false); }}
                 >
-                  <Maximize2 className="w-3.5 h-3.5" />
+                  <ChevronRight className="w-3.5 h-3.5" />
                 </Button>
               </div>
-              {continuousLoading ? (
-                <div className="flex items-center justify-center" style={{ height: 440 }}>
-                  <div className="flex flex-col items-center gap-3 text-muted-foreground">
-                    <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                    <span className="text-sm">Loading continuous history...</span>
-                    <span className="text-xs opacity-60">Fetching intraday data across multiple periods</span>
-                  </div>
-                </div>
-              ) : !continuousData?.candles?.length ? (
-                <div className="flex items-center justify-center" style={{ height: 440 }}>
-                  <div className="text-center text-muted-foreground">
-                    <BarChart3 className="w-10 h-10 mx-auto mb-2 opacity-30" />
-                    <p className="text-sm">No historical data available</p>
-                  </div>
-                </div>
-              ) : (
-                <CandlestickChart
-                  ref={histChartRef}
-                  candles={continuousData.candles}
-                  height={440}
-                  showVolume
-                  zoneOverlays={zoneOverlays}
-                  bandOverlays={bandOverlayData}
-                  dragZoomEnabled={dragZoomActive}
-                  onDragZoomDone={() => setDragZoomActive(false)}
-                />
-              )}
-            </div>
 
-            <div className="mt-2 flex gap-3 text-xs text-muted-foreground justify-between flex-wrap">
-              <div className="flex items-center gap-3 flex-wrap">
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} /> RTH up
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#ef5350" }} /> RTH down
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#26a69a80" }} /> ETH up
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#ef535080" }} /> ETH down
-                </span>
-                {showYellowBox && (
-                  <>
-                    <span className="border-l border-border pl-3 flex items-center gap-1">
-                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(180, 160, 40, 0.35)" }} /> Yellow Box
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(220, 220, 220, 0.8)" }} /> POC
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(200, 40, 40, 0.25)" }} /> Avg Range
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm inline-block border-dashed border-b" style={{ borderColor: "rgba(220, 80, 80, 0.5)" }} /> Max Range
-                    </span>
-                  </>
+              <div className="rounded-lg border bg-card overflow-hidden relative flex-1" style={{ minHeight: 500 }}>
+                <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card/90 backdrop-blur-sm border rounded-md p-0.5">
+                  <Button
+                    size="icon"
+                    variant={dragZoomActive ? "default" : "ghost"}
+                    data-testid="button-drag-zoom"
+                    className="h-7 w-7"
+                    title="Drag to zoom"
+                    onClick={() => setDragZoomActive(!dragZoomActive)}
+                  >
+                    <Crosshair className="w-3.5 h-3.5" />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    data-testid="button-zoom-reset"
+                    className="h-7 w-7"
+                    title="Fit all data"
+                    onClick={() => { chartRef.current?.resetZoom(); setDragZoomActive(false); }}
+                  >
+                    <Maximize2 className="w-3.5 h-3.5" />
+                  </Button>
+                </div>
+                {candlesLoading ? (
+                  <div className="flex items-center justify-center" style={{ height: 500 }}>
+                    <div className="flex flex-col items-center gap-3 text-muted-foreground">
+                      <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                      <span className="text-sm">Loading 5-min candle data...</span>
+                    </div>
+                  </div>
+                ) : windowedCandleData.length === 0 ? (
+                  <div className="flex items-center justify-center" style={{ height: 500 }}>
+                    <div className="text-center text-muted-foreground">
+                      <BarChart3 className="w-10 h-10 mx-auto mb-2 opacity-30" />
+                      <p className="text-sm">No candle data for selected window</p>
+                    </div>
+                  </div>
+                ) : (
+                  <CandlestickChart
+                    ref={chartRef}
+                    candles={windowedCandleData}
+                    height={500}
+                    showVolume
+                    zoneOverlays={zoneOverlays}
+                    bandOverlays={bandOverlayData}
+                    dragZoomEnabled={dragZoomActive}
+                    onDragZoomDone={() => setDragZoomActive(false)}
+                  />
                 )}
               </div>
-              <span>
-                {continuousData?.candles?.length?.toLocaleString()} candles ·
-                {effectiveDays?.days?.length ?? "—"} trading days
-              </span>
-            </div>
-          </section>
+
+              <div className="flex gap-3 text-xs text-muted-foreground justify-between flex-wrap">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <span className="flex items-center gap-1">
+                    <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} /> RTH up
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#ef5350" }} /> RTH down
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#26a69a80" }} /> ETH up
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#ef535080" }} /> ETH down
+                  </span>
+                  {showYellowBox && (
+                    <>
+                      <span className="border-l border-border pl-3 flex items-center gap-1">
+                        <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(180, 160, 40, 0.35)" }} /> Yellow Box
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(220, 220, 220, 0.8)" }} /> POC
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(200, 40, 40, 0.25)" }} /> Avg Range
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="w-3 h-1 rounded-sm inline-block border-dashed border-b" style={{ borderColor: "rgba(220, 80, 80, 0.5)" }} /> Max Range
+                      </span>
+                    </>
+                  )}
+                </div>
+                <span data-testid="text-bar-count">
+                  {windowedCandleData.length.toLocaleString()} bars ·
+                  {windowedDays.length} days ·
+                  5-min cached · {sortedDays.length} total days available
+                </span>
+              </div>
+            </>
+          )}
         </main>
       </div>
     </div>

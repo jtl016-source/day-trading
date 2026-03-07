@@ -1,25 +1,22 @@
 # MarketView — Market Charting Application
 
 ## Overview
-A real-time and historical market charting application using live Yahoo Finance data. Displays professional candlestick charts for stocks, ETFs, futures, and market indices with ETH/RTH visual distinction.
+A cache-driven market charting application. Downloads historical data from Polygon.io, stores it in PostgreSQL, and generates professional candlestick charts with Yellow Box strategy overlays entirely from cached data — no live API calls for chart rendering.
 
 ## Features
-- **Today's Intraday Chart**: Full-day candlestick chart including ETH (pre/post market) + RTH, 15m or 60m intervals, auto-refreshing every 60 seconds
-- **200-Day Continuous History**: Single continuous candlestick chart covering the full historical window — no per-day loading. ETH + RTH candles shown throughout. Supports zoom/pan via the chart and a draggable day-card timeline scrubber for jumping to specific dates.
-  - 15m interval: last 60 days (Yahoo Finance API limit)
-  - 60m interval: full 200 trading days
-- **TradingView-Style Theme**: Chart styling matches TradingView's dark theme exactly — background #131722, grid #1e222d, crosshair #758696, scale text #787b86, scale borders #2a2e39. Font matches TradingView's system font stack.
+- **Cache-Driven Chart**: Uses downloaded 5-min candle data for the candlestick chart and 60-min aggregated daily data for Yellow Box zone computation. No live API calls are made for chart display.
+- **Date Window Selector**: Configurable sliding window (5/10/20/40/60/120 days) over all cached trading days. Navigate with prev/next buttons (by day or by window), or click any day in the timeline strip to center the window there.
+- **TradingView-Style Theme**: Chart styling matches TradingView's dark theme exactly — background #131722, grid #1e222d, crosshair #758696, scale text #787b86, scale borders #2a2e39.
 - **ETH/RTH Color Coding**: TradingView candle colors — teal #26a69a for up, red #ef5350 for down. ETH candles use same palette with reduced opacity. Volume bars match candle colors.
-- **Symbol Support**: Stocks (AAPL, MSFT, etc.), ETFs (SPY, QQQ, etc.), Futures (ES=F, GC=F, etc.), Indices (^GSPC, ^VIX, etc.). Futures use a wider intraday window starting 5 PM ET the previous day to capture overnight Globex sessions.
-- **Volume bars** shown below each candlestick chart
-- **Live quote data** via MarketData.app API (LIVE_DATA secret) for stocks/ETFs, with Yahoo Finance fallback. Shows price, change, day high/low, volume. Futures and indices always use Yahoo Finance.
-- **Yellow Box Method** (per the Official Yellow Box Guide): Per-day zone overlays on both intraday and historical charts. POC = previous day's close (not today's open). Yellow Box width derived from 50-day historical volatility (average daily range × 0.35 fraction). Red Box (above Yellow Box) = Average Range High from POC. Green Box (below Yellow Box) = Average Range Low from POC. Max Range lines (dashed) show historical extreme levels. Average up/down moves computed separately from `high - prevClose` and `prevClose - low` over the 50-day lookback window.
-- **Data Download Panel** (`/data` route): Bulk download historical 5-min and 60-min candle data from Polygon.io. Calendar grid UI showing download status by month for the last 5 years. Downloaded data cached in PostgreSQL. When cached data exists for a symbol, the main chart uses it instead of Yahoo Finance for the continuous history view and Yellow Box calculations.
+- **Symbol Support**: Stocks (AAPL, MSFT, etc.), ETFs (SPY, QQQ, etc.), Futures (ES=F, GC=F, etc.), Indices (^GSPC, ^VIX, etc.).
+- **Volume bars** shown below the candlestick chart
+- **Yellow Box Method** (per the Official Yellow Box Guide): Per-day zone overlays on the chart. POC = previous day's close. Yellow Box width from 50-day historical volatility (average daily range × 0.35). Red Box = Average Range High. Green Box = Average Range Low. Max Range dashed lines show historical extreme levels.
+- **Data Download Panel** (`/data` route): Bulk download historical 5-min and 60-min candle data from Polygon.io. Calendar grid UI showing download status by month. Downloaded data cached in PostgreSQL.
 
 ## Architecture
 
 ### Frontend
-- `client/src/pages/market.tsx` — Main market page: intraday chart, continuous history chart, timeline scrubber, symbol selector sidebar
+- `client/src/pages/market.tsx` — Main market page: cache-driven candlestick chart with date window selector, Yellow Box overlays, symbol sidebar. Uses 5m cached data for chart and 60m-aggregated daily data for zones.
 - `client/src/pages/data-download.tsx` — Data Download page: Polygon.io bulk download UI, calendar grid, stored data table
 - `client/src/components/CandlestickChart.tsx` — TradingView lightweight-charts v5 component; supports ETH/RTH per-bar coloring, `scrollToTime()` via forwardRef, and dynamic zone overlay rendering via `zoneOverlays` prop (LineSeries)
 
@@ -43,7 +40,7 @@ A real-time and historical market charting application using live Yahoo Finance 
 - `POST /api/data/download` — Download candle data for a specific symbol/year/month from Polygon.io
 - `GET /api/data/candles/:symbol/:resolution` — Retrieve cached candles with optional from/to filters
 - `GET /api/data/daily-summary/:symbol` — Aggregated daily summary from cached 5-min data
-- `GET /api/data/cached-continuous/:symbol/:interval` — Cached continuous candle data for chart display
+- `GET /api/data/cached-continuous/:symbol/:interval?from=X&to=Y` — Cached continuous candle data for chart display, supports timestamp windowing via from/to query params
 - `GET /api/data/cached-days/:symbol` — Daily OHLCV from cached 60-min data for Yellow Box calculations
 - `DELETE /api/data/clear/:symbol` — Clear all cached data for a symbol
 
