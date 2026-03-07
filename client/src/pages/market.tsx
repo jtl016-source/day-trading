@@ -17,8 +17,10 @@ import {
   CalendarDays,
   Crosshair,
   Maximize2,
+  Database,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { Link } from "wouter";
 
 interface SymbolInfo { symbol: string; name: string }
 interface SymbolsData { stocks: SymbolInfo[]; etfs: SymbolInfo[]; futures: SymbolInfo[]; indices: SymbolInfo[] }
@@ -234,17 +236,42 @@ export default function MarketPage() {
     symbol: string; days: DayInfo[];
   }>({ queryKey: ["/api/market/historical-days", selectedSymbol] });
 
-  const { data: continuousData, isLoading: continuousLoading } = useQuery<{
+  const cachedInterval = interval === "60m" ? "60m" : "5m";
+
+  const { data: cachedContinuousData } = useQuery<{
+    symbol: string; interval: string; candles: CandleBar[]; source: string;
+  }>({
+    queryKey: ["/api/data/cached-continuous", selectedSymbol, cachedInterval],
+    staleTime: 60 * 1000,
+  });
+
+  const hasCachedData = (cachedContinuousData?.candles?.length ?? 0) > 0;
+
+  const { data: cachedDaysData } = useQuery<{ symbol: string; days: DayInfo[] }>({
+    queryKey: ["/api/data/cached-days", selectedSymbol],
+    enabled: hasCachedData,
+    staleTime: 60 * 1000,
+  });
+
+  const { data: liveContinuousData, isLoading: liveContinuousLoading } = useQuery<{
     symbol: string; interval: string; candles: CandleBar[];
   }>({
     queryKey: ["/api/market/historical-continuous", selectedSymbol, interval],
     staleTime: 5 * 60 * 1000,
+    enabled: !hasCachedData,
   });
 
+  const continuousData = hasCachedData ? cachedContinuousData : liveContinuousData;
+  const continuousLoading = hasCachedData ? false : liveContinuousLoading;
+
+  const effectiveDays = hasCachedData && cachedDaysData?.days?.length
+    ? cachedDaysData
+    : historicalDays;
+
   const yellowBoxZones = useMemo(() => {
-    if (!historicalDays?.days) return [];
-    return computeYellowBoxZones(historicalDays.days);
-  }, [historicalDays]);
+    if (!effectiveDays?.days) return [];
+    return computeYellowBoxZones(effectiveDays.days);
+  }, [effectiveDays]);
 
   const { zoneOverlays, bandOverlayData } = useMemo(() => {
     if (!showYellowBox || yellowBoxZones.length === 0 || !continuousData?.candles?.length)
@@ -356,24 +383,24 @@ export default function MarketPage() {
   const categorySymbols = symbolsData?.[selectedCategory] ?? [];
 
   useEffect(() => {
-    if (!timelineRef.current || !historicalDays?.days) return;
+    if (!timelineRef.current || !effectiveDays?.days) return;
     const cardWidth = 72;
     const containerWidth = timelineRef.current.offsetWidth;
     const scrollLeft = highlightDayIndex * cardWidth - containerWidth / 2 + cardWidth / 2;
     timelineRef.current.scrollTo({ left: Math.max(0, scrollLeft), behavior: "smooth" });
-  }, [highlightDayIndex, historicalDays]);
+  }, [highlightDayIndex, effectiveDays]);
 
   const jumpToDay = useCallback((idx: number) => {
     setHighlightDayIndex(idx);
     setDragIndex(idx);
-    const days = historicalDays?.days;
+    const days = effectiveDays?.days;
     if (!days || !histChartRef.current) return;
     const day = days[idx];
     if (!day) return;
     const [y, m, d] = day.date.split("-").map(Number);
     const t = Math.floor(new Date(y, m - 1, d, 13, 30, 0).getTime() / 1000);
     histChartRef.current.scrollToTime(t);
-  }, [historicalDays]);
+  }, [effectiveDays]);
 
   const handleDragStart = useCallback((clientX: number) => {
     isDragging.current = true;
@@ -382,13 +409,13 @@ export default function MarketPage() {
   }, [highlightDayIndex]);
 
   const handleDragMove = useCallback((clientX: number) => {
-    if (!isDragging.current || !historicalDays?.days) return;
+    if (!isDragging.current || !effectiveDays?.days) return;
     const dx = dragStartX.current - clientX;
     const step = Math.round(dx / 40);
-    const newIndex = Math.max(0, Math.min(historicalDays.days.length - 1, dragStartIndex.current + step));
+    const newIndex = Math.max(0, Math.min(effectiveDays.days.length - 1, dragStartIndex.current + step));
     setDragIndex(newIndex);
     setHighlightDayIndex(newIndex);
-  }, [historicalDays]);
+  }, [effectiveDays]);
 
   const handleDragEnd = useCallback(() => {
     if (!isDragging.current) return;
@@ -462,6 +489,12 @@ export default function MarketPage() {
         </div>
 
         <div className="flex items-center gap-2">
+          <Link href="/data">
+            <Button size="sm" variant="outline" data-testid="button-data-download" className="text-xs gap-1.5">
+              <Database className="w-3.5 h-3.5" />
+              Data
+            </Button>
+          </Link>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground border rounded-md px-2 py-1">
             <span className="w-2 h-2 rounded-sm inline-block" style={{ backgroundColor: "#26a69a" }} />RTH
             <span className="w-2 h-2 rounded-sm inline-block ml-1" style={{ backgroundColor: "#26a69a80" }} />ETH
@@ -598,10 +631,12 @@ export default function MarketPage() {
                 <History className="w-4 h-4 text-primary" />
                 <div>
                   <h2 className="text-base font-semibold tracking-tight">
-                    {interval === "15m" ? "60-Day" : "200-Day"} Continuous History
+                    {hasCachedData ? "Cached" : interval === "15m" ? "60-Day" : "200-Day"} Continuous History
                   </h2>
                   <p className="text-xs text-muted-foreground">
-                    {interval === "15m"
+                    {hasCachedData
+                      ? `5m cached data · ${continuousData?.candles?.length?.toLocaleString() ?? 0} bars · from Polygon.io`
+                      : interval === "15m"
                       ? "15m ETH + RTH · last 60 days · switch to 60m for full 200-day view"
                       : "60m ETH + RTH · full 200 trading days · drag timeline or zoom/pan"}
                   </p>
@@ -617,11 +652,11 @@ export default function MarketPage() {
                 >
                   {showYellowBox ? "Yellow Box ON" : "Yellow Box OFF"}
                 </Button>
-                {historicalDays?.days?.[highlightDayIndex] && (
+                {effectiveDays?.days?.[highlightDayIndex] && (
                   <div className="flex items-center gap-1">
                     <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
                     <span className="text-sm font-medium" data-testid="text-selected-date">
-                      {formatDateFull(historicalDays.days[highlightDayIndex].date)}
+                      {formatDateFull(effectiveDays.days[highlightDayIndex].date)}
                     </span>
                   </div>
                 )}
@@ -654,7 +689,7 @@ export default function MarketPage() {
                     ? Array.from({ length: 20 }).map((_, i) => (
                         <Skeleton key={i} className="w-16 h-14 rounded flex-shrink-0" />
                       ))
-                    : (historicalDays?.days ?? []).map((day, idx) => {
+                    : (effectiveDays?.days ?? []).map((day, idx) => {
                         const isUp = day.close >= day.open;
                         const isSelected = idx === highlightDayIndex;
                         const changePct = ((day.close - day.open) / day.open) * 100;
@@ -685,8 +720,8 @@ export default function MarketPage() {
                 size="icon"
                 variant="outline"
                 data-testid="button-hist-next"
-                disabled={highlightDayIndex >= (historicalDays?.days?.length ?? 1) - 1}
-                onClick={() => jumpToDay(Math.min((historicalDays?.days?.length ?? 1) - 1, highlightDayIndex + 1))}
+                disabled={highlightDayIndex >= (effectiveDays?.days?.length ?? 1) - 1}
+                onClick={() => jumpToDay(Math.min((effectiveDays?.days?.length ?? 1) - 1, highlightDayIndex + 1))}
               >
                 <ChevronRight className="w-4 h-4" />
               </Button>
@@ -777,7 +812,7 @@ export default function MarketPage() {
               </div>
               <span>
                 {continuousData?.candles?.length?.toLocaleString()} candles ·
-                {historicalDays?.days?.length ?? "—"} trading days
+                {effectiveDays?.days?.length ?? "—"} trading days
               </span>
             </div>
           </section>

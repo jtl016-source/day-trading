@@ -6,11 +6,13 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import MarketPage from "@/pages/market";
+import DataDownloadPage from "@/pages/data-download";
 
 function Router() {
   return (
     <Switch>
       <Route path="/" component={MarketPage} />
+      <Route path="/data" component={DataDownloadPage} />
       <Route component={NotFound} />
     </Switch>
   );
