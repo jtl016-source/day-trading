@@ -166,14 +166,27 @@ function buildZoneOverlays(
     });
   }
 
+  const dedup = (arr: Array<{ time: number; value: number }>) => {
+    arr.sort((a, b) => a.time - b.time);
+    const result: typeof arr = [];
+    for (const pt of arr) {
+      if (result.length > 0 && result[result.length - 1].time === pt.time) {
+        result[result.length - 1].value = pt.value;
+      } else {
+        result.push(pt);
+      }
+    }
+    return result;
+  };
+
   const lines: ZoneOverlay[] = [
-    { data: ytData, color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
-    { data: ybData, color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
-    { data: pocData, color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "POC" },
-    { data: arHData, color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range H" },
-    { data: arLData, color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range L" },
-    { data: mrHData, color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range H" },
-    { data: mrLData, color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range L" },
+    { data: dedup(ytData), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
+    { data: dedup(ybData), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
+    { data: dedup(pocData), color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "POC" },
+    { data: dedup(arHData), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range H" },
+    { data: dedup(arLData), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range L" },
+    { data: dedup(mrHData), color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range H" },
+    { data: dedup(mrLData), color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range L" },
   ];
 
   return { lines, bands };
