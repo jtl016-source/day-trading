@@ -144,13 +144,13 @@ function buildZoneOverlays(
   }
 
   return [
-    { data: ytData, color: "rgba(202, 178, 50, 0.7)", lineWidth: 1, lineStyle: 0, title: "YB Top" },
-    { data: ybData, color: "rgba(202, 178, 50, 0.7)", lineWidth: 1, lineStyle: 0, title: "YB Bot" },
+    { data: ytData, color: "rgba(255, 223, 0, 0.95)", lineWidth: 2, lineStyle: 0, title: "YB Top" },
+    { data: ybData, color: "rgba(255, 223, 0, 0.95)", lineWidth: 2, lineStyle: 0, title: "YB Bot" },
     { data: pocData, color: "rgba(168, 85, 247, 0.85)", lineWidth: 2, lineStyle: 4, title: "POC" },
-    { data: rtData, color: "rgba(239, 68, 68, 0.6)", lineWidth: 1, lineStyle: 2, title: "R Top" },
-    { data: rbData, color: "rgba(239, 68, 68, 0.6)", lineWidth: 1, lineStyle: 2, title: "R Bot" },
-    { data: stData, color: "rgba(34, 197, 94, 0.6)", lineWidth: 1, lineStyle: 2, title: "S Top" },
-    { data: sbData, color: "rgba(34, 197, 94, 0.6)", lineWidth: 1, lineStyle: 2, title: "S Bot" },
+    { data: rtData, color: "rgba(255, 60, 60, 0.9)", lineWidth: 2, lineStyle: 2, title: "R Top" },
+    { data: rbData, color: "rgba(255, 60, 60, 0.9)", lineWidth: 2, lineStyle: 2, title: "R Bot" },
+    { data: stData, color: "rgba(0, 200, 80, 0.9)", lineWidth: 2, lineStyle: 2, title: "S Top" },
+    { data: sbData, color: "rgba(0, 200, 80, 0.9)", lineWidth: 2, lineStyle: 2, title: "S Bot" },
   ];
 }
 
@@ -650,7 +650,7 @@ export default function MarketPage() {
                 {showYellowBox && (
                   <>
                     <span className="border-l border-border pl-3 flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(202, 178, 50, 0.9)" }} /> Yellow Box
+                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(255, 223, 0, 0.95)" }} /> Yellow Box
                     </span>
                     <span className="flex items-center gap-1">
                       <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(168, 85, 247, 0.9)" }} /> POC
