@@ -257,8 +257,16 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       });
       ro.observe(containerRef.current);
 
+      const el = containerRef.current;
+      const preventPageScroll = (e: WheelEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
+      el.addEventListener("wheel", preventPageScroll, { passive: false });
+
       return () => {
         ro.disconnect();
+        el.removeEventListener("wheel", preventPageScroll);
         chart.remove();
         chartRef.current = null;
         candleSeriesRef.current = null;
