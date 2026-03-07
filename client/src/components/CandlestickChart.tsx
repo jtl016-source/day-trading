@@ -1,4 +1,4 @@
-import { useEffect, useRef, useImperativeHandle, forwardRef } from "react";
+import { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback } from "react";
 import {
   createChart,
   CandlestickSeries,
@@ -34,8 +34,6 @@ export interface ZoneOverlay {
 
 export interface ChartHandle {
   scrollToTime: (timestamp: number) => void;
-  zoomIn: () => void;
-  zoomOut: () => void;
   resetZoom: () => void;
 }
 
@@ -44,6 +42,8 @@ interface CandlestickChartProps {
   height?: number;
   showVolume?: boolean;
   zoneOverlays?: ZoneOverlay[];
+  dragZoomEnabled?: boolean;
+  onDragZoomDone?: () => void;
 }
 
 const RTH_UP = "#22c55e";
@@ -57,12 +57,20 @@ const ETH_UP_WICK = "#4ade80";
 const ETH_DOWN_WICK = "#f87171";
 
 export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
-  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays }, ref) {
+  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays, dragZoomEnabled = false, onDragZoomDone }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
     const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
     const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+
+    const [dragState, setDragState] = useState<{
+      active: boolean;
+      startX: number;
+      startY: number;
+      curX: number;
+      curY: number;
+    } | null>(null);
 
     useImperativeHandle(ref, () => ({
       scrollToTime(timestamp: number) {
@@ -73,31 +81,75 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           to: (timestamp + range) as any,
         });
       },
-      zoomIn() {
-        if (!chartRef.current) return;
-        const ts = chartRef.current.timeScale();
-        const vr = ts.getVisibleLogicalRange();
-        if (!vr) return;
-        const center = (vr.from + vr.to) / 2;
-        const halfSpan = (vr.to - vr.from) / 2;
-        const newHalf = halfSpan * 0.6;
-        ts.setVisibleLogicalRange({ from: center - newHalf, to: center + newHalf });
-      },
-      zoomOut() {
-        if (!chartRef.current) return;
-        const ts = chartRef.current.timeScale();
-        const vr = ts.getVisibleLogicalRange();
-        if (!vr) return;
-        const center = (vr.from + vr.to) / 2;
-        const halfSpan = (vr.to - vr.from) / 2;
-        const newHalf = halfSpan * 1.6;
-        ts.setVisibleLogicalRange({ from: center - newHalf, to: center + newHalf });
-      },
       resetZoom() {
         if (!chartRef.current) return;
         chartRef.current.timeScale().fitContent();
       },
     }));
+
+    const handleDragStart = useCallback((e: React.MouseEvent) => {
+      if (!dragZoomEnabled) return;
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      setDragState({ active: true, startX: x, startY: y, curX: x, curY: y });
+    }, [dragZoomEnabled]);
+
+    const handleDragMove = useCallback((e: React.MouseEvent) => {
+      if (!dragState?.active) return;
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      setDragState((prev) => prev ? { ...prev, curX: x, curY: y } : null);
+    }, [dragState?.active]);
+
+    const handleDragEnd = useCallback(() => {
+      if (!dragState?.active || !chartRef.current) {
+        setDragState(null);
+        return;
+      }
+
+      const chart = chartRef.current;
+      const ts = chart.timeScale();
+
+      const leftX = Math.min(dragState.startX, dragState.curX);
+      const rightX = Math.max(dragState.startX, dragState.curX);
+      const width = rightX - leftX;
+
+      if (width > 10) {
+        const fromTime = ts.coordinateToTime(leftX);
+        const toTime = ts.coordinateToTime(rightX);
+
+        if (fromTime != null && toTime != null) {
+          ts.setVisibleRange({
+            from: fromTime,
+            to: toTime,
+          });
+        }
+      }
+
+      setDragState(null);
+      onDragZoomDone?.();
+    }, [dragState, onDragZoomDone]);
+
+    useEffect(() => {
+      if (!dragZoomEnabled) return;
+      const onGlobalMouseUp = () => {
+        if (dragState?.active) handleDragEnd();
+      };
+      const onKeyDown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          setDragState(null);
+          onDragZoomDone?.();
+        }
+      };
+      window.addEventListener("mouseup", onGlobalMouseUp);
+      window.addEventListener("keydown", onKeyDown);
+      return () => {
+        window.removeEventListener("mouseup", onGlobalMouseUp);
+        window.removeEventListener("keydown", onKeyDown);
+      };
+    }, [dragZoomEnabled, dragState?.active, handleDragEnd, onDragZoomDone]);
 
     useEffect(() => {
       if (!containerRef.current) return;
@@ -197,6 +249,22 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         overlaySeriesRef.current = [];
       };
     }, [height, showVolume]);
+
+    useEffect(() => {
+      if (!chartRef.current) return;
+      chartRef.current.applyOptions({
+        handleScroll: {
+          mouseWheel: !dragZoomEnabled,
+          pressedMouseMove: !dragZoomEnabled,
+          horzTouchDrag: !dragZoomEnabled,
+        },
+        handleScale: {
+          axisPressedMouseMove: !dragZoomEnabled ? { time: true, price: true } : { time: false, price: false },
+          mouseWheel: !dragZoomEnabled,
+          pinch: !dragZoomEnabled,
+        },
+      });
+    }, [dragZoomEnabled]);
 
     useEffect(() => {
       if (!candleSeriesRef.current || !chartRef.current) return;
@@ -302,12 +370,55 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       }
     }, [zoneOverlays]);
 
+    const selRect = dragState?.active ? {
+      left: Math.min(dragState.startX, dragState.curX),
+      top: Math.min(dragState.startY, dragState.curY),
+      width: Math.abs(dragState.curX - dragState.startX),
+      height: Math.abs(dragState.curY - dragState.startY),
+    } : null;
+
     return (
       <div
-        ref={containerRef}
-        style={{ width: "100%", height }}
+        style={{ width: "100%", height, position: "relative" }}
         data-testid="candlestick-chart"
-      />
+      >
+        <div ref={containerRef} style={{ width: "100%", height }} />
+        {dragZoomEnabled && (
+          <div
+            data-testid="drag-zoom-overlay"
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              height: "100%",
+              cursor: "crosshair",
+              zIndex: 5,
+            }}
+            onMouseDown={handleDragStart}
+            onMouseMove={handleDragMove}
+            onMouseUp={handleDragEnd}
+            onMouseLeave={() => { if (dragState?.active) handleDragEnd(); }}
+          >
+            {selRect && selRect.width > 2 && (
+              <div
+                data-testid="drag-zoom-selection"
+                style={{
+                  position: "absolute",
+                  left: selRect.left,
+                  top: selRect.top,
+                  width: selRect.width,
+                  height: selRect.height,
+                  border: "2px solid rgba(99, 102, 241, 0.8)",
+                  backgroundColor: "rgba(99, 102, 241, 0.1)",
+                  borderRadius: 2,
+                  pointerEvents: "none",
+                }}
+              />
+            )}
+          </div>
+        )}
+      </div>
     );
   }
 );

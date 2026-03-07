@@ -15,8 +15,7 @@ import {
   ChevronRight,
   History,
   CalendarDays,
-  ZoomIn,
-  ZoomOut,
+  Crosshair,
   Maximize2,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -189,6 +188,7 @@ export default function MarketPage() {
   const [symbolSearch, setSymbolSearch] = useState("");
   const [highlightDayIndex, setHighlightDayIndex] = useState(0);
   const [showYellowBox, setShowYellowBox] = useState(true);
+  const [dragZoomActive, setDragZoomActive] = useState(false);
 
   const histChartRef = useRef<ChartHandle>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -586,28 +586,21 @@ export default function MarketPage() {
               <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card/90 backdrop-blur-sm border rounded-md p-0.5">
                 <Button
                   size="icon"
-                  variant="ghost"
-                  data-testid="button-zoom-in"
+                  variant={dragZoomActive ? "default" : "ghost"}
+                  data-testid="button-drag-zoom"
                   className="h-7 w-7"
-                  onClick={() => histChartRef.current?.zoomIn()}
+                  title="Drag to zoom"
+                  onClick={() => setDragZoomActive(!dragZoomActive)}
                 >
-                  <ZoomIn className="w-3.5 h-3.5" />
-                </Button>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  data-testid="button-zoom-out"
-                  className="h-7 w-7"
-                  onClick={() => histChartRef.current?.zoomOut()}
-                >
-                  <ZoomOut className="w-3.5 h-3.5" />
+                  <Crosshair className="w-3.5 h-3.5" />
                 </Button>
                 <Button
                   size="icon"
                   variant="ghost"
                   data-testid="button-zoom-reset"
                   className="h-7 w-7"
-                  onClick={() => histChartRef.current?.resetZoom()}
+                  title="Fit all data"
+                  onClick={() => { histChartRef.current?.resetZoom(); setDragZoomActive(false); }}
                 >
                   <Maximize2 className="w-3.5 h-3.5" />
                 </Button>
@@ -634,6 +627,8 @@ export default function MarketPage() {
                   height={440}
                   showVolume
                   zoneOverlays={zoneOverlays}
+                  dragZoomEnabled={dragZoomActive}
+                  onDragZoomDone={() => setDragZoomActive(false)}
                 />
               )}
             </div>
