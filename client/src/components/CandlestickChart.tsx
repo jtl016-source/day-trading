@@ -216,7 +216,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           textColor: isDark ? "#787b86" : "#131722",
         },
         handleScale: {
-          axisPressedMouseMove: { time: true, price: true },
+          axisPressedMouseMove: { time: false, price: false },
           mouseWheel: true,
           pinch: true,
         },
@@ -284,7 +284,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           horzTouchDrag: !dragZoomEnabled,
         },
         handleScale: {
-          axisPressedMouseMove: !dragZoomEnabled ? { time: true, price: true } : { time: false, price: false },
+          axisPressedMouseMove: { time: false, price: false },
           mouseWheel: !dragZoomEnabled,
           pinch: !dragZoomEnabled,
         },
