@@ -248,7 +248,7 @@ function aggregate5mTo15m(candles: CandleBar[]): CandleBar[] {
 
 export default function MarketPage() {
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
-  const [selectedCategory, setSelectedCategory] = useState<keyof SymbolsData>("etfs");
+  const [symbolDropdownOpen, setSymbolDropdownOpen] = useState(false);
   const [symbolSearch, setSymbolSearch] = useState("");
   const [showYellowBox, setShowYellowBox] = useState(true);
   const [dragZoomActive, setDragZoomActive] = useState(false);
@@ -259,6 +259,19 @@ export default function MarketPage() {
 
   const chartRef = useRef<ChartHandle>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+  const symbolDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!symbolDropdownOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (symbolDropdownRef.current && !symbolDropdownRef.current.contains(e.target as Node)) {
+        setSymbolDropdownOpen(false);
+        setSymbolSearch("");
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [symbolDropdownOpen]);
 
   const { data: symbolsData } = useQuery<SymbolsData>({ queryKey: ["/api/market/symbols"] });
 
@@ -333,27 +346,34 @@ export default function MarketPage() {
     return { zoneOverlays: result.lines, bandOverlayData: result.bands };
   }, [showYellowBox, yellowBoxZones, candleData]);
 
-  const allSymbolsForSearch = symbolsData
-    ? [
-        ...(symbolsData.stocks || []).map((s) => ({ ...s, category: "stocks" })),
-        ...(symbolsData.etfs || []).map((s) => ({ ...s, category: "etfs" })),
-        ...(symbolsData.futures || []).map((s) => ({ ...s, category: "futures" })),
-        ...(symbolsData.indices || []).map((s) => ({ ...s, category: "indices" })),
-      ]
-    : [];
+  const allSymbols = useMemo(() => {
+    if (!symbolsData) return [];
+    return [
+      ...(symbolsData.etfs || []).map((s) => ({ ...s, category: "ETFs" })),
+      ...(symbolsData.stocks || []).map((s) => ({ ...s, category: "Stocks" })),
+      ...(symbolsData.futures || []).map((s) => ({ ...s, category: "Futures" })),
+      ...(symbolsData.indices || []).map((s) => ({ ...s, category: "Indices" })),
+    ];
+  }, [symbolsData]);
 
-  const filteredSearch = symbolSearch.trim()
-    ? allSymbolsForSearch.filter(
-        (s) =>
-          s.symbol.toLowerCase().includes(symbolSearch.toLowerCase()) ||
-          s.name.toLowerCase().includes(symbolSearch.toLowerCase())
-      )
-    : [];
+  const filteredSymbols = useMemo(() => {
+    const q = symbolSearch.trim().toLowerCase();
+    if (!q) return allSymbols;
+    return allSymbols.filter(
+      (s) => s.symbol.toLowerCase().includes(q) || s.name.toLowerCase().includes(q)
+    );
+  }, [allSymbols, symbolSearch]);
 
-  const categoryLabels: Record<keyof SymbolsData, string> = {
-    stocks: "Stocks", etfs: "ETFs", futures: "Futures", indices: "Indices",
-  };
-  const categorySymbols = symbolsData?.[selectedCategory] ?? [];
+  const groupedSymbols = useMemo(() => {
+    const groups: Record<string, typeof filteredSymbols> = {};
+    for (const s of filteredSymbols) {
+      if (!groups[s.category]) groups[s.category] = [];
+      groups[s.category].push(s);
+    }
+    return groups;
+  }, [filteredSymbols]);
+
+  const selectedSymbolName = allSymbols.find((s) => s.symbol === selectedSymbol)?.name ?? "";
 
   const shiftWindow = useCallback((direction: number) => {
     if (sortedDays.length === 0) return;
@@ -402,49 +422,61 @@ export default function MarketPage() {
         </div>
 
         <div className="flex items-center gap-2 flex-1 min-w-0">
-          <div className="relative">
-            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-            <Input
-              data-testid="input-symbol-search"
-              placeholder="Search symbol..."
-              value={symbolSearch}
-              onChange={(e) => setSymbolSearch(e.target.value)}
-              className="pl-8 h-8 w-40 text-sm"
-            />
-            {filteredSearch.length > 0 && (
-              <div className="absolute top-full left-0 mt-1 w-64 bg-popover border border-popover-border rounded-md shadow-lg z-50 overflow-hidden">
-                {filteredSearch.slice(0, 8).map((s) => (
-                  <button
-                    key={s.symbol}
-                    data-testid={`button-search-result-${s.symbol}`}
-                    className="w-full px-3 py-2 text-left hover:bg-accent flex items-center justify-between gap-2 text-sm"
-                    onClick={() => {
-                      setSelectedSymbol(s.symbol);
-                      setSelectedCategory(s.category as keyof SymbolsData);
-                      setSymbolSearch("");
-                    }}
-                  >
-                    <span className="font-medium">{s.symbol}</span>
-                    <span className="text-muted-foreground text-xs truncate">{s.name}</span>
-                  </button>
-                ))}
+          <div className="relative" ref={symbolDropdownRef}>
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="button-symbol-dropdown"
+              className="h-8 text-sm gap-1.5 min-w-[140px] justify-between font-semibold"
+              onClick={() => { setSymbolDropdownOpen(!symbolDropdownOpen); setSymbolSearch(""); }}
+            >
+              <span>{selectedSymbol}</span>
+              <span className="text-muted-foreground text-xs font-normal truncate max-w-[100px]">{selectedSymbolName}</span>
+            </Button>
+            {symbolDropdownOpen && (
+              <div className="absolute top-full left-0 mt-1 w-72 bg-popover border rounded-md shadow-lg z-50 overflow-hidden">
+                <div className="p-2 border-b">
+                  <div className="relative">
+                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                    <Input
+                      data-testid="input-symbol-search"
+                      placeholder="Search symbol..."
+                      value={symbolSearch}
+                      onChange={(e) => setSymbolSearch(e.target.value)}
+                      className="pl-8 h-8 text-sm"
+                      autoFocus
+                    />
+                  </div>
+                </div>
+                <div className="max-h-80 overflow-auto">
+                  {Object.entries(groupedSymbols).map(([category, symbols]) => (
+                    <div key={category}>
+                      <div className="px-3 py-1.5 text-xs font-semibold text-muted-foreground bg-muted/50 sticky top-0">{category}</div>
+                      {symbols.map((s) => (
+                        <button
+                          key={s.symbol}
+                          data-testid={`button-symbol-${s.symbol}`}
+                          className={`w-full px-3 py-2 text-left hover:bg-accent flex items-center justify-between gap-2 text-sm ${
+                            s.symbol === selectedSymbol ? "bg-accent font-medium" : ""
+                          }`}
+                          onClick={() => {
+                            setSelectedSymbol(s.symbol);
+                            setSymbolDropdownOpen(false);
+                            setSymbolSearch("");
+                          }}
+                        >
+                          <span className="font-medium text-xs">{s.symbol}</span>
+                          <span className="text-muted-foreground text-xs truncate">{s.name}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                  {filteredSymbols.length === 0 && (
+                    <div className="px-3 py-4 text-center text-sm text-muted-foreground">No symbols found</div>
+                  )}
+                </div>
               </div>
             )}
-          </div>
-
-          <div className="flex gap-1 flex-wrap">
-            {(Object.keys(categoryLabels) as (keyof SymbolsData)[]).map((cat) => (
-              <Button
-                key={cat}
-                size="sm"
-                variant={selectedCategory === cat ? "default" : "outline"}
-                data-testid={`button-category-${cat}`}
-                onClick={() => setSelectedCategory(cat)}
-                className="h-7 text-xs"
-              >
-                {categoryLabels[cat]}
-              </Button>
-            ))}
           </div>
         </div>
 
@@ -472,28 +504,7 @@ export default function MarketPage() {
         </div>
       </header>
 
-      <div className="flex flex-col lg:flex-row flex-1 min-h-0 overflow-auto">
-        <aside className="lg:w-48 border-b lg:border-b-0 lg:border-r bg-sidebar flex-shrink-0 overflow-auto">
-          <div className="p-2 flex flex-row lg:flex-col gap-1 flex-wrap lg:flex-nowrap">
-            {categorySymbols.map((sym) => {
-              const isSelected = sym.symbol === selectedSymbol;
-              return (
-                <button
-                  key={sym.symbol}
-                  data-testid={`button-symbol-${sym.symbol}`}
-                  onClick={() => setSelectedSymbol(sym.symbol)}
-                  className={`text-left rounded-md px-3 py-1.5 text-sm transition-colors w-full lg:w-auto ${
-                    isSelected ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium" : "text-sidebar-foreground hover:bg-sidebar-accent/50"
-                  }`}
-                >
-                  <div className="font-semibold text-xs">{sym.symbol}</div>
-                  <div className="text-xs text-muted-foreground truncate hidden lg:block">{sym.name}</div>
-                </button>
-              );
-            })}
-          </div>
-        </aside>
-
+      <div className="flex flex-col flex-1 min-h-0 overflow-auto">
         <main className="flex-1 overflow-auto p-3 flex flex-col gap-3 min-w-0">
           {!hasCachedData && !daysLoading ? (
             <div className="flex-1 flex items-center justify-center">
