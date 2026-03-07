@@ -12,7 +12,7 @@ A real-time and historical market charting application using live Yahoo Finance 
 - **Symbol Support**: Stocks (AAPL, MSFT, etc.), ETFs (SPY, QQQ, etc.), Futures (ES=F, GC=F, etc.), Indices (^GSPC, ^VIX, etc.). Futures use a wider intraday window starting 5 PM ET the previous day to capture overnight Globex sessions.
 - **Volume bars** shown below each candlestick chart
 - **Live quote data** showing price, change, day high/low, volume
-- **Milk's Yellow Box Strategy**: Per-day zone overlays on both the intraday and historical charts. Includes Yellow Box (top/bottom), POC line (opening price), Resistance zone (top/bottom), and Support zone (top/bottom). Toggle on/off via shared button. Algorithm uses 14-day lookback average range, percentage-based distance, and 0.3 zone thickness fraction. Intraday chart uses previous trading day's close and today's open to compute zones.
+- **Milk's Yellow Box Strategy**: Per-day zone overlays on both the intraday and historical charts. Includes Yellow Box (top/bottom), POC line (opening price), Resistance zone (top/bottom), and Support zone (top/bottom). Toggle on/off via shared button. Yellow Box is a fixed 8 points wide (±4 from POC). Resistance/support zones use percentage-based distance and 0.3 zone thickness fraction. Intraday chart uses previous trading day's close and today's open to compute zones.
 
 ## Architecture
 

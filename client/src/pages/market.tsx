@@ -35,18 +35,16 @@ interface YellowBoxDay {
   supportBot: number;
 }
 
-const LOOKBACK = 14;
+const YELLOW_BOX_POINTS = 8;
 const ZONE_THICKNESS_FRACTION = 0.3;
 const MIN_RAW_DIFF = 0.001;
 
 function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
   const chronological = [...days].reverse();
   const zones: YellowBoxDay[] = [];
-  const ranges: number[] = [];
+  const halfBox = YELLOW_BOX_POINTS / 2;
 
   for (let i = 0; i < chronological.length; i++) {
-    ranges.push(chronological[i].high - chronological[i].low);
-
     if (i < 1) continue;
 
     const curOpen = chronological[i].open;
@@ -57,12 +55,8 @@ function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
     let pct = pointDiff / prevClose;
     pct = Math.max(pct, MIN_RAW_DIFF);
 
-    const lookbackStart = Math.max(0, i - LOOKBACK);
-    const lookbackRanges = ranges.slice(lookbackStart, i);
-    const avgRange = lookbackRanges.reduce((a, b) => a + b, 0) / lookbackRanges.length;
-
-    const yellowTop = yellowBox + avgRange / 2;
-    const yellowBottom = yellowBox - avgRange / 2;
+    const yellowTop = yellowBox + halfBox;
+    const yellowBottom = yellowBox - halfBox;
 
     const pctDist = pct * yellowBox;
     const rStart = yellowTop + pctDist;
@@ -290,13 +284,9 @@ export default function MarketPage() {
     let pct = pointDiff / prevClose;
     pct = Math.max(pct, MIN_RAW_DIFF);
 
-    const lookbackEnd = prevDayIdx + 1;
-    const lookbackStart = Math.max(0, lookbackEnd - LOOKBACK);
-    const lookbackRanges = chronoDays.slice(lookbackStart, lookbackEnd).map(d => d.high - d.low);
-    const avgRange = lookbackRanges.reduce((a, b) => a + b, 0) / lookbackRanges.length;
-
-    const yellowTop = yellowBox + avgRange / 2;
-    const yellowBottom = yellowBox - avgRange / 2;
+    const halfBox = YELLOW_BOX_POINTS / 2;
+    const yellowTop = yellowBox + halfBox;
+    const yellowBottom = yellowBox - halfBox;
     const pctDist = pct * yellowBox;
     const rStart = yellowTop + pctDist;
     const sStart = yellowBottom - pctDist;
