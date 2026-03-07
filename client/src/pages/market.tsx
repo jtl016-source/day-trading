@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CandlestickChart, type CandleBar } from "@/components/CandlestickChart";
+import { CandlestickChart, type CandleBar, type ChartHandle } from "@/components/CandlestickChart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -8,34 +8,19 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   TrendingUp,
   TrendingDown,
-  ChevronLeft,
-  ChevronRight,
   Activity,
   BarChart3,
   Search,
+  ChevronLeft,
+  ChevronRight,
+  History,
+  CalendarDays,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 
-interface SymbolInfo {
-  symbol: string;
-  name: string;
-}
-
-interface SymbolsData {
-  stocks: SymbolInfo[];
-  etfs: SymbolInfo[];
-  futures: SymbolInfo[];
-  indices: SymbolInfo[];
-}
-
-interface DayInfo {
-  date: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
+interface SymbolInfo { symbol: string; name: string }
+interface SymbolsData { stocks: SymbolInfo[]; etfs: SymbolInfo[]; futures: SymbolInfo[]; indices: SymbolInfo[] }
+interface DayInfo { date: string; open: number; high: number; low: number; close: number; volume: number }
 
 function formatPrice(n: number | undefined | null): string {
   if (n == null) return "—";
@@ -69,15 +54,16 @@ export default function MarketPage() {
   const [selectedCategory, setSelectedCategory] = useState<keyof SymbolsData>("etfs");
   const [interval, setInterval] = useState<"15m" | "60m">("15m");
   const [symbolSearch, setSymbolSearch] = useState("");
-  const [histDayIndex, setHistDayIndex] = useState(0);
-  const [isDragging, setIsDragging] = useState(false);
+  const [highlightDayIndex, setHighlightDayIndex] = useState(0);
+
+  const histChartRef = useRef<ChartHandle>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
   const dragStartX = useRef(0);
   const dragStartIndex = useRef(0);
-  const timelineRef = useRef<HTMLDivElement>(null);
+  const [dragIndex, setDragIndex] = useState(0);
 
-  const { data: symbolsData } = useQuery<SymbolsData>({
-    queryKey: ["/api/market/symbols"],
-  });
+  const { data: symbolsData } = useQuery<SymbolsData>({ queryKey: ["/api/market/symbols"] });
 
   const { data: quoteData } = useQuery<any>({
     queryKey: ["/api/market/quote", selectedSymbol],
@@ -85,8 +71,7 @@ export default function MarketPage() {
   });
 
   const { data: intradayData, isLoading: intradayLoading } = useQuery<{
-    symbol: string;
-    interval: string;
+    symbol: string; interval: string;
     meta: { regularMarketPrice?: number; previousClose?: number; currency?: string; exchangeName?: string };
     candles: CandleBar[];
   }>({
@@ -94,23 +79,15 @@ export default function MarketPage() {
     refetchInterval: 60000,
   });
 
-  const { data: historicalDays, isLoading: histLoading } = useQuery<{
-    symbol: string;
-    days: DayInfo[];
-  }>({
-    queryKey: ["/api/market/historical-days", selectedSymbol],
-  });
+  const { data: historicalDays, isLoading: histDaysLoading } = useQuery<{
+    symbol: string; days: DayInfo[];
+  }>({ queryKey: ["/api/market/historical-days", selectedSymbol] });
 
-  const selectedDay = historicalDays?.days?.[histDayIndex];
-
-  const { data: dayDetailData, isLoading: dayDetailLoading } = useQuery<{
-    symbol: string;
-    date: string;
-    interval: string;
-    candles: CandleBar[];
+  const { data: continuousData, isLoading: continuousLoading } = useQuery<{
+    symbol: string; interval: string; candles: CandleBar[];
   }>({
-    queryKey: ["/api/market/day-detail", selectedSymbol, selectedDay?.date, interval],
-    enabled: !!selectedDay,
+    queryKey: ["/api/market/historical-continuous", selectedSymbol, interval],
+    staleTime: 5 * 60 * 1000,
   });
 
   const currentPrice = quoteData?.regularMarketPrice ?? intradayData?.meta?.regularMarketPrice;
@@ -136,23 +113,54 @@ export default function MarketPage() {
       )
     : [];
 
+  const categoryLabels: Record<keyof SymbolsData, string> = {
+    stocks: "Stocks", etfs: "ETFs", futures: "Futures", indices: "Indices",
+  };
+  const categorySymbols = symbolsData?.[selectedCategory] ?? [];
+
+  // Scroll timeline to show highlighted day
+  useEffect(() => {
+    if (!timelineRef.current || !historicalDays?.days) return;
+    const cardWidth = 72;
+    const containerWidth = timelineRef.current.offsetWidth;
+    const scrollLeft = highlightDayIndex * cardWidth - containerWidth / 2 + cardWidth / 2;
+    timelineRef.current.scrollTo({ left: Math.max(0, scrollLeft), behavior: "smooth" });
+  }, [highlightDayIndex, historicalDays]);
+
+  // Jump the continuous chart to a specific day
+  const jumpToDay = useCallback((idx: number) => {
+    setHighlightDayIndex(idx);
+    setDragIndex(idx);
+    const days = historicalDays?.days;
+    if (!days || !histChartRef.current) return;
+    const day = days[idx];
+    if (!day) return;
+    const [y, m, d] = day.date.split("-").map(Number);
+    const t = Math.floor(new Date(y, m - 1, d, 13, 30, 0).getTime() / 1000);
+    histChartRef.current.scrollToTime(t);
+  }, [historicalDays]);
+
+  // Drag handlers for timeline
   const handleDragStart = useCallback((clientX: number) => {
-    setIsDragging(true);
+    isDragging.current = true;
     dragStartX.current = clientX;
-    dragStartIndex.current = histDayIndex;
-  }, [histDayIndex]);
+    dragStartIndex.current = highlightDayIndex;
+  }, [highlightDayIndex]);
 
   const handleDragMove = useCallback((clientX: number) => {
-    if (!isDragging || !historicalDays?.days) return;
+    if (!isDragging.current || !historicalDays?.days) return;
     const dx = dragStartX.current - clientX;
     const step = Math.round(dx / 40);
     const newIndex = Math.max(0, Math.min(historicalDays.days.length - 1, dragStartIndex.current + step));
-    setHistDayIndex(newIndex);
-  }, [isDragging, historicalDays]);
+    setDragIndex(newIndex);
+    setHighlightDayIndex(newIndex);
+  }, [historicalDays]);
 
   const handleDragEnd = useCallback(() => {
-    setIsDragging(false);
-  }, []);
+    if (!isDragging.current) return;
+    isDragging.current = false;
+    jumpToDay(dragIndex);
+  }, [dragIndex, jumpToDay]);
 
   useEffect(() => {
     const onMouseUp = () => handleDragEnd();
@@ -165,26 +173,9 @@ export default function MarketPage() {
     };
   }, [handleDragMove, handleDragEnd]);
 
-  useEffect(() => {
-    if (timelineRef.current && historicalDays?.days) {
-      const cardWidth = 72;
-      const containerWidth = timelineRef.current.offsetWidth;
-      const scrollLeft = histDayIndex * cardWidth - containerWidth / 2 + cardWidth / 2;
-      timelineRef.current.scrollTo({ left: Math.max(0, scrollLeft), behavior: "smooth" });
-    }
-  }, [histDayIndex, historicalDays]);
-
-  const categoryLabels: Record<keyof SymbolsData, string> = {
-    stocks: "Stocks",
-    etfs: "ETFs",
-    futures: "Futures",
-    indices: "Indices",
-  };
-
-  const categorySymbols = symbolsData?.[selectedCategory] ?? [];
-
   return (
     <div className="flex flex-col h-full overflow-auto bg-background">
+      {/* Header */}
       <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur-sm px-4 py-3 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 mr-2">
           <BarChart3 className="w-5 h-5 text-primary" />
@@ -237,18 +228,25 @@ export default function MarketPage() {
           </div>
         </div>
 
-        <Select value={interval} onValueChange={(v) => setInterval(v as "15m" | "60m")}>
-          <SelectTrigger className="w-24" data-testid="select-interval">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="15m">15 min</SelectItem>
-            <SelectItem value="60m">60 min</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground border rounded-md px-2 py-1">
+            <span className="w-2 h-2 rounded-sm bg-green-500 inline-block" />RTH
+            <span className="w-2 h-2 rounded-sm bg-green-300 inline-block ml-1" />ETH
+          </div>
+          <Select value={interval} onValueChange={(v) => setInterval(v as "15m" | "60m")}>
+            <SelectTrigger className="w-24" data-testid="select-interval">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="15m">15 min</SelectItem>
+              <SelectItem value="60m">60 min</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
       </header>
 
       <div className="flex flex-col lg:flex-row flex-1 min-h-0 overflow-auto">
+        {/* Sidebar */}
         <aside className="lg:w-52 border-b lg:border-b-0 lg:border-r bg-sidebar flex-shrink-0 overflow-auto">
           <div className="p-2 flex flex-row lg:flex-col gap-1 flex-wrap lg:flex-nowrap">
             {categorySymbols.map((sym) => {
@@ -257,11 +255,9 @@ export default function MarketPage() {
                 <button
                   key={sym.symbol}
                   data-testid={`button-symbol-${sym.symbol}`}
-                  onClick={() => { setSelectedSymbol(sym.symbol); setHistDayIndex(0); }}
+                  onClick={() => { setSelectedSymbol(sym.symbol); setHighlightDayIndex(0); }}
                   className={`text-left rounded-md px-3 py-2 text-sm transition-colors hover-elevate w-full lg:w-auto ${
-                    isSelected
-                      ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
-                      : "text-sidebar-foreground"
+                    isSelected ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium" : "text-sidebar-foreground"
                   }`}
                 >
                   <div className="font-semibold text-xs">{sym.symbol}</div>
@@ -272,138 +268,146 @@ export default function MarketPage() {
           </div>
         </aside>
 
+        {/* Main content */}
         <main className="flex-1 overflow-auto p-4 flex flex-col gap-6 min-w-0">
-          <section>
-            <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
-              <div>
-                <div className="flex items-center gap-3 flex-wrap">
-                  <h1 className="text-2xl font-bold tracking-tight" data-testid="text-symbol">{selectedSymbol}</h1>
-                  {quoteData?.shortName && (
-                    <span className="text-sm text-muted-foreground" data-testid="text-company-name">{quoteData.shortName}</span>
-                  )}
-                  <Badge variant="outline" className="text-xs" data-testid="badge-exchange">
-                    {quoteData?.fullExchangeName ?? intradayData?.meta?.exchangeName ?? "—"}
-                  </Badge>
-                </div>
-                <div className="flex items-center gap-3 mt-2 flex-wrap">
-                  {currentPrice != null ? (
-                    <span className="text-3xl font-bold font-mono" data-testid="text-current-price">
-                      {formatPrice(currentPrice)}
-                    </span>
-                  ) : (
-                    <Skeleton className="h-8 w-32" />
-                  )}
-                  {priceChange != null && (
-                    <div
-                      className={`flex items-center gap-1 ${isPositive ? "text-green-500" : "text-red-500"}`}
-                      data-testid="text-price-change"
-                    >
-                      {isPositive ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
-                      <span className="font-semibold font-mono">{isPositive ? "+" : ""}{formatPrice(priceChange)}</span>
-                      <span className="font-mono text-sm">({isPositive ? "+" : ""}{priceChangePct?.toFixed(2)}%)</span>
-                    </div>
-                  )}
-                </div>
-                <div className="flex gap-4 mt-2 text-xs text-muted-foreground flex-wrap">
-                  {quoteData?.regularMarketVolume != null && (
-                    <span>Vol: <span className="text-foreground font-medium">{formatVolume(quoteData.regularMarketVolume)}</span></span>
-                  )}
-                  {quoteData?.regularMarketDayHigh != null && (
-                    <span>H: <span className="text-foreground font-medium">{formatPrice(quoteData.regularMarketDayHigh)}</span></span>
-                  )}
-                  {quoteData?.regularMarketDayLow != null && (
-                    <span>L: <span className="text-foreground font-medium">{formatPrice(quoteData.regularMarketDayLow)}</span></span>
-                  )}
-                  {prevClose != null && (
-                    <span>Prev Close: <span className="text-foreground font-medium">{formatPrice(prevClose)}</span></span>
-                  )}
-                </div>
+          {/* Price header */}
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-3 flex-wrap">
+                <h1 className="text-2xl font-bold tracking-tight" data-testid="text-symbol">{selectedSymbol}</h1>
+                {quoteData?.shortName && (
+                  <span className="text-sm text-muted-foreground" data-testid="text-company-name">{quoteData.shortName}</span>
+                )}
+                <Badge variant="outline" className="text-xs" data-testid="badge-exchange">
+                  {quoteData?.fullExchangeName ?? intradayData?.meta?.exchangeName ?? "—"}
+                </Badge>
               </div>
-              <div className="flex items-center gap-2">
-                <Activity className="w-4 h-4 text-primary" />
-                <span className="text-xs text-muted-foreground">Today's Session · {interval} candles</span>
+              <div className="flex items-center gap-3 mt-2 flex-wrap">
+                {currentPrice != null ? (
+                  <span className="text-3xl font-bold font-mono" data-testid="text-current-price">
+                    {formatPrice(currentPrice)}
+                  </span>
+                ) : (
+                  <Skeleton className="h-8 w-32" />
+                )}
+                {priceChange != null && (
+                  <div
+                    className={`flex items-center gap-1 ${isPositive ? "text-green-500" : "text-red-500"}`}
+                    data-testid="text-price-change"
+                  >
+                    {isPositive ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
+                    <span className="font-semibold font-mono">{isPositive ? "+" : ""}{formatPrice(priceChange)}</span>
+                    <span className="font-mono text-sm">({isPositive ? "+" : ""}{priceChangePct?.toFixed(2)}%)</span>
+                  </div>
+                )}
+              </div>
+              <div className="flex gap-4 mt-1 text-xs text-muted-foreground flex-wrap">
+                {quoteData?.regularMarketVolume != null && (
+                  <span>Vol: <span className="text-foreground font-medium">{formatVolume(quoteData.regularMarketVolume)}</span></span>
+                )}
+                {quoteData?.regularMarketDayHigh != null && (
+                  <span>H: <span className="text-foreground font-medium">{formatPrice(quoteData.regularMarketDayHigh)}</span></span>
+                )}
+                {quoteData?.regularMarketDayLow != null && (
+                  <span>L: <span className="text-foreground font-medium">{formatPrice(quoteData.regularMarketDayLow)}</span></span>
+                )}
+                {prevClose != null && (
+                  <span>Prev Close: <span className="text-foreground font-medium">{formatPrice(prevClose)}</span></span>
+                )}
               </div>
             </div>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Activity className="w-4 h-4 text-primary" />
+              <span>Today's Session · {interval} candles · ETH + RTH</span>
+            </div>
+          </div>
 
+          {/* Today's intraday chart */}
+          <section>
             <div className="rounded-lg border bg-card overflow-hidden">
               {intradayLoading ? (
-                <div className="flex items-center justify-center" style={{ height: 420 }}>
+                <div className="flex items-center justify-center" style={{ height: 380 }}>
                   <div className="flex flex-col items-center gap-3 text-muted-foreground">
                     <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                    <span className="text-sm">Loading market data...</span>
+                    <span className="text-sm">Loading today's market data...</span>
                   </div>
                 </div>
-              ) : intradayData?.candles?.length === 0 ? (
-                <div className="flex items-center justify-center" style={{ height: 420 }}>
+              ) : !intradayData?.candles?.length ? (
+                <div className="flex items-center justify-center" style={{ height: 380 }}>
                   <div className="text-center text-muted-foreground">
                     <BarChart3 className="w-10 h-10 mx-auto mb-2 opacity-30" />
                     <p className="text-sm">No trading data available for today</p>
-                    <p className="text-xs mt-1">Market may be closed or no data yet</p>
+                    <p className="text-xs mt-1">Market may be closed or pre-session</p>
                   </div>
                 </div>
               ) : (
-                <CandlestickChart
-                  candles={intradayData?.candles ?? []}
-                  height={420}
-                  showVolume={true}
-                />
+                <CandlestickChart candles={intradayData.candles} height={380} showVolume />
               )}
             </div>
           </section>
 
+          {/* Continuous historical section */}
           <section>
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h2 className="text-lg font-semibold tracking-tight">Historical Data</h2>
-                <p className="text-sm text-muted-foreground">Past 200 trading days — drag or click to navigate</p>
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <History className="w-4 h-4 text-primary" />
+                <div>
+                  <h2 className="text-base font-semibold tracking-tight">
+                    {interval === "15m" ? "60-Day" : "200-Day"} Continuous History
+                  </h2>
+                  <p className="text-xs text-muted-foreground">
+                    {interval === "15m"
+                      ? "15m ETH + RTH · last 60 days · switch to 60m for full 200-day view"
+                      : "60m ETH + RTH · full 200 trading days · drag timeline or zoom/pan"}
+                  </p>
+                </div>
               </div>
-              {selectedDay && (
-                <div className="text-right">
-                  <div className="text-sm font-medium" data-testid="text-selected-date">{formatDateFull(selectedDay.date)}</div>
-                  <div className="flex gap-3 text-xs text-muted-foreground mt-0.5 justify-end flex-wrap">
-                    <span>O: <span className={`font-medium ${selectedDay.close >= selectedDay.open ? "text-green-500" : "text-red-500"}`}>{formatPrice(selectedDay.open)}</span></span>
-                    <span>H: <span className="font-medium text-foreground">{formatPrice(selectedDay.high)}</span></span>
-                    <span>L: <span className="font-medium text-foreground">{formatPrice(selectedDay.low)}</span></span>
-                    <span>C: <span className={`font-medium ${selectedDay.close >= selectedDay.open ? "text-green-500" : "text-red-500"}`}>{formatPrice(selectedDay.close)}</span></span>
-                  </div>
+              {historicalDays?.days?.[highlightDayIndex] && (
+                <div className="flex items-center gap-2">
+                  <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
+                  <span className="text-sm font-medium" data-testid="text-selected-date">
+                    {formatDateFull(historicalDays.days[highlightDayIndex].date)}
+                  </span>
                 </div>
               )}
             </div>
 
-            <div className="mb-3 flex items-center gap-2">
+            {/* Timeline scrubber */}
+            <div className="flex items-center gap-2 mb-3">
               <Button
                 size="icon"
                 variant="outline"
                 data-testid="button-hist-prev"
-                disabled={histDayIndex <= 0}
-                onClick={() => setHistDayIndex((i) => Math.max(0, i - 1))}
+                disabled={highlightDayIndex <= 0}
+                onClick={() => jumpToDay(Math.max(0, highlightDayIndex - 1))}
               >
                 <ChevronLeft className="w-4 h-4" />
               </Button>
+
               <div
                 ref={timelineRef}
                 data-testid="timeline-scroll"
                 className="flex-1 overflow-x-auto select-none"
-                style={{ cursor: isDragging ? "grabbing" : "grab", scrollbarWidth: "none" }}
+                style={{ cursor: isDragging.current ? "grabbing" : "grab", scrollbarWidth: "none" }}
                 onMouseDown={(e) => { e.preventDefault(); handleDragStart(e.clientX); }}
                 onTouchStart={(e) => handleDragStart(e.touches[0].clientX)}
                 onTouchMove={(e) => handleDragMove(e.touches[0].clientX)}
                 onTouchEnd={handleDragEnd}
               >
                 <div className="flex gap-1 px-1 py-1" style={{ width: "max-content" }}>
-                  {histLoading
+                  {histDaysLoading
                     ? Array.from({ length: 20 }).map((_, i) => (
                         <Skeleton key={i} className="w-16 h-14 rounded flex-shrink-0" />
                       ))
                     : (historicalDays?.days ?? []).map((day, idx) => {
                         const isUp = day.close >= day.open;
-                        const isSelected = idx === histDayIndex;
+                        const isSelected = idx === highlightDayIndex;
                         const changePct = ((day.close - day.open) / day.open) * 100;
                         return (
                           <button
                             key={day.date}
                             data-testid={`button-day-${day.date}`}
-                            onClick={() => setHistDayIndex(idx)}
+                            onClick={() => jumpToDay(idx)}
                             className={`flex-shrink-0 w-16 rounded-md border px-1.5 py-1.5 text-center transition-all ${
                               isSelected
                                 ? "border-primary bg-primary/10 ring-1 ring-primary"
@@ -421,52 +425,65 @@ export default function MarketPage() {
                       })}
                 </div>
               </div>
+
               <Button
                 size="icon"
                 variant="outline"
                 data-testid="button-hist-next"
-                disabled={histDayIndex >= (historicalDays?.days?.length ?? 1) - 1}
-                onClick={() => setHistDayIndex((i) => Math.min((historicalDays?.days?.length ?? 1) - 1, i + 1))}
+                disabled={highlightDayIndex >= (historicalDays?.days?.length ?? 1) - 1}
+                onClick={() => jumpToDay(Math.min((historicalDays?.days?.length ?? 1) - 1, highlightDayIndex + 1))}
               >
                 <ChevronRight className="w-4 h-4" />
               </Button>
             </div>
 
+            {/* Continuous chart */}
             <div className="rounded-lg border bg-card overflow-hidden">
-              {!selectedDay ? (
-                <div className="flex items-center justify-center" style={{ height: 380 }}>
-                  <Skeleton className="w-full h-full" />
-                </div>
-              ) : dayDetailLoading ? (
-                <div className="flex items-center justify-center" style={{ height: 380 }}>
+              {continuousLoading ? (
+                <div className="flex items-center justify-center" style={{ height: 440 }}>
                   <div className="flex flex-col items-center gap-3 text-muted-foreground">
                     <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                    <span className="text-sm">Loading {formatDate(selectedDay.date)} data...</span>
+                    <span className="text-sm">Loading 200-day continuous history...</span>
+                    <span className="text-xs opacity-60">Fetching intraday data across multiple periods</span>
                   </div>
                 </div>
-              ) : dayDetailData?.candles?.length === 0 ? (
-                <div className="flex items-center justify-center" style={{ height: 380 }}>
+              ) : !continuousData?.candles?.length ? (
+                <div className="flex items-center justify-center" style={{ height: 440 }}>
                   <div className="text-center text-muted-foreground">
                     <BarChart3 className="w-10 h-10 mx-auto mb-2 opacity-30" />
-                    <p className="text-sm">No intraday data for {formatDate(selectedDay.date)}</p>
+                    <p className="text-sm">No historical data available</p>
                   </div>
                 </div>
               ) : (
                 <CandlestickChart
-                  candles={dayDetailData?.candles ?? []}
-                  height={380}
-                  showVolume={true}
+                  ref={histChartRef}
+                  candles={continuousData.candles}
+                  height={440}
+                  showVolume
                 />
               )}
             </div>
 
-            {selectedDay && (
-              <div className="mt-2 flex gap-2 text-xs text-muted-foreground justify-end">
-                <span>{histDayIndex + 1} of {historicalDays?.days?.length ?? "—"} days</span>
-                <span>·</span>
-                <span>Vol: {formatVolume(selectedDay.volume)}</span>
+            <div className="mt-2 flex gap-3 text-xs text-muted-foreground justify-between flex-wrap">
+              <div className="flex items-center gap-3">
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-sm bg-green-500 inline-block" /> RTH up
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-sm bg-red-500 inline-block" /> RTH down
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-sm bg-green-300 inline-block" /> ETH up
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-sm bg-red-300 inline-block" /> ETH down
+                </span>
               </div>
-            )}
+              <span>
+                {continuousData?.candles?.length?.toLocaleString()} candles ·
+                {historicalDays?.days?.length ?? "—"} trading days
+              </span>
+            </div>
           </section>
         </main>
       </div>

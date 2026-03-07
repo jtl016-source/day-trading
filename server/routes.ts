@@ -45,23 +45,74 @@ const POPULAR_SYMBOLS = {
   ],
 };
 
-function daysAgo(n: number): Date {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  d.setHours(0, 0, 0, 0);
-  return d;
+/**
+ * Determine if a UTC timestamp is within Regular Trading Hours (RTH) for US markets.
+ * RTH: 9:30 AM – 4:00 PM ET
+ * ET = UTC-5 (EST) or UTC-4 (EDT). We approximate by checking UTC 13:30–21:00 (EST offset).
+ */
+function isRTH(timestampSec: number): boolean {
+  const d = new Date(timestampSec * 1000);
+  const dayOfWeek = d.getUTCDay();
+  if (dayOfWeek === 0 || dayOfWeek === 6) return false;
+
+  const utcHour = d.getUTCHours();
+  const utcMin = d.getUTCMinutes();
+  const utcMins = utcHour * 60 + utcMin;
+
+  // Approximate both EDT (UTC-4: open=13:30, close=20:00) and EST (UTC-5: open=14:30, close=21:00)
+  // Use 13:30 UTC (EDT open) to 21:00 UTC (EST close) to be inclusive
+  const openUTC = 13 * 60 + 30; // 13:30 UTC = 9:30 AM EDT
+  const closeUTC = 21 * 60;     // 21:00 UTC = 4:00 PM EST
+  return utcMins >= openUTC && utcMins < closeUTC;
 }
 
-function todayStart(): Date {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
+function mapQuotes(quotes: any[]): any[] {
+  return quotes
+    .filter((q: any) => q.open != null && q.close != null && q.high != null && q.low != null)
+    .map((q: any) => {
+      const timeSec = Math.floor(new Date(q.date).getTime() / 1000);
+      return {
+        time: timeSec,
+        open: q.open,
+        high: q.high,
+        low: q.low,
+        close: q.close,
+        volume: q.volume ?? 0,
+        rth: isRTH(timeSec),
+      };
+    });
 }
 
-function todayEnd(): Date {
-  const d = new Date();
-  d.setHours(23, 59, 59, 999);
-  return d;
+/** Fetch a single chart chunk from Yahoo Finance */
+async function fetchChunk(symbol: string, period1: Date, period2: Date, interval: string): Promise<any[]> {
+  try {
+    const result = await yahooFinance.chart(symbol, {
+      period1,
+      period2,
+      interval: interval as any,
+    });
+    return mapQuotes(result.quotes || []);
+  } catch {
+    return [];
+  }
+}
+
+/** Fetch all available intraday data, respecting Yahoo Finance limits */
+async function fetchContinuousHistory(symbol: string, interval: string): Promise<any[]> {
+  const now = new Date();
+
+  if (interval === "60m") {
+    // 60m supports up to 730 days — fetch full 200-day range in one request
+    const period1 = new Date(now);
+    period1.setDate(period1.getDate() - 200);
+    return fetchChunk(symbol, period1, now, "60m");
+  }
+
+  // 15m: Yahoo Finance only supports the most recent 60 days
+  // We cannot go further back without a third-party data provider
+  const period1 = new Date(now);
+  period1.setDate(period1.getDate() - 59);
+  return fetchChunk(symbol, period1, now, "15m");
 }
 
 export async function registerRoutes(
@@ -82,25 +133,23 @@ export async function registerRoutes(
     }
   });
 
+  /** Today's intraday data with full ETH+RTH */
   app.get("/api/market/intraday/:symbol/:interval", async (req, res) => {
     const { symbol, interval } = req.params;
     const iv = interval === "60m" ? "60m" : "15m";
     try {
+      const now = new Date();
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+
       const result = await yahooFinance.chart(symbol, {
-        period1: todayStart(),
-        period2: todayEnd(),
+        period1: start,
+        period2: now,
         interval: iv as any,
       });
-      const candles = (result.quotes || [])
-        .filter((q: any) => q.open != null && q.close != null && q.high != null && q.low != null)
-        .map((q: any) => ({
-          time: Math.floor(new Date(q.date).getTime() / 1000),
-          open: q.open,
-          high: q.high,
-          low: q.low,
-          close: q.close,
-          volume: q.volume,
-        }));
+
+      const candles = mapQuotes(result.quotes || []);
+
       res.json({
         symbol,
         interval: iv,
@@ -117,14 +166,20 @@ export async function registerRoutes(
     }
   });
 
+  /** Daily summary for past 200 trading days (for the timeline scrubber) */
   app.get("/api/market/historical-days/:symbol", async (req, res) => {
     const { symbol } = req.params;
     try {
+      const now = new Date();
+      const period1 = new Date(now);
+      period1.setDate(period1.getDate() - 280);
+
       const result = await yahooFinance.chart(symbol, {
-        period1: daysAgo(280),
-        period2: new Date(),
+        period1,
+        period2: now,
         interval: "1d" as any,
       });
+
       const days = (result.quotes || [])
         .filter((q: any) => q.open != null && q.close != null)
         .map((q: any) => {
@@ -140,35 +195,20 @@ export async function registerRoutes(
         })
         .slice(-200)
         .reverse();
+
       res.json({ symbol, days });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  app.get("/api/market/day-detail/:symbol/:date/:interval", async (req, res) => {
-    const { symbol, date, interval } = req.params;
+  /** Continuous 200-day intraday history — all ETH+RTH, no gaps between days */
+  app.get("/api/market/historical-continuous/:symbol/:interval", async (req, res) => {
+    const { symbol, interval } = req.params;
     const iv = interval === "60m" ? "60m" : "15m";
     try {
-      const [y, m, d] = date.split("-").map(Number);
-      const start = new Date(y, m - 1, d, 0, 0, 0);
-      const end = new Date(y, m - 1, d, 23, 59, 59);
-      const result = await yahooFinance.chart(symbol, {
-        period1: start,
-        period2: end,
-        interval: iv as any,
-      });
-      const candles = (result.quotes || [])
-        .filter((q: any) => q.open != null && q.close != null && q.high != null && q.low != null)
-        .map((q: any) => ({
-          time: Math.floor(new Date(q.date).getTime() / 1000),
-          open: q.open,
-          high: q.high,
-          low: q.low,
-          close: q.close,
-          volume: q.volume,
-        }));
-      res.json({ symbol, date, interval: iv, candles });
+      const candles = await fetchContinuousHistory(symbol, iv);
+      res.json({ symbol, interval: iv, candles });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
