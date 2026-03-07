@@ -140,7 +140,13 @@ export async function registerRoutes(
     try {
       const now = new Date();
       const start = new Date();
-      start.setHours(0, 0, 0, 0);
+      const isFutures = symbol.endsWith("=F");
+      if (isFutures) {
+        start.setDate(start.getDate() - 1);
+        start.setHours(17, 0, 0, 0);
+      } else {
+        start.setHours(0, 0, 0, 0);
+      }
 
       const result = await yahooFinance.chart(symbol, {
         period1: start,
