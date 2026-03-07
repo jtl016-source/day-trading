@@ -33,9 +33,14 @@ A real-time and historical market charting application using live Yahoo Finance 
 ## RTH Detection
 RTH (Regular Trading Hours) = 9:30am – 4:00pm ET. Implemented server-side by checking UTC timestamp falls between 13:30–21:00 UTC (covers both EST/EDT offsets).
 
+## UI/UX
+- **Dark Theme**: Professional trading terminal dark theme (near-black background `220 10% 4%`). Dark class forced on mount via `useEffect` in `App.tsx`.
+- **Drag-to-Zoom**: Crosshair toggle button enables drag-to-zoom rectangle selection. Fit-all reset button (Maximize2 icon). Global mouseup + Escape key handlers for reliable deactivation.
+- **Band Overlays**: Canvas-based filled zone rendering for Yellow Box strategy. Semi-transparent yellow/red/green rectangles redrawn on every pan/zoom via `subscribeVisibleLogicalRangeChange` + `subscribeCrosshairMove`. Uses `unsubscribe*` methods (not callable return values) for cleanup.
+
 ## Key Libraries
 - `yahoo-finance2` (v3) — Server-side Yahoo Finance data fetching; uses `period1`/`period2` Date objects
-- `lightweight-charts` (v5) — TradingView candlestick charting library
+- `lightweight-charts` (v5) — TradingView candlestick charting library; subscribe methods return void, use `unsubscribe*` counterparts for cleanup
 - `@tanstack/react-query` — Data fetching and caching on the frontend
 
 ## Running

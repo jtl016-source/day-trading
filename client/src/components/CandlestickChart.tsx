@@ -32,6 +32,14 @@ export interface ZoneOverlay {
   title?: string;
 }
 
+export interface BandOverlay {
+  topPrice: number;
+  bottomPrice: number;
+  fillColor: string;
+  fromTime: number;
+  toTime: number;
+}
+
 export interface ChartHandle {
   scrollToTime: (timestamp: number) => void;
   resetZoom: () => void;
@@ -42,6 +50,7 @@ interface CandlestickChartProps {
   height?: number;
   showVolume?: boolean;
   zoneOverlays?: ZoneOverlay[];
+  bandOverlays?: BandOverlay[];
   dragZoomEnabled?: boolean;
   onDragZoomDone?: () => void;
 }
@@ -57,8 +66,9 @@ const ETH_UP_WICK = "#4ade80";
 const ETH_DOWN_WICK = "#f87171";
 
 export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
-  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays, dragZoomEnabled = false, onDragZoomDone }, ref) {
+  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays, bandOverlays, dragZoomEnabled = false, onDragZoomDone }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
+    const bandCanvasRef = useRef<HTMLCanvasElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
     const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
@@ -162,9 +172,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         layout: {
           background: {
             type: ColorType.Solid,
-            color: isDark ? "hsl(210, 6%, 8%)" : "hsl(210, 5%, 98%)",
+            color: isDark ? "hsl(220, 10%, 4%)" : "hsl(210, 5%, 98%)",
           },
-          textColor: isDark ? "rgba(210,220,230,0.65)" : "rgba(30,40,50,0.55)",
+          textColor: isDark ? "rgba(180,190,200,0.7)" : "rgba(30,40,50,0.55)",
           fontFamily: "var(--font-sans, sans-serif)",
           fontSize: 11,
         },
@@ -338,6 +348,71 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       chartRef.current.timeScale().fitContent();
     }, [candles]);
 
+    const drawBands = useCallback(() => {
+      const canvas = bandCanvasRef.current;
+      const chart = chartRef.current;
+      const series = candleSeriesRef.current;
+      if (!canvas || !chart || !series || !bandOverlays || bandOverlays.length === 0) {
+        if (canvas) {
+          const ctx = canvas.getContext("2d");
+          if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        return;
+      }
+
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.parentElement?.getBoundingClientRect();
+      if (!rect) return;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      canvas.style.width = rect.width + "px";
+      canvas.style.height = rect.height + "px";
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      const ts = chart.timeScale();
+
+      for (const band of bandOverlays) {
+        const topY = series.priceToCoordinate(band.topPrice);
+        const bottomY = series.priceToCoordinate(band.bottomPrice);
+        if (topY == null || bottomY == null) continue;
+
+        const leftX = ts.timeToCoordinate(band.fromTime as any);
+        const rightX = ts.timeToCoordinate(band.toTime as any);
+        if (leftX == null || rightX == null) continue;
+
+        const x = Math.min(leftX, rightX);
+        const w = Math.abs(rightX - leftX);
+        const y = Math.min(topY, bottomY);
+        const h = Math.abs(bottomY - topY);
+
+        if (w > 0 && h > 0) {
+          ctx.fillStyle = band.fillColor;
+          ctx.fillRect(x, y, w, h);
+        }
+      }
+    }, [bandOverlays]);
+
+    useEffect(() => {
+      const chart = chartRef.current;
+      if (!chart) return;
+
+      drawBands();
+
+      chart.timeScale().subscribeVisibleLogicalRangeChange(drawBands);
+      chart.subscribeCrosshairMove(drawBands);
+
+      return () => {
+        try {
+          chart.timeScale().unsubscribeVisibleLogicalRangeChange(drawBands);
+          chart.unsubscribeCrosshairMove(drawBands);
+        } catch {}
+      };
+    }, [drawBands]);
+
     useEffect(() => {
       const chart = chartRef.current;
       if (!chart) return;
@@ -383,6 +458,18 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         data-testid="candlestick-chart"
       >
         <div ref={containerRef} style={{ width: "100%", height }} />
+        <canvas
+          ref={bandCanvasRef}
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            height: "100%",
+            pointerEvents: "none",
+            zIndex: 1,
+          }}
+        />
         {dragZoomEnabled && (
           <div
             data-testid="drag-zoom-overlay"

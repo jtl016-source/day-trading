@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CandlestickChart, type CandleBar, type ChartHandle, type ZoneOverlay } from "@/components/CandlestickChart";
+import { CandlestickChart, type CandleBar, type ChartHandle, type ZoneOverlay, type BandOverlay } from "@/components/CandlestickChart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -87,8 +87,8 @@ function computeYellowBoxZones(days: DayInfo[]): YellowBoxDay[] {
 function buildZoneOverlays(
   zones: YellowBoxDay[],
   candles: CandleBar[]
-): ZoneOverlay[] {
-  if (zones.length === 0 || candles.length === 0) return [];
+): { lines: ZoneOverlay[]; bands: BandOverlay[] } {
+  if (zones.length === 0 || candles.length === 0) return { lines: [], bands: [] };
 
   const sorted = [...candles].sort((a, b) => a.time - b.time);
 
@@ -116,6 +116,7 @@ function buildZoneOverlays(
   const rbData: Array<{ time: number; value: number }> = [];
   const stData: Array<{ time: number; value: number }> = [];
   const sbData: Array<{ time: number; value: number }> = [];
+  const bands: BandOverlay[] = [];
 
   for (const [dateStr, bounds] of dayGroups) {
     const zone = zoneMap.get(dateStr);
@@ -141,17 +142,41 @@ function buildZoneOverlays(
 
     sbData.push({ time: bounds.first, value: zone.supportBot });
     sbData.push({ time: bounds.last, value: zone.supportBot });
+
+    bands.push({
+      topPrice: zone.yellowTop,
+      bottomPrice: zone.yellowBottom,
+      fillColor: "rgba(180, 160, 40, 0.18)",
+      fromTime: bounds.first,
+      toTime: bounds.last,
+    });
+    bands.push({
+      topPrice: zone.resistanceTop,
+      bottomPrice: zone.resistanceBot,
+      fillColor: "rgba(200, 40, 40, 0.22)",
+      fromTime: bounds.first,
+      toTime: bounds.last,
+    });
+    bands.push({
+      topPrice: zone.supportTop,
+      bottomPrice: zone.supportBot,
+      fillColor: "rgba(30, 160, 60, 0.22)",
+      fromTime: bounds.first,
+      toTime: bounds.last,
+    });
   }
 
-  return [
-    { data: ytData, color: "rgba(255, 223, 0, 0.95)", lineWidth: 2, lineStyle: 0, title: "YB Top" },
-    { data: ybData, color: "rgba(255, 223, 0, 0.95)", lineWidth: 2, lineStyle: 0, title: "YB Bot" },
-    { data: pocData, color: "rgba(168, 85, 247, 0.85)", lineWidth: 2, lineStyle: 4, title: "POC" },
-    { data: rtData, color: "rgba(255, 60, 60, 0.9)", lineWidth: 2, lineStyle: 2, title: "R Top" },
-    { data: rbData, color: "rgba(255, 60, 60, 0.9)", lineWidth: 2, lineStyle: 2, title: "R Bot" },
-    { data: stData, color: "rgba(0, 200, 80, 0.9)", lineWidth: 2, lineStyle: 2, title: "S Top" },
-    { data: sbData, color: "rgba(0, 200, 80, 0.9)", lineWidth: 2, lineStyle: 2, title: "S Bot" },
+  const lines: ZoneOverlay[] = [
+    { data: ytData, color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
+    { data: ybData, color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
+    { data: pocData, color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "Pivot" },
+    { data: rtData, color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Top" },
+    { data: rbData, color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Bot" },
+    { data: stData, color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Top" },
+    { data: sbData, color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Bot" },
   ];
+
+  return { lines, bands };
 }
 
 function formatPrice(n: number | undefined | null): string {
@@ -229,9 +254,11 @@ export default function MarketPage() {
     return computeYellowBoxZones(historicalDays.days);
   }, [historicalDays]);
 
-  const zoneOverlays = useMemo(() => {
-    if (!showYellowBox || yellowBoxZones.length === 0 || !continuousData?.candles?.length) return [];
-    return buildZoneOverlays(yellowBoxZones, continuousData.candles);
+  const { zoneOverlays, bandOverlayData } = useMemo(() => {
+    if (!showYellowBox || yellowBoxZones.length === 0 || !continuousData?.candles?.length)
+      return { zoneOverlays: [] as ZoneOverlay[], bandOverlayData: [] as BandOverlay[] };
+    const result = buildZoneOverlays(yellowBoxZones, continuousData.candles);
+    return { zoneOverlays: result.lines, bandOverlayData: result.bands };
   }, [showYellowBox, yellowBoxZones, continuousData]);
 
   const currentPrice = quoteData?.regularMarketPrice ?? intradayData?.meta?.regularMarketPrice;
@@ -627,6 +654,7 @@ export default function MarketPage() {
                   height={440}
                   showVolume
                   zoneOverlays={zoneOverlays}
+                  bandOverlays={bandOverlayData}
                   dragZoomEnabled={dragZoomActive}
                   onDragZoomDone={() => setDragZoomActive(false)}
                 />
@@ -650,16 +678,16 @@ export default function MarketPage() {
                 {showYellowBox && (
                   <>
                     <span className="border-l border-border pl-3 flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(255, 223, 0, 0.95)" }} /> Yellow Box
+                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(180, 160, 40, 0.35)" }} /> Yellow Box
                     </span>
                     <span className="flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(168, 85, 247, 0.9)" }} /> POC
+                      <span className="w-3 h-1 rounded-sm inline-block" style={{ backgroundColor: "rgba(220, 220, 220, 0.8)" }} /> Pivot
                     </span>
                     <span className="flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm bg-red-500 inline-block" /> Resistance
+                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(200, 40, 40, 0.35)" }} /> Resistance
                     </span>
                     <span className="flex items-center gap-1">
-                      <span className="w-3 h-1 rounded-sm bg-green-500 inline-block" /> Support
+                      <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "rgba(30, 160, 60, 0.35)" }} /> Support
                     </span>
                   </>
                 )}
