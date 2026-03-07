@@ -73,6 +73,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
     const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+    const bandOverlaysRef = useRef<BandOverlay[]>([]);
+    const rafIdRef = useRef<number>(0);
+    const prevCandleKeyRef = useRef<string>("");
 
     const [dragState, setDragState] = useState<{
       active: boolean;
@@ -285,10 +288,15 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       if (candles.length === 0) {
         candleSeriesRef.current.setData([]);
         volumeSeriesRef.current?.setData([]);
+        prevCandleKeyRef.current = "";
         return;
       }
 
       const sorted = [...candles].sort((a, b) => a.time - b.time);
+      const candleKey = `${sorted[0].time}-${sorted[sorted.length - 1].time}-${sorted.length}`;
+      const dataChanged = candleKey !== prevCandleKeyRef.current;
+      prevCandleKeyRef.current = candleKey;
+
       const hasETHData = sorted.some((c) => c.rth === true || c.rth === false);
 
       function getUTCDate(ts: number): string {
@@ -349,14 +357,20 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         volumeSeriesRef.current.setData(volData as HistogramData[]);
       }
 
-      chartRef.current.timeScale().fitContent();
+      if (dataChanged) {
+        chartRef.current.timeScale().fitContent();
+      }
     }, [candles]);
+
+    bandOverlaysRef.current = bandOverlays || [];
 
     const drawBands = useCallback(() => {
       const canvas = bandCanvasRef.current;
       const chart = chartRef.current;
       const series = candleSeriesRef.current;
-      if (!canvas || !chart || !series || !bandOverlays || bandOverlays.length === 0) {
+      const bands = bandOverlaysRef.current;
+
+      if (!canvas || !chart || !series) {
         if (canvas) {
           const ctx = canvas.getContext("2d");
           if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -365,21 +379,41 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       }
 
       const dpr = window.devicePixelRatio || 1;
-      const rect = canvas.parentElement?.getBoundingClientRect();
-      if (!rect) return;
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      canvas.style.width = rect.width + "px";
-      canvas.style.height = rect.height + "px";
+      const container = canvas.parentElement;
+      if (!container) return;
+      const containerRect = container.getBoundingClientRect();
+      const cw = containerRect.width;
+      const ch = containerRect.height;
+
+      if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
+        canvas.width = Math.round(cw * dpr);
+        canvas.height = Math.round(ch * dpr);
+        canvas.style.width = cw + "px";
+        canvas.style.height = ch + "px";
+      }
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.clearRect(0, 0, cw, ch);
+
+      if (!bands || bands.length === 0) return;
 
       const ts = chart.timeScale();
+      const priceScale = chart.priceScale("right");
+      const timeScaleWidth = ts.width();
+      const chartAreaLeft = cw - timeScaleWidth - (priceScale.width() || 0);
+      const clipLeft = Math.max(0, chartAreaLeft < 10 ? 0 : 0);
+      const clipRight = timeScaleWidth;
+      const clipTop = 0;
+      const clipBottom = ch - 28;
 
-      for (const band of bandOverlays) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(clipLeft, clipTop, clipRight, clipBottom);
+      ctx.clip();
+
+      for (const band of bands) {
         const topY = series.priceToCoordinate(band.topPrice);
         const bottomY = series.priceToCoordinate(band.bottomPrice);
         if (topY == null || bottomY == null) continue;
@@ -398,24 +432,32 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           ctx.fillRect(x, y, w, h);
         }
       }
-    }, [bandOverlays]);
+
+      ctx.restore();
+    }, []);
 
     useEffect(() => {
       const chart = chartRef.current;
       if (!chart) return;
 
-      drawBands();
+      const scheduleRedraw = () => {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = requestAnimationFrame(drawBands);
+      };
 
-      chart.timeScale().subscribeVisibleLogicalRangeChange(drawBands);
-      chart.subscribeCrosshairMove(drawBands);
+      scheduleRedraw();
+
+      chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleRedraw);
+      chart.subscribeCrosshairMove(scheduleRedraw);
 
       return () => {
+        cancelAnimationFrame(rafIdRef.current);
         try {
-          chart.timeScale().unsubscribeVisibleLogicalRangeChange(drawBands);
-          chart.unsubscribeCrosshairMove(drawBands);
+          chart.timeScale().unsubscribeVisibleLogicalRangeChange(scheduleRedraw);
+          chart.unsubscribeCrosshairMove(scheduleRedraw);
         } catch {}
       };
-    }, [drawBands]);
+    }, [drawBands, bandOverlays, zoneOverlays]);
 
     useEffect(() => {
       const chart = chartRef.current;
