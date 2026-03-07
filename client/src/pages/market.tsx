@@ -146,15 +146,15 @@ function buildZoneOverlays(
       toTime: bounds.last,
     });
     bands.push({
-      topPrice: zone.avgRangeHigh,
-      bottomPrice: zone.yellowTop,
+      topPrice: zone.maxRangeHigh,
+      bottomPrice: zone.avgRangeHigh,
       fillColor: "rgba(200, 40, 40, 0.15)",
       fromTime: bounds.first,
       toTime: bounds.last,
     });
     bands.push({
-      topPrice: zone.yellowBottom,
-      bottomPrice: zone.avgRangeLow,
+      topPrice: zone.avgRangeLow,
+      bottomPrice: zone.maxRangeLow,
       fillColor: "rgba(30, 160, 60, 0.15)",
       fromTime: bounds.first,
       toTime: bounds.last,
@@ -178,10 +178,10 @@ function buildZoneOverlays(
     { data: dedup(ytData), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Top" },
     { data: dedup(ybData), color: "rgba(210, 190, 50, 0.9)", lineWidth: 1, lineStyle: 2, title: "YB Bot" },
     { data: dedup(pocData), color: "rgba(220, 220, 220, 0.8)", lineWidth: 1, lineStyle: 2, title: "POC" },
-    { data: dedup(arHData), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range H" },
-    { data: dedup(arLData), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "Avg Range L" },
-    { data: dedup(mrHData), color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range H" },
-    { data: dedup(mrLData), color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max Range L" },
+    { data: dedup(arHData), color: "rgba(220, 80, 80, 0.8)", lineWidth: 1, lineStyle: 2, title: "R Zone" },
+    { data: dedup(arLData), color: "rgba(60, 180, 90, 0.8)", lineWidth: 1, lineStyle: 2, title: "S Zone" },
+    { data: dedup(mrHData), color: "rgba(220, 80, 80, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max R" },
+    { data: dedup(mrLData), color: "rgba(60, 180, 90, 0.5)", lineWidth: 1, lineStyle: 3, title: "Max S" },
   ];
 
   return { lines, bands };
