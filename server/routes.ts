@@ -4,6 +4,66 @@ import YahooFinance from "yahoo-finance2";
 
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
 
+const MARKETDATA_BASE = "https://api.marketdata.app/v1";
+const LIVE_DATA_KEY = process.env.LIVE_DATA;
+
+async function mdFetch(path: string): Promise<any> {
+  if (!LIVE_DATA_KEY) return null;
+  const resp = await fetch(`${MARKETDATA_BASE}${path}`, {
+    headers: { Authorization: `Bearer ${LIVE_DATA_KEY}` },
+  });
+  if (!resp.ok) return null;
+  return resp.json();
+}
+
+async function fetchMarketDataQuote(symbol: string): Promise<any | null> {
+  const data = await mdFetch(`/stocks/quotes/${symbol}/?52week=true`);
+  if (!data || data.s !== "ok") return null;
+  const i = 0;
+  return {
+    symbol,
+    regularMarketPrice: data.last?.[i],
+    regularMarketChange: data.change?.[i],
+    regularMarketChangePercent: data.changepct?.[i] != null ? data.changepct[i] * 100 : undefined,
+    regularMarketVolume: data.volume?.[i],
+    regularMarketDayHigh: data.high?.[i] ?? undefined,
+    regularMarketDayLow: data.low?.[i] ?? undefined,
+    regularMarketOpen: data.open?.[i] ?? undefined,
+    regularMarketPreviousClose: data.prevClose?.[i] ?? undefined,
+    bid: data.bid?.[i],
+    ask: data.ask?.[i],
+    bidSize: data.bidSize?.[i],
+    askSize: data.askSize?.[i],
+    fiftyTwoWeekHigh: data["52weekHigh"]?.[i],
+    fiftyTwoWeekLow: data["52weekLow"]?.[i],
+    regularMarketTime: data.updated?.[i] ? new Date(data.updated[i] * 1000).toISOString() : undefined,
+    fullExchangeName: "MarketData.app",
+    shortName: symbol,
+    marketState: "REGULAR",
+  };
+}
+
+async function fetchMarketDataCandles(symbol: string, resolution: string, from: Date, to: Date): Promise<any[]> {
+  const fromTs = Math.floor(from.getTime() / 1000);
+  const toTs = Math.floor(to.getTime() / 1000);
+  const data = await mdFetch(`/stocks/candles/${resolution}/${symbol}/?from=${fromTs}&to=${toTs}`);
+  if (!data || data.s !== "ok" || !data.t) return [];
+  const candles: any[] = [];
+  for (let i = 0; i < data.t.length; i++) {
+    if (data.o[i] == null || data.c[i] == null) continue;
+    candles.push({
+      time: data.t[i],
+      open: data.o[i],
+      high: data.h[i],
+      low: data.l[i],
+      close: data.c[i],
+      volume: data.v?.[i] ?? 0,
+      rth: isRTH(data.t[i]),
+    });
+  }
+  return candles;
+}
+
 const POPULAR_SYMBOLS = {
   stocks: [
     { symbol: "AAPL", name: "Apple Inc." },
@@ -126,6 +186,13 @@ export async function registerRoutes(
   app.get("/api/market/quote/:symbol", async (req, res) => {
     const { symbol } = req.params;
     try {
+      if (LIVE_DATA_KEY && !symbol.endsWith("=F") && !symbol.startsWith("^")) {
+        const mdQuote = await fetchMarketDataQuote(symbol);
+        if (mdQuote) {
+          res.json(mdQuote);
+          return;
+        }
+      }
       const quote = await yahooFinance.quote(symbol);
       res.json(quote);
     } catch (err: any) {
@@ -141,6 +208,29 @@ export async function registerRoutes(
       const now = new Date();
       const start = new Date();
       const isFutures = symbol.endsWith("=F");
+      const isIndex = symbol.startsWith("^");
+
+      if (LIVE_DATA_KEY && !isFutures && !isIndex) {
+        start.setHours(0, 0, 0, 0);
+        const mdResolution = iv === "60m" ? "H" : "15";
+        const mdCandles = await fetchMarketDataCandles(symbol, mdResolution, start, now);
+        if (mdCandles.length > 0) {
+          const mdQuote = await fetchMarketDataQuote(symbol);
+          res.json({
+            symbol,
+            interval: iv,
+            meta: {
+              regularMarketPrice: mdQuote?.regularMarketPrice,
+              previousClose: mdQuote?.regularMarketPreviousClose,
+              currency: "USD",
+              exchangeName: "MarketData.app",
+            },
+            candles: mdCandles,
+          });
+          return;
+        }
+      }
+
       if (isFutures) {
         start.setDate(start.getDate() - 1);
         start.setHours(17, 0, 0, 0);
