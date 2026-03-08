@@ -13,6 +13,7 @@ import {
   Crosshair,
   Maximize2,
   Database,
+  Newspaper,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Link } from "wouter";
@@ -481,6 +482,12 @@ export default function MarketPage() {
         </div>
 
         <div className="flex items-center gap-2">
+          <Link href="/news">
+            <Button size="sm" variant="outline" data-testid="button-news" className="text-xs gap-1.5 h-7">
+              <Newspaper className="w-3.5 h-3.5" />
+              News
+            </Button>
+          </Link>
           <Link href="/data">
             <Button size="sm" variant="outline" data-testid="button-data-download" className="text-xs gap-1.5 h-7">
               <Database className="w-3.5 h-3.5" />

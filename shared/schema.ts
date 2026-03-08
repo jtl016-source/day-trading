@@ -43,5 +43,25 @@ export const downloadStatus = pgTable("download_status", {
   unique().on(t.symbol, t.year, t.month),
 ]);
 
+export const newsArticles = pgTable("news_articles", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  description: text("description"),
+  content: text("content"),
+  url: text("url").notNull(),
+  source: varchar("source", { length: 100 }),
+  imageUrl: text("image_url"),
+  publishedAt: timestamp("published_at").notNull(),
+  category: varchar("category", { length: 50 }).notNull().default("general"),
+  searchQuery: varchar("search_query", { length: 200 }),
+  fetchedAt: timestamp("fetched_at").defaultNow(),
+}, (t) => [
+  unique().on(t.url),
+]);
+
+export const insertNewsArticleSchema = createInsertSchema(newsArticles).omit({ id: true, fetchedAt: true });
+export type InsertNewsArticle = z.infer<typeof insertNewsArticleSchema>;
+export type NewsArticle = typeof newsArticles.$inferSelect;
+
 export type CachedCandle = typeof cachedCandles.$inferSelect;
 export type DownloadStatus = typeof downloadStatus.$inferSelect;

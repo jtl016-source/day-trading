@@ -12,22 +12,25 @@ A cache-driven market charting application. Downloads historical data from Polyg
 - **Volume bars** shown below the candlestick chart
 - **Yellow Box Method** (per the Official Yellow Box Guide): Per-day zone overlays on the chart. POC = previous day's close. Yellow Box width from 50-day historical volatility (average daily range × 0.35). Red Box = Average Range High. Green Box = Average Range Low. Max Range dashed lines show historical extreme levels.
 - **Data Download Panel** (`/data` route): Bulk download historical 5-min and 60-min candle data from Polygon.io. Calendar grid UI showing download status by month. Downloaded data cached in PostgreSQL.
+- **Market News Timeline** (`/news` route): Timeline chart of major market-moving events fetched from GNews API. Articles categorized by type (Fed policy, crashes, rallies, inflation, geopolitical, earnings, recession, crypto). Interactive timeline with hover tooltips and click-to-expand article cards. Cached in PostgreSQL.
 
 ## Architecture
 
 ### Frontend
 - `client/src/pages/market.tsx` — Main market page: cache-driven candlestick chart with date window selector, Yellow Box overlays, symbol sidebar. Uses 5m cached data for chart and 60m-aggregated daily data for zones.
 - `client/src/pages/data-download.tsx` — Data Download page: Polygon.io bulk download UI, calendar grid, stored data table
+- `client/src/pages/news.tsx` — News page: GNews-powered market event timeline with category filters
 - `client/src/components/CandlestickChart.tsx` — TradingView lightweight-charts v5 component; supports ETH/RTH per-bar coloring, `scrollToTime()` via forwardRef, and dynamic zone overlay rendering via `zoneOverlays` prop (LineSeries)
 
 ### Backend
 - `server/routes.ts` — Express API routes fetching from Yahoo Finance (yahoo-finance2 v3), MarketData.app, and Polygon.io
 - `server/db.ts` — PostgreSQL database connection via Drizzle ORM
-- `shared/schema.ts` — Drizzle schema: users, cached_candles, download_status tables
+- `shared/schema.ts` — Drizzle schema: users, cached_candles, download_status, news_articles tables
 
 ### Database (PostgreSQL)
 - `cached_candles` — Stores downloaded 5-min and 60-min OHLCV candle data per symbol
 - `download_status` — Tracks download state (none/downloading/done/error) per symbol/year/month
+- `news_articles` — Cached news articles from GNews API with category, source, published date
 
 ## API Routes
 - `GET /api/market/symbols` — Static list of symbols by category
@@ -43,10 +46,15 @@ A cache-driven market charting application. Downloads historical data from Polyg
 - `GET /api/data/cached-continuous/:symbol/:interval?from=X&to=Y` — Cached continuous candle data for chart display, supports timestamp windowing via from/to query params
 - `GET /api/data/cached-days/:symbol` — Daily OHLCV from cached 60-min data for Yellow Box calculations
 - `DELETE /api/data/clear/:symbol` — Clear all cached data for a symbol
+- `GET /api/news/categories` — News category definitions
+- `GET /api/news/articles?category=X&limit=N` — Cached news articles with optional category filter
+- `POST /api/news/fetch` — Fetch latest news from GNews API across all categories
+- `POST /api/news/fetch-historical` — Fetch historical news with date range
 
 ## Environment Secrets
 - `LIVE_DATA` — MarketData.app API bearer token for live stock/ETF quotes
 - `MASSIVE_API_CODE` — Polygon.io API key for historical data downloads
+- `LIVE_NEWS` — GNews API key for market news fetching
 - `SESSION_SECRET` — Express session secret
 - `DATABASE_URL` — PostgreSQL connection string (auto-provisioned)
 

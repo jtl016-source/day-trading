@@ -7,12 +7,14 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import MarketPage from "@/pages/market";
 import DataDownloadPage from "@/pages/data-download";
+import NewsPage from "@/pages/news";
 
 function Router() {
   return (
     <Switch>
       <Route path="/" component={MarketPage} />
       <Route path="/data" component={DataDownloadPage} />
+      <Route path="/news" component={NewsPage} />
       <Route component={NotFound} />
     </Switch>
   );

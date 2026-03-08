@@ -2,8 +2,8 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import YahooFinance from "yahoo-finance2";
 import { db } from "./db";
-import { cachedCandles, downloadStatus } from "@shared/schema";
-import { eq, and, sql, gte, lte, asc } from "drizzle-orm";
+import { cachedCandles, downloadStatus, newsArticles } from "@shared/schema";
+import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
 
@@ -571,6 +571,158 @@ export async function registerRoutes(
       await db.delete(cachedCandles).where(eq(cachedCandles.symbol, symbol.toUpperCase()));
       await db.delete(downloadStatus).where(eq(downloadStatus.symbol, symbol.toUpperCase()));
       res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  const GNEWS_KEY = process.env.LIVE_NEWS;
+  const GNEWS_BASE = "https://gnews.io/api/v4";
+
+  const NEWS_CATEGORIES = [
+    { category: "fed_policy", query: '"federal reserve" OR "interest rate" OR "rate cut" OR "rate hike" OR "FOMC"', label: "Fed & Monetary Policy" },
+    { category: "market_crash", query: '"stock market crash" OR "market selloff" OR "bear market" OR "market correction"', label: "Market Crashes & Corrections" },
+    { category: "market_rally", query: '"stock market rally" OR "bull market" OR "record high" OR "market surge"', label: "Market Rallies" },
+    { category: "inflation", query: '"inflation" OR "CPI" OR "consumer price" OR "price index"', label: "Inflation & CPI" },
+    { category: "geopolitical", query: '"trade war" OR "tariff" OR "sanctions" OR "geopolitical" OR "war"', label: "Geopolitical Events" },
+    { category: "earnings", query: '"earnings report" OR "earnings miss" OR "earnings beat" OR "revenue guidance"', label: "Earnings & Corporate" },
+    { category: "recession", query: '"recession" OR "GDP" OR "unemployment" OR "jobs report" OR "economic slowdown"', label: "Recession & Economy" },
+    { category: "crypto", query: '"bitcoin" OR "crypto crash" OR "cryptocurrency" OR "ethereum"', label: "Crypto Markets" },
+  ];
+
+  app.get("/api/news/categories", (_req, res) => {
+    res.json(NEWS_CATEGORIES.map((c) => ({ category: c.category, label: c.label })));
+  });
+
+  app.get("/api/news/articles", async (req, res) => {
+    try {
+      const category = req.query.category as string | undefined;
+      const limit = Math.min(Number(req.query.limit) || 100, 500);
+
+      let query = db.select().from(newsArticles).orderBy(desc(newsArticles.publishedAt)).limit(limit);
+      if (category && category !== "all") {
+        query = query.where(eq(newsArticles.category, category)) as any;
+      }
+
+      const articles = await query;
+      res.json({ articles, total: articles.length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/news/fetch", async (req, res) => {
+    if (!GNEWS_KEY) {
+      return res.status(400).json({ error: "LIVE_NEWS API key not configured" });
+    }
+
+    try {
+      const { categories: reqCategories } = req.body;
+      const categoriesToFetch = reqCategories
+        ? NEWS_CATEGORIES.filter((c) => reqCategories.includes(c.category))
+        : NEWS_CATEGORIES;
+
+      let totalInserted = 0;
+      const errors: string[] = [];
+
+      for (const cat of categoriesToFetch) {
+        try {
+          const url = `${GNEWS_BASE}/search?q=${encodeURIComponent(cat.query)}&lang=en&max=10&sortby=relevance&apikey=${GNEWS_KEY}`;
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            errors.push(`${cat.category}: HTTP ${resp.status}`);
+            continue;
+          }
+          const data = await resp.json();
+          if (!data.articles?.length) continue;
+
+          for (const article of data.articles) {
+            try {
+              await db.insert(newsArticles).values({
+                title: article.title,
+                description: article.description || null,
+                content: article.content || null,
+                url: article.url,
+                source: article.source?.name || null,
+                imageUrl: article.image || null,
+                publishedAt: new Date(article.publishedAt),
+                category: cat.category,
+                searchQuery: cat.query.slice(0, 200),
+              }).onConflictDoNothing();
+              totalInserted++;
+            } catch {}
+          }
+
+          await new Promise((r) => setTimeout(r, 250));
+        } catch (err: any) {
+          errors.push(`${cat.category}: ${err.message}`);
+        }
+      }
+
+      res.json({ success: true, inserted: totalInserted, errors: errors.length > 0 ? errors : undefined });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/news/fetch-historical", async (req, res) => {
+    if (!GNEWS_KEY) {
+      return res.status(400).json({ error: "LIVE_NEWS API key not configured" });
+    }
+
+    try {
+      const { fromDate, toDate } = req.body;
+
+      const historicalQueries = [
+        { category: "fed_policy", query: '"federal reserve" OR "interest rate cut" OR "FOMC decision"' },
+        { category: "market_crash", query: '"stock market crash" OR "market selloff" OR "bear market"' },
+        { category: "market_rally", query: '"stock market rally" OR "record high" OR "bull run"' },
+        { category: "inflation", query: '"inflation rate" OR "CPI report" OR "consumer prices"' },
+        { category: "geopolitical", query: '"trade war" OR "tariff" OR "sanctions"' },
+        { category: "recession", query: '"recession" OR "GDP report" OR "jobs report"' },
+      ];
+
+      let totalInserted = 0;
+      const errors: string[] = [];
+
+      for (const cat of historicalQueries) {
+        try {
+          let url = `${GNEWS_BASE}/search?q=${encodeURIComponent(cat.query)}&lang=en&max=10&sortby=relevance&apikey=${GNEWS_KEY}`;
+          if (fromDate) url += `&from=${fromDate}`;
+          if (toDate) url += `&to=${toDate}`;
+
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            errors.push(`${cat.category}: HTTP ${resp.status}`);
+            continue;
+          }
+          const data = await resp.json();
+          if (!data.articles?.length) continue;
+
+          for (const article of data.articles) {
+            try {
+              await db.insert(newsArticles).values({
+                title: article.title,
+                description: article.description || null,
+                content: article.content || null,
+                url: article.url,
+                source: article.source?.name || null,
+                imageUrl: article.image || null,
+                publishedAt: new Date(article.publishedAt),
+                category: cat.category,
+                searchQuery: cat.query.slice(0, 200),
+              }).onConflictDoNothing();
+              totalInserted++;
+            } catch {}
+          }
+
+          await new Promise((r) => setTimeout(r, 250));
+        } catch (err: any) {
+          errors.push(`${cat.category}: ${err.message}`);
+        }
+      }
+
+      res.json({ success: true, inserted: totalInserted, errors: errors.length > 0 ? errors : undefined });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
