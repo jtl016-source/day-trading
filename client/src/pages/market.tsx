@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CandlestickChart, type CandleBar, type ChartHandle, type ZoneOverlay, type BandOverlay, type ChartMarker } from "@/components/CandlestickChart";
+import { CandlestickChart, type CandleBar, type ChartHandle, type ZoneOverlay, type BandOverlay } from "@/components/CandlestickChart";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -14,7 +14,6 @@ import {
   Maximize2,
   Database,
   Newspaper,
-  ArrowUpDown,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Link } from "wouter";
@@ -221,151 +220,6 @@ function dateToTimestamp(dateStr: string, hour: number = 0): number {
   return Math.floor(new Date(Date.UTC(y, m - 1, d, hour, 0, 0)).getTime() / 1000);
 }
 
-interface MonteCarloResult {
-  winRate: number;
-  longWinRate: number;
-  shortWinRate: number;
-  totalTrades: number;
-  simulations: number;
-  grade: string;
-  gradeColor: string;
-}
-
-function gradeWinRate(rate: number): { grade: string; color: string } {
-  if (rate >= 80) return { grade: "A+", color: "#22c55e" };
-  if (rate >= 70) return { grade: "A", color: "#4ade80" };
-  if (rate >= 60) return { grade: "B+", color: "#a3e635" };
-  if (rate >= 55) return { grade: "B", color: "#facc15" };
-  if (rate >= 50) return { grade: "C", color: "#fb923c" };
-  if (rate >= 40) return { grade: "D", color: "#f87171" };
-  return { grade: "F", color: "#ef4444" };
-}
-
-function runMonteCarloSimulation(
-  days: DayInfo[],
-  zones: YellowBoxDay[],
-  candles: CandleBar[],
-  numSimulations: number = 1000
-): MonteCarloResult {
-  const chronological = [...days].sort((a, b) => a.date.localeCompare(b.date));
-  const zoneMap = new Map<string, YellowBoxDay>();
-  for (const z of zones) zoneMap.set(z.date, z);
-
-  const candlesByDay = new Map<string, CandleBar[]>();
-  for (const c of candles) {
-    const d = new Date(c.time * 1000);
-    const dateStr = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-    if (!candlesByDay.has(dateStr)) candlesByDay.set(dateStr, []);
-    candlesByDay.get(dateStr)!.push(c);
-  }
-
-  const tradeOutcomes: { type: "long" | "short"; win: boolean }[] = [];
-
-  for (const day of chronological) {
-    const zone = zoneMap.get(day.date);
-    if (!zone) continue;
-    const dayCandles = candlesByDay.get(day.date);
-    if (!dayCandles || dayCandles.length < 3) continue;
-
-    const rthCandles = dayCandles.filter((c) => c.rth !== false).sort((a, b) => a.time - b.time);
-    if (rthCandles.length < 2) continue;
-
-    let longTriggered = false;
-    let shortTriggered = false;
-    let longWin = false;
-    let shortWin = false;
-
-    for (const c of rthCandles) {
-      if (!longTriggered && c.low <= zone.yellowBottom) {
-        longTriggered = true;
-        for (const future of rthCandles.filter((f) => f.time > c.time)) {
-          if (future.high >= zone.poc) { longWin = true; break; }
-          if (future.low <= zone.avgRangeLow) break;
-        }
-      }
-      if (!shortTriggered && c.high >= zone.yellowTop) {
-        shortTriggered = true;
-        for (const future of rthCandles.filter((f) => f.time > c.time)) {
-          if (future.low <= zone.poc) { shortWin = true; break; }
-          if (future.high >= zone.avgRangeHigh) break;
-        }
-      }
-    }
-
-    if (longTriggered) tradeOutcomes.push({ type: "long", win: longWin });
-    if (shortTriggered) tradeOutcomes.push({ type: "short", win: shortWin });
-  }
-
-  if (tradeOutcomes.length === 0) {
-    return { winRate: 0, longWinRate: 0, shortWinRate: 0, totalTrades: 0, simulations: numSimulations, grade: "N/A", gradeColor: "#6b7280" };
-  }
-
-  let totalWinRate = 0;
-  let totalLongWinRate = 0;
-  let totalShortWinRate = 0;
-  let longSimCount = 0;
-  let shortSimCount = 0;
-
-  for (let sim = 0; sim < numSimulations; sim++) {
-    const sampled: typeof tradeOutcomes = [];
-    for (let i = 0; i < tradeOutcomes.length; i++) {
-      sampled.push(tradeOutcomes[Math.floor(Math.random() * tradeOutcomes.length)]);
-    }
-    const wins = sampled.filter((t) => t.win).length;
-    totalWinRate += (wins / sampled.length) * 100;
-
-    const longs = sampled.filter((t) => t.type === "long");
-    const shorts = sampled.filter((t) => t.type === "short");
-    if (longs.length > 0) { totalLongWinRate += (longs.filter((t) => t.win).length / longs.length) * 100; longSimCount++; }
-    if (shorts.length > 0) { totalShortWinRate += (shorts.filter((t) => t.win).length / shorts.length) * 100; shortSimCount++; }
-  }
-
-  const winRate = totalWinRate / numSimulations;
-  const longWinRate = longSimCount > 0 ? totalLongWinRate / longSimCount : 0;
-  const shortWinRate = shortSimCount > 0 ? totalShortWinRate / shortSimCount : 0;
-  const { grade, color } = gradeWinRate(winRate);
-
-  return { winRate, longWinRate, shortWinRate, totalTrades: tradeOutcomes.length, simulations: numSimulations, grade, gradeColor: color };
-}
-
-function generateTradeSignals(
-  candles: CandleBar[],
-  zones: YellowBoxDay[]
-): ChartMarker[] {
-  if (!candles.length || !zones.length) return [];
-
-  const sorted = [...candles].sort((a, b) => a.time - b.time);
-  const zoneMap = new Map<string, YellowBoxDay>();
-  for (const z of zones) zoneMap.set(z.date, z);
-
-  const dayBuckets = new Map<string, CandleBar[]>();
-  for (const c of sorted) {
-    if (c.rth === false) continue;
-    const d = new Date(c.time * 1000);
-    const dateStr = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-    if (!dayBuckets.has(dateStr)) dayBuckets.set(dateStr, []);
-    dayBuckets.get(dateStr)!.push(c);
-  }
-
-  const markers: ChartMarker[] = [];
-
-  for (const [dateStr, dayCandles] of dayBuckets) {
-    const zone = zoneMap.get(dateStr);
-    if (!zone || dayCandles.length < 2) continue;
-
-    for (const c of dayCandles) {
-      if (c.low <= zone.yellowBottom) {
-        markers.push({ time: c.time, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "BUY" });
-      }
-      if (c.high >= zone.yellowTop) {
-        markers.push({ time: c.time, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SHORT" });
-      }
-    }
-  }
-
-  return markers;
-}
-
 function aggregate5mTo15m(candles: CandleBar[]): CandleBar[] {
   if (candles.length === 0) return [];
   const sorted = [...candles].sort((a, b) => a.time - b.time);
@@ -398,7 +252,6 @@ export default function MarketPage() {
   const [symbolDropdownOpen, setSymbolDropdownOpen] = useState(false);
   const [symbolSearch, setSymbolSearch] = useState("");
   const [showYellowBox, setShowYellowBox] = useState(true);
-  const [showSignals, setShowSignals] = useState(false);
   const [dragZoomActive, setDragZoomActive] = useState(false);
   const [startDayIdx, setStartDayIdx] = useState(0);
   const [endDayIdx, setEndDayIdx] = useState(9);
@@ -493,16 +346,6 @@ export default function MarketPage() {
     const result = buildZoneOverlays(yellowBoxZones, candleData.candles);
     return { zoneOverlays: result.lines, bandOverlayData: result.bands };
   }, [showYellowBox, yellowBoxZones, candleData]);
-
-  const monteCarloResult = useMemo<MonteCarloResult | null>(() => {
-    if (!cachedDaysData?.days?.length || yellowBoxZones.length === 0 || !candleData?.candles?.length) return null;
-    return runMonteCarloSimulation(cachedDaysData.days, yellowBoxZones, candleData.candles);
-  }, [cachedDaysData, yellowBoxZones, candleData]);
-
-  const tradeSignalMarkers = useMemo<ChartMarker[]>(() => {
-    if (!showSignals || !candleData?.candles?.length || yellowBoxZones.length === 0) return [];
-    return generateTradeSignals(candleData.candles, yellowBoxZones);
-  }, [showSignals, candleData, yellowBoxZones]);
 
   const allSymbols = useMemo(() => {
     if (!symbolsData) return [];
@@ -717,36 +560,8 @@ export default function MarketPage() {
                       </span>
                     </div>
                   )}
-                  {monteCarloResult && monteCarloResult.totalTrades > 0 && (
-                    <div className="flex items-center gap-2 border-l border-border pl-3 ml-1">
-                      <div className="flex items-center gap-1" data-testid="text-win-rate">
-                        <span className="text-xs font-semibold px-1.5 py-0.5 rounded" style={{ backgroundColor: monteCarloResult.gradeColor + "22", color: monteCarloResult.gradeColor }}>
-                          {monteCarloResult.grade}
-                        </span>
-                        <span className="text-sm font-bold" style={{ color: monteCarloResult.gradeColor }}>
-                          {monteCarloResult.winRate.toFixed(1)}%
-                        </span>
-                        <span className="text-xs text-muted-foreground">win</span>
-                      </div>
-                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <span>L:<span className="font-mono text-green-400 ml-0.5">{monteCarloResult.longWinRate.toFixed(0)}%</span></span>
-                        <span>S:<span className="font-mono text-red-400 ml-0.5">{monteCarloResult.shortWinRate.toFixed(0)}%</span></span>
-                        <span className="opacity-60">({monteCarloResult.totalTrades}t)</span>
-                      </div>
-                    </div>
-                  )}
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    variant={showSignals ? "default" : "outline"}
-                    data-testid="button-toggle-signals"
-                    onClick={() => setShowSignals(!showSignals)}
-                    className="text-xs h-7"
-                  >
-                    <ArrowUpDown className="w-3 h-3 mr-1" />
-                    {showSignals ? "Signals ON" : "Signals OFF"}
-                  </Button>
                   <Button
                     size="sm"
                     variant={showYellowBox ? "default" : "outline"}
@@ -911,7 +726,6 @@ export default function MarketPage() {
                     showVolume
                     zoneOverlays={zoneOverlays}
                     bandOverlays={bandOverlayData}
-                    markers={tradeSignalMarkers}
                     dragZoomEnabled={dragZoomActive}
                     onDragZoomDone={() => setDragZoomActive(false)}
                   />
@@ -945,16 +759,6 @@ export default function MarketPage() {
                       </span>
                       <span className="flex items-center gap-1">
                         <span className="w-3 h-1 rounded-sm inline-block border-dashed border-b" style={{ borderColor: "rgba(220, 80, 80, 0.5)" }} /> Max Range
-                      </span>
-                    </>
-                  )}
-                  {showSignals && (
-                    <>
-                      <span className="border-l border-border pl-3 flex items-center gap-1">
-                        <span style={{ color: "#22c55e", fontSize: 14, lineHeight: 1 }}>&#9650;</span> Buy
-                      </span>
-                      <span className="flex items-center gap-1">
-                        <span style={{ color: "#ef4444", fontSize: 14, lineHeight: 1 }}>&#9660;</span> Short
                       </span>
                     </>
                   )}

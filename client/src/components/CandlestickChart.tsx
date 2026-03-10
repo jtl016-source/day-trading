@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback } from "react";
 import {
   createChart,
-  createSeriesMarkers,
   CandlestickSeries,
   HistogramSeries,
   LineSeries,
@@ -11,7 +10,6 @@ import {
   type HistogramData,
   type WhitespaceData,
   type LineData,
-  type ISeriesMarkersPluginApi,
   LineStyle,
   ColorType,
 } from "lightweight-charts";
@@ -42,14 +40,6 @@ export interface BandOverlay {
   toTime: number;
 }
 
-export interface ChartMarker {
-  time: number;
-  position: "aboveBar" | "belowBar";
-  color: string;
-  shape: "arrowUp" | "arrowDown";
-  text: string;
-}
-
 export interface ChartHandle {
   scrollToTime: (timestamp: number) => void;
   resetZoom: () => void;
@@ -61,7 +51,6 @@ interface CandlestickChartProps {
   showVolume?: boolean;
   zoneOverlays?: ZoneOverlay[];
   bandOverlays?: BandOverlay[];
-  markers?: ChartMarker[];
   dragZoomEnabled?: boolean;
   onDragZoomDone?: () => void;
 }
@@ -77,14 +66,13 @@ const ETH_UP_WICK = "#26a69a99";
 const ETH_DOWN_WICK = "#ef535099";
 
 export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
-  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays, bandOverlays, markers, dragZoomEnabled = false, onDragZoomDone }, ref) {
+  function CandlestickChart({ candles, height = 420, showVolume = true, zoneOverlays, bandOverlays, dragZoomEnabled = false, onDragZoomDone }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const bandCanvasRef = useRef<HTMLCanvasElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
     const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
     const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
     const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
-    const markerPluginRef = useRef<ISeriesMarkersPluginApi<number> | null>(null);
     const bandOverlaysRef = useRef<BandOverlay[]>([]);
     const rafIdRef = useRef<number>(0);
     const prevCandleKeyRef = useRef<string>("");
@@ -286,7 +274,6 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         candleSeriesRef.current = null;
         volumeSeriesRef.current = null;
         overlaySeriesRef.current = [];
-        markerPluginRef.current = null;
       };
     }, [height, showVolume]);
 
@@ -384,29 +371,6 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         chartRef.current.timeScale().fitContent();
       }
     }, [candles]);
-
-    useEffect(() => {
-      if (!candleSeriesRef.current) return;
-      if (!markers || markers.length === 0) {
-        if (markerPluginRef.current) {
-          markerPluginRef.current.setMarkers([]);
-        }
-        return;
-      }
-      const sorted = [...markers].sort((a, b) => a.time - b.time);
-      const markerData = sorted.map((m) => ({
-        time: m.time as any,
-        position: m.position,
-        color: m.color,
-        shape: m.shape,
-        text: m.text,
-      }));
-      if (!markerPluginRef.current) {
-        markerPluginRef.current = createSeriesMarkers(candleSeriesRef.current, markerData) as any;
-      } else {
-        markerPluginRef.current.setMarkers(markerData);
-      }
-    }, [markers, candles]);
 
     bandOverlaysRef.current = bandOverlays || [];
 
