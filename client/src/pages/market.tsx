@@ -353,23 +353,13 @@ function generateTradeSignals(
     const zone = zoneMap.get(dateStr);
     if (!zone || dayCandles.length < 2) continue;
 
-    let longDone = false;
-    let shortDone = false;
-
-    for (let i = 0; i < dayCandles.length; i++) {
-      const c = dayCandles[i];
-
-      if (!longDone && c.low <= zone.yellowBottom) {
+    for (const c of dayCandles) {
+      if (c.low <= zone.yellowBottom) {
         markers.push({ time: c.time, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "BUY" });
-        longDone = true;
       }
-
-      if (!shortDone && c.high >= zone.yellowTop) {
+      if (c.high >= zone.yellowTop) {
         markers.push({ time: c.time, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SHORT" });
-        shortDone = true;
       }
-
-      if (longDone && shortDone) break;
     }
   }
 
