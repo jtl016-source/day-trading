@@ -359,26 +359,14 @@ function generateTradeSignals(
     for (let i = 0; i < dayCandles.length; i++) {
       const c = dayCandles[i];
 
-      if (!longDone && c.low <= zone.yellowBottom && c.close > zone.maxRangeLow) {
-        for (let j = i + 1; j < dayCandles.length; j++) {
-          if (dayCandles[j].high >= zone.poc) {
-            markers.push({ time: c.time, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "BUY" });
-            longDone = true;
-            break;
-          }
-        }
-        if (!longDone) longDone = true;
+      if (!longDone && c.low <= zone.yellowBottom) {
+        markers.push({ time: c.time, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "BUY" });
+        longDone = true;
       }
 
-      if (!shortDone && c.high >= zone.yellowTop && c.close < zone.maxRangeHigh) {
-        for (let j = i + 1; j < dayCandles.length; j++) {
-          if (dayCandles[j].low <= zone.poc) {
-            markers.push({ time: c.time, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SHORT" });
-            shortDone = true;
-            break;
-          }
-        }
-        if (!shortDone) shortDone = true;
+      if (!shortDone && c.high >= zone.yellowTop) {
+        markers.push({ time: c.time, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SHORT" });
+        shortDone = true;
       }
 
       if (longDone && shortDone) break;
