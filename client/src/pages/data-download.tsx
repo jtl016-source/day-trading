@@ -17,6 +17,10 @@ import {
   BarChart3,
   Shield,
   ArrowLeft,
+  Radio,
+  ExternalLink,
+  Upload,
+  FileJson,
 } from "lucide-react";
 import { Link } from "wouter";
 
@@ -66,6 +70,10 @@ export default function DataDownloadPage() {
     queryKey: ["/api/data/daily-summary", ticker],
     enabled: (statusData?.totalBars ?? 0) > 0,
   });
+
+  const { data: mwSummary } = useQuery<{
+    rows: Array<{ symbol: string; resolution: string; bar_count: number; first_bar: number; last_bar: number }>;
+  }>({ queryKey: ["/api/data/mw-summary"], refetchInterval: 30_000 });
 
   const downloadMutation = useMutation({
     mutationFn: async (params: { symbol: string; year: number; month: number }) => {
@@ -130,6 +138,17 @@ export default function DataDownloadPage() {
   const [downloadQueue, setDownloadQueue] = useState<string[]>([]);
   const [isDownloading, setIsDownloading] = useState(false);
 
+  // ── DATA PAGE FIX: Full JSON export / import state ────────────────────────
+  const [importState, setImportState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [importMessage, setImportMessage] = useState("");
+
+  // ── MW CSV import state ───────────────────────────────────────────────────
+  const [csvSymbol, setCsvSymbol] = useState("MES");
+  const [csvState, setCsvState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [csvMessage, setCsvMessage] = useState("");
+  const [dumpState, setDumpState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [dumpMessage, setDumpMessage] = useState("");
+
   const startDownload = useCallback(async () => {
     const queue = Array.from(selectedMonths).sort();
     setDownloadQueue(queue);
@@ -162,6 +181,93 @@ export default function DataDownloadPage() {
     if (isSelected) return { bg: "bg-blue-500/15 border-blue-500/50 ring-1 ring-blue-500/60", text: "text-blue-300", icon: "selected" as const };
     return { bg: "bg-[#1e222d] border-[#2a2e39]", text: "text-[#787b86]", icon: "none" as const };
   };
+
+  // Handle JSON import: parse file, POST to /api/data/import-full, invalidate queries
+  const handleImportFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = ""; // allow re-selecting the same file
+    setImportState("loading");
+    setImportMessage("");
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const res = await fetch("/api/data/import-full", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      const result = await res.json();
+      if (!res.ok || result.error) throw new Error(result.error ?? "Import failed");
+      setImportMessage(`Imported ${result.candlesInserted.toLocaleString()} candles, ${result.signalsInserted.toLocaleString()} signals`);
+      setImportState("done");
+      queryClient.invalidateQueries({ queryKey: ["/api/data/status", data.symbol ?? ticker] });
+      queryClient.invalidateQueries({ queryKey: ["/api/data/daily-summary", data.symbol ?? ticker] });
+      queryClient.invalidateQueries({ queryKey: ["/api/data/mw-summary"] });
+    } catch (err: any) {
+      setImportMessage(err.message ?? "Failed to import");
+      setImportState("error");
+    }
+  }, [ticker]);
+
+  // Handle MW CSV file import (manual MW export or HistoryDumper output)
+  const handleCsvImport = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    // Auto-detect symbol from filename: "MESM6 - 15 min - ETH.csv" → "MES"
+    const nameMatch = file.name.match(/^([A-Z]+\d?)/i);
+    if (nameMatch) {
+      const raw = nameMatch[1].toUpperCase().replace(/[HMUZ]\d{1,2}$/, "");
+      if (raw) setCsvSymbol(raw);
+    }
+    setCsvState("loading");
+    setCsvMessage("");
+    try {
+      const csv = await file.text();
+      const sym = csvSymbol.replace(/[HMUZ]\d{1,2}$/, "").toUpperCase();
+      const res = await fetch("/api/data/import-csv", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ csv, symbol: sym }),
+      });
+      const text = await res.text();
+      let result: any;
+      try { result = JSON.parse(text); } catch { throw new Error("Server not ready — restart npm run dev and try again"); }
+      if (!res.ok || result.error) throw new Error(result.error ?? "Import failed");
+      setCsvMessage(`Imported ${result.bars.toLocaleString()} bars (${result.resolution}m) for ${result.symbol}`);
+      setCsvState("done");
+      queryClient.invalidateQueries({ queryKey: ["/api/data/mw-summary"] });
+    } catch (err: any) {
+      setCsvMessage(err.message ?? "Failed to import CSV");
+      setCsvState("error");
+    }
+  }, [csvSymbol]);
+
+  const handleMwDumpImport = useCallback(async () => {
+    setDumpState("loading");
+    setDumpMessage("");
+    try {
+      const sym = csvSymbol.replace(/[HMUZ]\d{1,2}$/, "").toUpperCase();
+      const res = await fetch("/api/data/import-mw-dump", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: sym }),
+      });
+      const text = await res.text();
+      let result: any;
+      try { result = JSON.parse(text); } catch { throw new Error("Server not ready — restart npm run dev and try again"); }
+      if (!res.ok || result.error) throw new Error(result.error ?? "Import failed");
+      const fileList = (result.files as Array<{ file: string; bars: number; resolution: string }>)
+        .map(f => `${f.resolution}m: ${f.bars.toLocaleString()} bars`).join(", ");
+      setDumpMessage(`Loaded ${result.totalBars.toLocaleString()} bars for ${result.symbol} (${fileList})`);
+      setDumpState("done");
+      queryClient.invalidateQueries({ queryKey: ["/api/data/mw-summary"] });
+    } catch (err: any) {
+      setDumpMessage(err.message ?? "Failed");
+      setDumpState("error");
+    }
+  }, [csvSymbol]);
 
   const isFutureMonth = (year: number, month: number) => {
     const now = new Date();
@@ -439,6 +545,179 @@ export default function DataDownloadPage() {
                 )}
               </div>
             </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── DATA PAGE FIX: Full JSON Export / Import ──────────────────── */}
+      {/* Export: one JSON file with all candles + signals keyed by symbol+interval */}
+      {/* Import: re-upload to restore exact chart state without losing any existing data */}
+      <div className="mt-6 rounded-lg border border-[#2a2e39] bg-[#1a1e2e] p-5 space-y-4">
+        <div className="flex items-center gap-2">
+          <FileJson className="w-4 h-4 text-blue-400" />
+          <h2 className="text-sm font-semibold text-[#d1d4dc]">Full Dataset Export / Import</h2>
+          <span className="text-xs text-[#787b86] ml-1">— candles + signals in one JSON file</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Export: download all candles + signals for the selected ticker */}
+          <a
+            href={`/api/data/export-full/${ticker}`}
+            download
+            className="flex items-center gap-2 px-3 py-2 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium transition-colors"
+            data-testid="button-export-json"
+          >
+            <Download className="w-4 h-4" />
+            Export {ticker} JSON
+          </a>
+
+          {/* Import: re-upload a previously exported JSON to restore state */}
+          <label
+            className="flex items-center gap-2 px-3 py-2 rounded border border-[#2a2e39] bg-[#131722] hover:bg-[#1e222d] text-[#d1d4dc] text-sm font-medium cursor-pointer transition-colors"
+            data-testid="label-import-json"
+          >
+            <Upload className="w-4 h-4 text-blue-400" />
+            Import JSON
+            <input
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={handleImportFile}
+              data-testid="input-import-file"
+            />
+          </label>
+
+          {importState === "loading" && (
+            <span className="flex items-center gap-1 text-sm text-amber-400">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Importing…
+            </span>
+          )}
+          {importState === "done" && (
+            <span className="flex items-center gap-1 text-sm text-emerald-400">
+              <CheckCircle className="w-3.5 h-3.5" /> {importMessage}
+            </span>
+          )}
+          {importState === "error" && (
+            <span className="flex items-center gap-1 text-sm text-red-400">
+              <XCircle className="w-3.5 h-3.5" /> {importMessage}
+            </span>
+          )}
+        </div>
+
+        <p className="text-xs text-[#787b86]">
+          Export saves all downloaded candles + locked signal levels to a single JSON. Import re-uploads it to restore exact chart state — new candles are appended, existing data is never overwritten.
+        </p>
+      </div>
+
+      {/* ── MotiveWave CSV Import ─────────────────────────────────── */}
+      <div className="mt-4 rounded-lg border border-[#2a2e39] bg-[#131722] p-5">
+        <div className="flex items-center gap-2 mb-3">
+          <Upload className="w-4 h-4 text-violet-400" />
+          <h2 className="text-sm font-semibold text-[#d1d4dc]">Import MotiveWave CSV</h2>
+          <span className="text-xs text-[#787b86] ml-1">— MW manual export or HistoryDumper study output</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          {/* Symbol input */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-[#787b86]">Symbol:</span>
+            <input
+              value={csvSymbol}
+              onChange={e => setCsvSymbol(e.target.value.toUpperCase())}
+              className="w-20 px-2 py-1 text-xs rounded border border-[#2a2e39] bg-[#0d1117] text-[#d1d4dc] focus:outline-none focus:border-violet-500"
+              placeholder="MES"
+            />
+          </div>
+
+          {/* File upload: MW manual export CSV */}
+          <label className="flex items-center gap-2 px-3 py-2 rounded border border-[#2a2e39] bg-[#131722] hover:bg-[#1e222d] text-[#d1d4dc] text-sm font-medium cursor-pointer transition-colors">
+            <Upload className="w-4 h-4 text-violet-400" />
+            Upload MW CSV
+            <input type="file" accept=".csv" className="hidden" onChange={handleCsvImport} />
+          </label>
+
+          {/* Load from HistoryDumper dump file on disk */}
+          <button
+            onClick={handleMwDumpImport}
+            disabled={dumpState === "loading"}
+            className="flex items-center gap-2 px-3 py-2 rounded border border-[#2a2e39] bg-[#131722] hover:bg-[#1e222d] text-[#d1d4dc] text-sm font-medium transition-colors disabled:opacity-50"
+          >
+            <Database className="w-4 h-4 text-violet-400" />
+            {dumpState === "loading" ? "Loading…" : "Load MW Dump"}
+          </button>
+
+          {/* CSV status */}
+          {csvState === "loading" && <span className="flex items-center gap-1 text-sm text-amber-400"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Importing…</span>}
+          {csvState === "done"    && <span className="flex items-center gap-1 text-sm text-emerald-400"><CheckCircle className="w-3.5 h-3.5" /> {csvMessage}</span>}
+          {csvState === "error"   && <span className="flex items-center gap-1 text-sm text-red-400"><XCircle className="w-3.5 h-3.5" /> {csvMessage}</span>}
+          {dumpState === "loading" && <span className="flex items-center gap-1 text-sm text-amber-400"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Reading dump…</span>}
+          {dumpState === "done"    && <span className="flex items-center gap-1 text-sm text-emerald-400"><CheckCircle className="w-3.5 h-3.5" /> {dumpMessage}</span>}
+          {dumpState === "error"   && <span className="flex items-center gap-1 text-sm text-red-400"><XCircle className="w-3.5 h-3.5" /> {dumpMessage}</span>}
+        </div>
+
+        <div className="text-xs text-[#787b86] space-y-1">
+          <p><span className="text-violet-400 font-medium">Upload MW CSV</span> — right-click any MW chart → Export Data → save as CSV. Supports MW format (DD/MM/YYYY) and volume like 17.8K. Resolution auto-detected from timestamp gaps.</p>
+          <p><span className="text-violet-400 font-medium">Load MW Dump</span> — apply the <span className="text-[#d1d4dc]">HistoryDumper</span> study to any MW chart, then click this to load <code className="bg-[#1e222d] px-1 rounded">~/MotiveWave Extensions/dump_{"{symbol}"}_{"{res}"}.csv</code> directly from disk (no file picker needed).</p>
+        </div>
+      </div>
+
+      {/* ── MotiveWave Live Candle Cache ──────────────────────────── */}
+      <div className="mt-6 rounded-lg border border-[#2a2e39] bg-[#131722] p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <Radio className="w-4 h-4 text-emerald-400" />
+          <h2 className="text-sm font-semibold text-[#d1d4dc]">MotiveWave Live Data Cache</h2>
+          <span className="text-xs text-[#787b86] ml-1">— bars recorded from MW via WebSocket, stored locally</span>
+        </div>
+
+        {!mwSummary?.rows?.length ? (
+          <p className="text-xs text-[#787b86]">No MotiveWave bars cached yet. Connect MotiveWave with the LiveBarRelay study to start recording.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs border-collapse">
+              <thead>
+                <tr className="border-b border-[#2a2e39]">
+                  {["Symbol", "Interval", "Bars", "First Bar (UTC)", "Last Bar (UTC)", "Apply to Chart", "Download CSV"].map(h => (
+                    <th key={h} className="text-left px-3 py-2 text-[#787b86] font-medium whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {mwSummary.rows.map(row => {
+                  const label = row.resolution === "1" ? "1m" : row.resolution === "5" ? "5m" : row.resolution === "60" ? "60m" : `${row.resolution}m`;
+                  const chartInterval = row.resolution === "1" ? "1m" : row.resolution === "60" ? "60m" : "5m";
+                  const first = new Date(row.first_bar * 1000).toLocaleString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" });
+                  const last  = new Date(row.last_bar  * 1000).toLocaleString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" });
+                  return (
+                    <tr key={`${row.symbol}-${row.resolution}`} className="border-b border-[#1e2230] hover:bg-[#1c2030]">
+                      <td className="px-3 py-2 font-semibold text-[#42a5f5]">{row.symbol}</td>
+                      <td className="px-3 py-2 text-[#d1d4dc]">{label}</td>
+                      <td className="px-3 py-2 text-[#d1d4dc] font-mono">{row.bar_count.toLocaleString()}</td>
+                      <td className="px-3 py-2 text-[#787b86] font-mono">{first}</td>
+                      <td className="px-3 py-2 text-[#787b86] font-mono">{last}</td>
+                      <td className="px-3 py-2">
+                        <a
+                          href={`/?symbol=${encodeURIComponent(row.symbol)}&interval=${chartInterval}`}
+                          className="flex items-center gap-1 text-emerald-400 hover:text-emerald-300 transition-colors font-medium"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          View Chart
+                        </a>
+                      </td>
+                      <td className="px-3 py-2">
+                        <a
+                          href={`/api/data/mw-export/${row.symbol}/${row.resolution}`}
+                          download
+                          className="flex items-center gap-1 text-[#42a5f5] hover:text-white transition-colors"
+                        >
+                          <Download className="w-3 h-3" />
+                          {row.symbol}_{label}.csv
+                        </a>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </div>

@@ -1,0 +1,63 @@
+{
+  "id": "data-analysis",
+  "name": "Data Analysis & Exit Rules",
+  "version": "2.0.0",
+  "description": "Exit parameters calibrated from Monte Carlo simulation + real 1-min/30-min/60-min vector trade observations (May–November 2025).",
+  "updatedAt": "2026-04-20T00:00:00.000Z",
+  "gates": {
+    "no_cme_settlement": "No signals 16:30–18:00 ET (CME settlement break)",
+    "closing_hour_safe_only": "20:00–21:00 UTC -> Safe tier signals only",
+    "rth_cooldown_bars": 10,
+    "eth_cooldown_bars": 20,
+    "hod_suppression_pts": 5.0
+  },
+  "rules": {
+    "fixed_exits_only": "Fixed-point exits only — never ATR-based in live trading",
+    "sl_always_correct_side": "SL below entry for Long, above entry for Short",
+    "tp2_never_clamped": "TP2 never clamped to HOD/LOD — only TP1 adjusted",
+    "tabletop_wick_hold": "Candle wicks through vector but CLOSES above → hold trade. Only exit on closed-below vector.",
+    "hod_check_uses_prev": "HOD suppression uses prevDayHodHigh (before current bar)",
+    "win_rate_floor": "Win rate below 50% → check DB for corrupt bars before adjusting strategy",
+    "walk_forward_required": "Any parameter change must be validated on walk-forward test"
+  },
+  "exitProfiles": {
+    "safe_rth":     { "tp1": 10.0, "tp1Safe": 10.0, "tp2": 20.0, "sl": 5.0  },
+    "risky_rth":    { "tp1": 10.0, "tp1Safe": 12.5, "tp2": 25.0, "sl": 5.0  },
+    "riskiest_rth": { "tp1": 16.0, "tp1Safe": 20.0, "tp2": 40.0, "sl": 10.0 },
+    "safe_eth":     { "tp1":  6.0, "tp1Safe":  6.0, "tp2": 14.0, "sl": 3.5  },
+    "risky_eth":    { "tp1":  5.0, "tp1Safe":  7.5, "tp2": 12.0, "sl": 3.0  },
+    "riskiest_eth": { "tp1": 10.0, "tp1Safe": 12.0, "tp2": 22.0, "sl": 7.0  }
+  },
+  "observedTabletopSlippage": {
+    "1min":  { "typical_pts": "0-3", "max_survivable_pts": 4.75, "n_trades": 17 },
+    "5min":  { "typical_pts": "0-5", "max_survivable_pts": 7.0,  "n_trades": null, "note": "interpolated" },
+    "30min": { "typical_pts": "2-10", "max_survivable_pts": 16.5, "n_trades": 21 },
+    "60min": { "typical_pts": "4-20", "max_survivable_pts": 51.84, "n_trades": 10, "note": "51pt was CPI day — exceptional" }
+  },
+  "observedMaxMoves": {
+    "1min":  { "typical_pts": "3-10", "large_pts": 25.25,  "n_trades": 17 },
+    "30min": { "typical_pts": "30-60", "large_pts": 127.0,  "n_trades": 21 },
+    "60min": { "typical_pts": "40-94", "large_pts": 212.0,  "n_trades": 10 }
+  },
+  "tabletopInitiationRate": {
+    "1min":  0.76,
+    "30min": 0.57,
+    "60min": 0.40
+  },
+  "hodLodAdjustment": {
+    "proximity_threshold_pts": 3.0,
+    "buffer_pts": 2.0,
+    "min_profit_pts": 3.0
+  },
+  "calibration": {
+    "monteCarloSignals": 222,
+    "date_range": "2025-06-01 to 2026-04-01",
+    "observationSheets": [
+      { "timeframe": "1min",  "trades": 17, "period": "2025-07 to 2025-08" },
+      { "timeframe": "30min", "trades": 21, "period": "2025-05 to 2025-08" },
+      { "timeframe": "60min", "trades": 10, "period": "2025-09 to 2025-11" }
+    ],
+    "symbol": "MES/ES",
+    "method": "walk-forward grid search + real trade observation"
+  }
+}

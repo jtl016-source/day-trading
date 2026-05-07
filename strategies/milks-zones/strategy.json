@@ -1,0 +1,38 @@
+{
+  "id": "milks-zones",
+  "name": "Milk Yellow Box Zones",
+  "version": "1.2.0",
+  "description": "Forward-looking price levels derived from prior-day order flow. Zones are mapped at 9:30 AM ET before the open and placed AHEAD of price as pre-committed decision points: 'if price reaches here, do X'. Immutable once RTH opens.",
+  "updatedAt": "2026-04-22T20:42:22.137Z",
+  "gates": {
+    "price_in_zone_low": "candle.low <= zone.top + 2.0",
+    "price_in_zone_close": "candle.close >= zone.bottom - 2.0",
+    "rth_required": true,
+    "zone_active_window": "candle.time must be within [zone.from_ts, zone.to_ts]"
+  },
+  "rules": {
+    "milkOk_definition": "Price is inside or has broke through a zone on a CLOSED candle — low reached zone or broke through it, close held above zone bottom.",
+    "zone_types": "is_bull=true means support_zone (long signals). is_bull=false means resistance_zone (downgrade).",
+    "support_zone": "Zone below current price where buyers stepped in — is_bull=true.",
+    "resistance_zone": "Zone above current price where sellers stepped in — is_bull=false.",
+    "resistance_downgrade": "Resistance zone bottom within 5.0 pts above entry -> mandatory one-tier downgrade.",
+    "no_time_only_check": "Never mark milkOk based on time alone — always require price confirmation.",
+    "zone_persistence": "Zones do NOT reset daily. They persist from from_ts to to_ts regardless of day boundaries.",
+    "price_comparison_only": "Always compare prices (numbers) to prices. Never compare visual chart positions.",
+    "zones_are_forward_looking": "Zones are placed AHEAD of price before 9:30 AM ET. They are decision points: 'if price reaches here, what do I do?' — not reactive marks drawn after price moved.",
+    "derived_from_prior_day": "Zones are built from the previous day's order flow data in MotiveWave. Today's zones reflect yesterday's institutional positioning.",
+    "pre_market_commitment": "ALL zones for the day must be mapped before 9:30 AM ET (RTH open). No mid-session zone additions.",
+    "zone_immutability": "Once RTH opens, zones are LOCKED. No zone may be moved, adjusted, extended, shrunk, or removed during the trading day.",
+    "no_hindsight_repositioning": "A zone repositioned after price moved is invalid data. Exclude from signal generation and learning engine training.",
+    "to_ts_fixed": "Zone expiry (to_ts) is set at creation time and does not move. Zones are not extended because price kept respecting them.",
+    "predictive_value": "A zone placed BEFORE price reached it that price then respected is a valid signal. A zone moved after the fact is worthless.",
+    "miss_is_information": "If price blows through a zone without reacting, that is a valid miss — log it for the learning engine. Do not redraw to chase price."
+  },
+  "parameters": {
+    "zone_proximity_pts": 2,
+    "resistance_downgrade_pts": 5,
+    "zone_commitment_deadline_et": "09:30",
+    "zones_mutable_after_rth_open": false
+  },
+  "min_confidence_riskiest": "RISKIEST signals suppressed until win rate recovers above 40%"
+}

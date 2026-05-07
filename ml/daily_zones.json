@@ -1,0 +1,57 @@
+[
+  {
+    "date": "2026-04-10",
+    "symbol": "ESM6",
+    "interval": "5m",
+    "source": "Milk Yellow Box Strategy — screenshot from Discord",
+    "zones": [
+      { "label": "LARGE SELLER POSITIONING", "type": "RESISTIVE", "top": 6940, "bottom": 6935, "color": "red", "session": "RTH", "notes": "High probability cap on outlier move" },
+      { "label": "RTH GAP", "type": "GAP", "top": 6935, "bottom": 6918, "color": "red", "session": "RTH", "notes": "RTH GAP 6900.25-6935" },
+      { "label": "IV WALL", "type": "STRUCTURAL", "top": 6912, "bottom": 6911, "color": "yellow", "session": "RTH", "notes": "IV WALL level ~6911.50" },
+      { "label": "OVN SPY CEILING", "type": "STRUCTURAL", "top": 6902, "bottom": 6901, "color": "yellow", "session": "ETH", "notes": "Overnight SPY ceiling ~6901.50" },
+      { "label": "TOP AVE RANGE RESISTANCE", "type": "RESISTIVE", "top": 6907, "bottom": 6894, "color": "red_outline", "session": "RTH", "notes": "Top of average range resistance band" },
+      { "label": "LTE BUYER OBJECTIVE", "type": "ABSORPTION", "top": 6888, "bottom": 6884, "color": "blue", "session": "RTH", "notes": "Buyer objective zone" },
+      { "label": "SELLER POSITIONING", "type": "RESISTIVE", "top": 6882, "bottom": 6876, "color": "red", "session": "RTH", "notes": "THUR/FRI SPLICE 5% BAND 6876.28 — sellers offside at/above pivot" },
+      { "label": "PIVOT", "type": "STRUCTURAL", "top": 6851, "bottom": 6850, "color": "white", "session": "RTH", "notes": "Sellers offside at and above Pivot; buyers will attempt to test; sellers first test, break below gives confirmation short" },
+      { "label": "NON FAIR VALUE", "type": "IMBALANCE", "top": 6842, "bottom": 6838, "color": "red", "session": "RTH", "notes": "Red NFV — sellers fill zone" },
+      { "label": "BOTTOM AVE RANGE SUPPORT", "type": "ABSORPTION", "top": 6842, "bottom": 6831, "color": "green_outline", "session": "RTH", "notes": "Buyers will value add on test, supportive first attempts" },
+      { "label": "NON FAIR VALUE", "type": "IMBALANCE", "top": 6838, "bottom": 6830, "color": "green", "session": "RTH", "notes": "Green NFV — buyers fill zone" },
+      { "label": "MON-FRI WEEKLY CEILING", "type": "STRUCTURAL", "top": 6820, "bottom": 6816, "color": "green", "session": "RTH", "notes": "Weekly ceiling level" },
+      { "label": "IV WALL (lower)", "type": "STRUCTURAL", "top": 6781, "bottom": 6780, "color": "yellow", "session": "RTH", "notes": "Lower IV wall" },
+      { "label": "MAX RANGE DAYS", "type": "STRUCTURAL", "top": 6781, "bottom": 6780, "color": "white", "session": "RTH", "notes": "Max range day boundary 6780.75" },
+      { "label": "RTH GAP (lower)", "type": "GAP", "top": 6780, "bottom": 6684, "color": "red", "session": "RTH", "notes": "RTH GAP 6780-6683.50 — sellers soft target on session" },
+      { "label": "SELLERS SOFT TARGET", "type": "RESISTIVE", "top": 6770, "bottom": 6760, "color": "red", "session": "RTH", "notes": "Sellers soft target; potential to cap session 6769.5" },
+      { "label": "OVN SPY FLOOR", "type": "STRUCTURAL", "top": 6743, "bottom": 6738, "color": "yellow", "session": "ETH", "notes": "Overnight SPY floor ~6742.75 / 6738" },
+      { "label": "MAX TREND DAYS", "type": "STRUCTURAL", "top": 6735, "bottom": 6734, "color": "white", "session": "RTH", "notes": "Max trend day boundary 6734.75" },
+      { "label": "BUYER POSITIONING", "type": "ABSORPTION", "top": 6735, "bottom": 6730, "color": "green", "session": "RTH", "notes": "Buyer positioning at lows" }
+    ]
+  },
+  {
+    "date": "2026-04-17",
+    "symbol": "ESM6",
+    "interval": "5m",
+    "source": "Milk Yellow Box Strategy — screenshot uploaded by user",
+    "price_at_upload": 7132.75,
+    "bias": "BULLISH BREAKOUT — price above TOP AVE RANGE / IV WALL. Buyers took control above 7113.75. Major outlier zone at 7136.96 (1% odds). Next cap 7144-7146.",
+    "zones": [
+      { "label": "W10 10MIN 10% BAND (outlier cap)", "type": "STRUCTURAL", "top": 7146.25, "bottom": 7144.25, "color": "red_dashes", "session": "RTH", "notes": "High probability cap on outlier move — extreme upper bound for the session" },
+      { "label": "1% ODDS AT AND ABOVE", "type": "STRUCTURAL", "top": 7137.0, "bottom": 7136.96, "color": "orange_dashes", "session": "RTH", "notes": "Only 1% statistical odds of price reaching or exceeding this level" },
+      { "label": "STRUCTURAL LINE", "type": "STRUCTURAL", "top": 7125.25, "bottom": 7125.25, "color": "green", "session": "RTH", "notes": "Horizontal green line — structural support/resistance level" },
+      { "label": "W10 10MIN 70% BAND / 5.36% ODDS AT AND ABOVE", "type": "STRUCTURAL", "top": 7116.50, "bottom": 7114.47, "color": "red_dashes", "session": "RTH", "notes": "5.36% odds at/above 7114.47; W10 10min 70% band — buyers ultimate target on session" },
+      { "label": "TOP AVE RANGE RESISTANCE / IV WALL / OVN SPY CEILING", "type": "STRUCTURAL", "top": 7113.75, "bottom": 7113.75, "color": "green_olive", "session": "RTH", "notes": "KEY CONFLUENCE LEVEL: TOP AVE RANGE 'RESISTANCE' + IV WALL + OVN SPY CEILING all at ~7113.75. Was prior resistance; now acts as support after breakout above" },
+      { "label": "THUR PR SPLICE IMPRINT", "type": "STRUCTURAL", "top": 7109.5, "bottom": 7108.75, "color": "white_dashes", "session": "RTH", "notes": "Thursday prior range splice imprint ~7108.35-7109.5" },
+      { "label": "STRUCTURAL LINES", "type": "STRUCTURAL", "top": 7106.50, "bottom": 7105.75, "color": "white_dashes", "session": "RTH", "notes": "Clustered dashed lines at 7105.75 / 7106.50" },
+      { "label": "PURPLE ZONE UPPER", "type": "IMBALANCE", "top": 7098.0, "bottom": 7090.0, "color": "purple", "session": "RTH", "notes": "Purple imbalance/structural zone band ~7090-7098" },
+      { "label": "SELLER OBJECTIVE / PIVOT AREA", "type": "STRUCTURAL", "top": 7080.0, "bottom": 7078.0, "color": "white_dashes", "session": "RTH", "notes": "PIVOT at 7078. Sellers offsides at & above pivot; buyers will attempt to absorb; break below gives confirmation short. 7085.50 labeled nearby as prior high marker" },
+      { "label": "SELLER OBJECTIVE (lower)", "type": "RESISTIVE", "top": 7070.0, "bottom": 7067.5, "color": "red", "session": "RTH", "notes": "Sellers still offsides at & above; buyers attempt to absorb sellers. Only loss of this level confirms short. Seller objective target." },
+      { "label": "SUPPORT / BOTTOM AVE RANGE", "type": "ABSORPTION", "top": 7055.5, "bottom": 7054.0, "color": "green_outline", "session": "RTH", "notes": "SUPPORT label; BOTTOM AVE RANGE — buyers value add on test; supportive first attempts" },
+      { "label": "SELLER OBJECTIVE (mid-low)", "type": "RESISTIVE", "top": 7058.0, "bottom": 7054.0, "color": "red", "session": "RTH", "notes": "Seller objective zone cluster 7054-7058" },
+      { "label": "THUR PR SPLICE IMPRINTS / NON FAIR VALUE", "type": "IMBALANCE", "top": 7051.0, "bottom": 7051.0, "color": "orange_dashes", "session": "RTH", "notes": "Thursday prior range splice imprints — NON FAIR VALUE label; price should revisit if sellers take control" },
+      { "label": "BUYER POSITIONING / SELLER OBJECTIVE (pivotal)", "type": "ABSORPTION", "top": 7038.0, "bottom": 7034.0, "color": "yellow_green", "session": "RTH", "notes": "PIVOTAL level 7036: buyers will absorb sellers first test. BUYER POSITIONING + SELLER OBJECTIVE dual label — key inflection zone" },
+      { "label": "SELLERS ULTIMATE TARGET ON SESSION / SELLERS OBJECTIVE", "type": "RESISTIVE", "top": 7030.0, "bottom": 7026.0, "color": "red_dashes", "session": "RTH", "notes": "Sellers ultimate target on session — high probability cap on session, outlier below this level. S VECTOR ~7025.5 also nearby." },
+      { "label": "IV WALL (lower)", "type": "STRUCTURAL", "top": 7016.25, "bottom": 7016.25, "color": "yellow", "session": "RTH", "notes": "Lower IV WALL line ~7016.25" },
+      { "label": "FRI WEEKLY CEILING", "type": "STRUCTURAL", "top": 7004.5, "bottom": 7004.0, "color": "green", "session": "RTH", "notes": "Friday weekly ceiling — structural weekly boundary" },
+      { "label": "BUYER POSITIONING (extreme low)", "type": "ABSORPTION", "top": 7000.0, "bottom": 7000.0, "color": "green_dashes", "session": "RTH", "notes": "High probability cap on outlier move downside — BUYER POSITIONING at 7000. Extreme lower bound." }
+    ]
+  }
+]

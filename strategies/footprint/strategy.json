@@ -1,0 +1,72 @@
+{
+  "id": "footprint",
+  "name": "Footprint (Order Flow Confirmation)",
+  "version": "1.2.0",
+  "description": "4th confirmation layer using per-level bid/ask tick data. Strongest single confluence — can fire standalone as RISKY. Vetoes signals on delta divergence. Per-candle visual rendering live on chart.",
+  "updatedAt": "2026-04-28T00:00:00.000Z",
+  "locked": true,
+  "lastUpdatedBy": null,
+  "lastUpdatedAt": null,
+  "operatingHours": "rth_and_eth",
+  "confirmationRole": "orderflow",
+  "canStandAlone": true,
+  "standaloneSignalTier": "RISKY",
+  "standaloneNote": "Recommended to pair with at least one other confirmation for highest quality trades",
+  "dataSource": "motivewave-tick",
+  "dataFields": ["bidVolume", "askVolume", "delta", "poc", "imbalances"],
+  "gates": {
+    "delta_divergence_veto": "Runs BEFORE all conditions. If signal candle delta diverges vs prior 3 candles, signal is suppressed entirely.",
+    "delta_agreement": "LONG: candleDelta must be strictly > 0. SHORT: candleDelta must be strictly < 0. Zero does not confirm."
+  },
+  "deltaRule": "must_be_confirmed_not_trending_toward",
+  "confirmationConditions": {
+    "vetoGate": "delta_divergence_runs_first",
+    "condition1_delta": "strictly_positive_for_long_strictly_negative_for_short",
+    "condition2_bonus": "one_of_absorption_imbalance_trap_auction",
+    "fullConfirmation": "condition1_AND_condition2",
+    "partialConfirmation": "condition1_only_no_bonus_signal"
+  },
+  "signalTier": {
+    "alone": "RISKY",
+    "withOneOtherPrimary": "RISKY",
+    "withZoneAndVector": "SAFE",
+    "withZoneAndVectorPartial": "SAFE_DEGRADED",
+    "withTwoConfirmations": "RISKY",
+    "divergenceDetected": "VETO"
+  },
+  "exitEnhancements": {
+    "pocStop": {
+      "enabled": true,
+      "maxPocDistancePct": 0.60
+    },
+    "unfinishedAuctionTP1": {
+      "enabled": true,
+      "lookbackCandles": 3
+    },
+    "stackedImbalanceTP2Extension": {
+      "enabled": true,
+      "extensionPct": 0.20
+    },
+    "divergenceTrailingStop": {
+      "enabled": true,
+      "tightenToPoc": true
+    }
+  },
+  "imbalanceRatio": 3,
+  "stackedImbalanceMinLevels": 3,
+  "absorptionVolMultiplier": 1.5,
+  "divergenceLookbackCandles": 3,
+  "vetoConditions": ["delta_divergence_on_signal_candle"],
+  "partialConditions": ["delta_agrees_no_bonus_signal"],
+  "learningFeatures": [
+    "absorption_accuracy",
+    "divergence_veto_accuracy",
+    "stacked_imbalance_tp2_rate",
+    "trapped_trader_speed",
+    "unfinished_auction_tp1_accuracy",
+    "safe_degraded_vs_safe_full_winrate",
+    "poc_stop_vs_default_stop_performance",
+    "footprint_alone_signal_performance",
+    "eth_vs_rth_reading_reliability"
+  ]
+}

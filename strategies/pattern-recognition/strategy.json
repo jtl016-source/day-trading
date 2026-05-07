@@ -1,0 +1,54 @@
+{
+  "id": "pattern-recognition",
+  "name": "Pattern Recognition (Bonus Components)",
+  "version": "1.1.0",
+  "description": "Supplementary evidence for entries. At high confidence, patterns can fire as standalone RISKY signals. Otherwise they provide bonus points toward tier.",
+  "updatedAt": "2026-04-21T00:00:00.000Z",
+  "operatingHours": "rth_and_eth",
+  "candleLookback": { "min": 5, "max": 10 },
+  "canStandAlone": true,
+  "standaloneRequirements": {
+    "minimumConfidence": "high",
+    "minimumOccurrences": 25,
+    "minimumWinRate": 0.72
+  },
+  "gates": {},
+  "rules": {
+    "body_confirmation_bonus": "bodyOk = close > open. Worth +1 bonus only, never a hard gate.",
+    "fls_requires_vector": "Fractal Liquidity Sweep requires vector agreement — never trade FLS against declining vector",
+    "delta_imbalance_not_milk": "Delta imbalance zones are NOT Milk zones — different source, different weight",
+    "secondary_vec_bonus": "Any secondary-interval vector (1m/5m/15m/60m) below price = +1 bonus",
+    "standalone_risky": "Pattern alone at high confidence (>=25 occurrences, >=72% win rate) fires as RISKY",
+    "standalone_riskiest": "Pattern alone at low/medium confidence fires as RISKIEST"
+  },
+  "signalTier": {
+    "alone": {
+      "high_confidence": "RISKY",
+      "low_confidence": "RISKIEST"
+    },
+    "with_one_primary": "RISKY",
+    "with_zone_and_vector": "SAFE"
+  },
+  "patterns": {
+    "body_confirmation": {
+      "condition": "close > open",
+      "bonus": 1,
+      "gate": false
+    },
+    "secondary_vector_alignment": {
+      "condition": "any secondary interval vector < close",
+      "bonus": 1,
+      "gate": false
+    },
+    "fractal_liquidity_sweep": {
+      "condition": "5-bar fractal sweep + close back inside range + vector agrees",
+      "bonus": 1,
+      "gate": false
+    },
+    "delta_imbalance_bullish": {
+      "condition": "buyer-heavy candle in last 20 bars > 1.5x average imbalance",
+      "bonus": 1,
+      "gate": false
+    }
+  }
+}

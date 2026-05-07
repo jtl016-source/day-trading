@@ -1,0 +1,51 @@
+{
+  "id": "vector",
+  "name": "Vector Line (Highest Lowest HL20)",
+  "version": "1.1.0",
+  "description": "Dynamic support baseline using Highest(Lowest(low,20),20). Rising vector with price above = buyers in control.",
+  "updatedAt": "2026-04-21T00:00:00.000Z",
+  "operatingHours": "rth_and_eth",
+  "gates": {
+    "price_above_vector": "close > vector[current]",
+    "slope_not_declining": "vector[now] >= vector[3_bars_ago]"
+  },
+  "rules": {
+    "formula": "Highest(Lowest(low, 20), 20) on current chart interval",
+    "computation_bars": "ALL bars (RTH + ETH) — never RTH-only for vector computation",
+    "flat_ok": "Flat slope (vector[now] == vector[3]) is acceptable. Declining is not.",
+    "declining_60m_blocks_all": "60m vector declining -> skip ALL Long signals on any interval",
+    "secondary_vectors": "Any secondary interval (1m/5m/15m/60m) vector below price = +1 bonus",
+    "no_tabletopped_entries": "Flat/tabletopped vector with no retest = exhausted momentum, skip",
+    "signal_fires_next_bar": "Entry is on the NEXT bar after both gates are met, not the same bar",
+    "minimum_timeframes": "Only one timeframe needs to confirm. If only one, it must be the primary timeframe being traded.",
+    "short_caution": "Vector is not a strong confluence for shorts — always seek zone or footprint co-confirmation"
+  },
+  "parameters": {
+    "lookback_period": 20,
+    "slope_lookback_bars": 3,
+    "intervals": ["1m", "5m", "15m", "60m"],
+    "minimumTimeframes": 1
+  },
+  "longSetups": ["side_entry", "tested_tabletop_off_side_entry"],
+  "shortCaution": true,
+  "shortNote": "Not a strong confluence for shorts — seek additional confirmation",
+  "tabletopSlippageTolerance": {
+    "note": "Observed from real trade data. Candle may WICK through vector by this amount and still return to profit — do NOT exit on wick alone.",
+    "1min_pts":  4.75,
+    "5min_pts":  7.0,
+    "30min_pts": 16.5,
+    "60min_pts": 51.84
+  },
+  "tabletopInitiationRate": {
+    "note": "% of trades where vector wicked through then returned to profit (initiation). Remaining % broke through and trended down.",
+    "1min":  0.76,
+    "30min": 0.57,
+    "60min": 0.40
+  },
+  "confluenceImpact": {
+    "note": "From 30-min data: trades with BOTH 5min and 15min confluence had near-100% tabletop initiation. No confluence = loss rate approaches 100%.",
+    "full_confluence_required_for_safe": true,
+    "single_confluence_risky": true,
+    "no_confluence_riskiest_only": true
+  }
+}

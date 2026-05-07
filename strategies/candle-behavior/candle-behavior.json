@@ -1,0 +1,60 @@
+{
+  "id": "candle-behavior",
+  "name": "Candle Behavior Specification",
+  "version": "1.0",
+  "locked": true,
+  "lastUpdatedBy": null,
+  "lastUpdatedAt": null,
+  "type": "system-spec",
+  "description": "Single source of truth for candle creation, validation, storage, broadcast, and rendering.",
+  "sections": [
+    "candle-data-structure",
+    "validation-rules",
+    "timestamp-alignment",
+    "storage-rules",
+    "live-candle-rules",
+    "client-merge-rules",
+    "interval-switch-rules",
+    "data-page-rules",
+    "prohibited-behaviors",
+    "debugging-reference"
+  ],
+  "validationRules": {
+    "pricePositive": true,
+    "ohlcIntegrity": true,
+    "maxWickSpreadPct": 0.20,
+    "timestampAligned": true,
+    "neighborDeviationMax": 0.20,
+    "noZeroVolumeCompleted": true
+  },
+  "intervalSeconds": {
+    "1m":  60,
+    "5m":  300,
+    "15m": 900,
+    "60m": 3600,
+    "1d":  86400
+  },
+  "prohibitedBehaviors": [
+    "candle_spans_multiple_intervals",
+    "date_now_as_timestamp",
+    "client_clock_for_new_bar",
+    "wipe_cached_candles_on_startup",
+    "merge_gap_into_one_candle",
+    "overwrite_existing_open",
+    "insert_forming_candle_as_complete",
+    "live_bar_on_wrong_interval",
+    "render_before_validation",
+    "wipe_live_candles_outside_symbol_switch",
+    "chain_open_to_stale_close",
+    "http_poll_appends_old_bar",
+    "gap_fill_inserts_forming_bucket"
+  ],
+  "debugChecklist": [
+    "check_live_candles_wipe_location",
+    "check_in_progress_bar_seed_age",
+    "check_contiguous_gap_guard",
+    "check_fetch_gap_candles_bucket_filter",
+    "check_http_poll_stale_bar_guard",
+    "check_timestamp_alignment"
+  ]
+}
