@@ -1,7 +1,9 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { GraduationCap, X as XIcon } from "lucide-react";
+import { GraduationCap, RefreshCw, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
+import { type FrozenImbalanceZone, buildCandleFootprints, type FootprintCandle, analyzeFootprint, buildProxyFootprintCandle } from "@/lib/footprint-analysis";
+import { buildFpImbalanceBands, type FpZoneBand } from "./FootprintLadder";
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const MW = {
@@ -11,7 +13,7 @@ const MW = {
 };
 
 // ── types ──────────────────────────────────────────────────────────────────────
-type RiskLevel  = "safe" | "risky" | "riskiest";
+type RiskLevel  = "safeplus" | "safe" | "risky" | "riskiest";
 type IntervalKey = "1m" | "5m" | "15m" | "60m";
 type OutcomeResult = "Win" | "Loss" | "Open";
 
@@ -36,8 +38,7 @@ interface SignalEntry {
   milkOk: boolean;
   secondaryVecOk: boolean;
   imbalanceOk?: boolean;
-  reclassifyReason?: string;
-  signalType?: "pure_tabletop" | "side_tabletop";
+  zonesLoaded?: boolean;
   footprintReading?: string; // FOOTPRINT-UI: JSON FootprintReading
   confidence?: number; // 0–100 confidence score
 }
@@ -45,21 +46,21 @@ interface SignalEntry {
 interface Annotation {
   note: string;
   markedBad: boolean;
+  reason?: string;
 }
 
 /** Matches the CSig shape from market.tsx. Passed in to avoid duplicate signal computation. */
 export interface ExternalSignal {
   time: number;
   direction: "Long" | "Short";
-  riskLevel: "safe" | "risky" | "riskiest";
+  riskLevel: RiskLevel;
   price: number;
   high: number;
   low: number;
   tp1: number; tp2: number; sl: number;
   confirmations: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
-  reclassifyReason?: string;
   outcome?: "win_tp1" | "win_tp2" | "loss" | "open";
-  signalType?: "pure_tabletop" | "side_tabletop";
+  zonesLoaded?: boolean;
   footprintReading?: string; // FOOTPRINT-UI: JSON-serialized FootprintReading
   confidence?: number; // 0–100 confidence score
   interval?: string; // FIX: interval at signal creation — used to filter panel by current interval
@@ -79,6 +80,12 @@ export interface SignalsPanelProps {
   allCandles?: CandleBar[];
   /** FOOTPRINT-UI: mid-trade divergence alerts keyed by signal id (signalId → alert data) */
   footprintAlerts?: Record<number, { pocPrice: number; message: string }>; // FOOTPRINT-UI:
+  /** Frozen imbalance zones from the parent (prior-session imbalance bands for preview chart overlay). */
+  frozenImbalances?: FrozenImbalanceZone[];
+  /** Called when user clicks the Refresh Signals button — parent refetches candle data */
+  onRefreshSignals?: () => Promise<void>;
+  /** Pre-set the risk filter to match the chart's current risk level */
+  defaultRiskLevel?: "all" | RiskLevel;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -181,7 +188,6 @@ const TP_FIXED_1    = 10.0;  // 10 pts (40 ticks)
 const TP_FIXED_2    = 20.0;  // 20 pts (80 ticks)
 const SL_FIXED      = 5.0;   // 5 pts  (20 ticks)
 const MILK_TOL      = 2.0;   // zone proximity tolerance in pts
-const RESIST_PROX   = 5.0;
 const COOLDOWN_BARS = 10;
 const ETH_COOLDOWN  = 20;
 // Legacy ATR constants kept for reference only
@@ -190,21 +196,31 @@ const SL_ATR_MULT   = 0.5;
 const ATR_PERIOD    = 14;
 
 interface RawSignal {
-  time: number; open: number; high: number; low: number; direction: "Long";
+  time: number; open: number; high: number; low: number; direction: "Long" | "Short";
   riskLevel: RiskLevel; price: number;
   tp1: number; tp2: number; sl: number;
   milkOk: boolean; secondaryVecOk: boolean;
-  reclassifyReason?: string;
+  zonesLoaded?: boolean;
   /** Pre-computed outcome from market.tsx (only set when externalSignals provided) */
   preOutcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
-  signalType?: "pure_tabletop" | "side_tabletop";
   footprintReading?: string; // FOOTPRINT-UI: JSON FootprintReading
   confidence?: number; // 0–100 confidence score
 }
 
-type MLZone = { from_ts: number; to_ts: number; top: number; bottom: number; is_bull: boolean; score: number };
+function isBullZone(z: ZoneBand): boolean {
+  if (z.label) {
+    const l = z.label.toLowerCase();
+    if (/sell|resist|bear|supply|absorb\s*buy|cap\s*session|ceiling|non.fair|iv.wall|iv.overflow|pivot(?!.*floor)|gex.wall.short|wall.short|short.median/i.test(l)) return false;
+    if (/buy|demand|support|bull|absorb\s*sell|floor|gex.wall.long|wall.long|long.median|spy.floor|ovn.spy.floor/i.test(l)) return true;
+  }
+  const c = z.color.toLowerCase().trim();
+  if (c === "#22c55e" || c === "#3b82f6" || c === "#14b8a6") return true;
+  const m = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  if (m) { const r = +m[1], g = +m[2], b = +m[3]; return g > r || (b > r && b > g); }
+  return false;
+}
 
-function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = [], mlZones: MLZone[] = []): RawSignal[] {
+function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = [], zones: ZoneBand[] = []): RawSignal[] {
   if (!candles.length) return [];
   const sorted     = [...candles].sort((a, b) => a.time - b.time);
   const chartTimes = sorted.map(c => c.time);
@@ -216,63 +232,129 @@ function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = 
     return new Map(forwardFillVector(sv, chartTimes).map(v => [v.time, v.value]));
   });
 
+  // Pre-build proxy footprint for all bars
+  const fpByTime = new Map<number, FootprintCandle>();
+  for (const c of sorted) fpByTime.set(c.time, buildProxyFootprintCandle(c));
+
   const raw: RawSignal[] = [];
   let lastLongBar = -COOLDOWN_BARS, lastLongEthBar = -ETH_COOLDOWN;
+  let lastShortBar = -COOLDOWN_BARS, lastShortEthBar = -ETH_COOLDOWN;
 
   for (let i = 0; i < sorted.length; i++) {
-    const c = sorted[i], lb = vecMap.get(c.time), prevLb = i >= 3 ? vecMap.get(sorted[i - 3].time) : undefined;
-    if (isMarketBreak(c.time)) continue;
-    if (!(lb != null && c.close > lb)) continue;
-    if (lb != null && prevLb != null && lb < prevLb) continue;
+    const c   = sorted[i];
+    const lb  = vecMap.get(c.time);
+    if (lb == null || isMarketBreak(c.time)) continue;
 
-    const secondaryVecOk = secMaps.some(m => { const v = m.get(c.time); return v != null && c.close > v; });
-    const utcH = (c.time / 3600 | 0) % 24, utcMin = (c.time / 60 | 0) % 60;
-    const minsUtc = utcH * 60 + utcMin;
-    const rthFlag = c.rth ?? isRTH(c.time);
+    const rthFlag      = c.rth ?? isRTH(c.time);
+    const utcH         = (c.time / 3600 | 0) % 24;
+    const minsUtc      = utcH * 60 + ((c.time / 60 | 0) % 60);
     const isRthForMilk = rthFlag && minsUtc >= 13 * 60 + 30 && minsUtc < 20 * 60 + 30;
 
-    // milkOk: price-based check — candle wicked into a bullish zone AND closed above its bottom
-    let milkOk = false;
+    const secLongOk  = secMaps.some(m => { const v = m.get(c.time); return v != null && c.close > v; });
+    const secShortOk = secMaps.some(m => { const v = m.get(c.time); return v != null && c.close < v; });
+
+    let milkBullOk = false, milkBearOk = false;
+    let milkPtsL = 0, milkPtsS = 0;
     if (isRthForMilk) {
-      for (const z of mlZones) {
-        if (!z.is_bull) continue;
-        if (c.time < z.from_ts || c.time > z.to_ts) continue;
-        if (c.low <= z.top + MILK_TOL && c.close >= z.bottom - MILK_TOL) { milkOk = true; break; }
+      for (const z of zones) {
+        // Only dated zones (fromTime > 0) count for milk confirmation
+        if (!z.fromTime || c.time < z.fromTime || (z.toTime != null && c.time > z.toTime)) continue;
+        const bull = isBullZone(z);
+        if (bull) {
+          if (c.low <= z.topPrice + 0.5) {
+            const below = z.bottomPrice - c.close;
+            const pts = below <= 0.5 ? 3 : below <= 1.5 ? 1 : 0;
+            if (pts > milkPtsL) { milkPtsL = pts; if (pts > 0) milkBullOk = true; }
+          }
+        } else {
+          if (c.high >= z.bottomPrice - 0.5) {
+            const above = c.close - z.topPrice;
+            const pts = above <= 0.5 ? 3 : above <= 1.5 ? 1 : 0;
+            if (pts > milkPtsS) { milkPtsS = pts; if (pts > 0) milkBearOk = true; }
+          }
+        }
       }
     }
 
-    // SAFE: MilkZone AND secondary Vector both confirm
-    // RISKY: exactly one of MilkZone / secondary Vector confirms
-    // RISKIEST: neither confirms (pattern-only fallback)
-    let level: RiskLevel =
-      (milkOk && secondaryVecOk) ? "safe" :
-      (milkOk || secondaryVecOk) ? "risky" :
-      "riskiest";
+    const fpCandle = fpByTime.get(c.time)!;
+    const priorFp  = sorted.slice(Math.max(0, i - 4), i).map(b => fpByTime.get(b.time)!);
 
-    if (rthFlag && utcH >= 20 && level !== "safe") continue;
+    const prevBarLb  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
+    const prevBarLb2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
 
-    const cooldown  = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-    const lastUsed  = rthFlag ? lastLongBar   : lastLongEthBar;
-    if (i - lastUsed < cooldown) continue;
-    if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
+    // ── Long ──────────────────────────────────────────────────────────────
+    if (c.close > lb) {
+      const fpR = analyzeFootprint(fpCandle, "Long", priorFp, c.close);
+      if (!fpR?.vetoed) {
+        const sideEntry   = prevBarLb != null && sorted[i - 1].close <= prevBarLb && c.close > lb;
+        const tabletopTest = prevBarLb != null && prevBarLb2 != null
+          && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
+          && c.close > lb && c.close >= c.open;
+        const vecTestedL = sideEntry || tabletopTest;
 
-    // Fixed-point exits (Monte Carlo calibrated)
-    const tp1 = c.close + TP_FIXED_1;
-    const tp2 = c.close + TP_FIXED_2;
-    const sl  = c.close - SL_FIXED;
-
-    let reclassifyReason: string | undefined;
-    for (const z of mlZones) {
-      if (z.is_bull) continue;
-      if (c.time < z.from_ts || c.time > z.to_ts) continue;
-      const dist = z.bottom - c.close;
-      if (dist >= 0 && dist <= RESIST_PROX) {
-        reclassifyReason = `Resistance at ${z.bottom.toFixed(2)} (${dist.toFixed(1)} pts above)`;
-        break;
+        const fpFires = fpR?.confirmed || fpR?.partial;
+        let fpStrong  = false;
+        if (fpFires) {
+          if (fpCandle.imbalances.some(cl => cl.direction === "buy"  && cl.levelCount >= 2)) fpStrong = true;
+          if (!fpStrong && priorFp.length > 0) {
+            const avg = priorFp.reduce((s, p) => s + Math.abs(p.candleDelta), 0) / priorFp.length;
+            if (avg > 0 && Math.abs(fpCandle.candleDelta) >= 2 * avg) fpStrong = true;
+          }
+        }
+        // FIX 4: proxy data cannot be "strong" — cap at weak (2pts max)
+        if (fpR?.isProxyData) fpStrong = false;
+        const totalPts = (fpFires ? (fpStrong ? 4 : 2) : 0) + milkPtsL + (vecTestedL ? 2 : 0);
+        if (totalPts >= 1) {
+          const level: RiskLevel = totalPts >= 8 ? "safeplus" : totalPts >= 4 ? "safe" : totalPts >= 3 ? "risky" : "riskiest";
+          if (!(rthFlag && utcH >= 20 && level !== "safe" && level !== "safeplus")) {
+            const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
+            if (i - (rthFlag ? lastLongBar : lastLongEthBar) >= cd) {
+              if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
+              raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Long", riskLevel: level, price: c.close,
+                tp1: c.close + TP_FIXED_1, tp2: c.close + TP_FIXED_2, sl: c.close - SL_FIXED,
+                milkOk: milkBullOk, secondaryVecOk: secLongOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
+            }
+          }
+        }
       }
     }
 
-    raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Long", riskLevel: level, price: c.close, tp1, tp2, sl, milkOk, secondaryVecOk, reclassifyReason });
+    // ── Short ─────────────────────────────────────────────────────────────
+    if (c.close < lb) {
+      const fpR = analyzeFootprint(fpCandle, "Short", priorFp, c.close);
+      if (!fpR?.vetoed) {
+        const sideEntry    = prevBarLb != null && sorted[i - 1].close >= prevBarLb && c.close < lb;
+        const tabletopTest = prevBarLb != null && prevBarLb2 != null
+          && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
+          && c.close < lb && c.close <= c.open;
+        const vecTestedS = sideEntry || tabletopTest;
+
+        const fpFires = fpR?.confirmed || fpR?.partial;
+        let fpStrong  = false;
+        if (fpFires) {
+          if (fpCandle.imbalances.some(cl => cl.direction === "sell" && cl.levelCount >= 2)) fpStrong = true;
+          if (!fpStrong && priorFp.length > 0) {
+            const avg = priorFp.reduce((s, p) => s + Math.abs(p.candleDelta), 0) / priorFp.length;
+            if (avg > 0 && Math.abs(fpCandle.candleDelta) >= 2 * avg) fpStrong = true;
+          }
+        }
+        // FIX 4: proxy data cannot be "strong" — cap at weak (2pts max)
+        if (fpR?.isProxyData) fpStrong = false;
+        const totalPts = (fpFires ? (fpStrong ? 4 : 2) : 0) + milkPtsS + (vecTestedS ? 2 : 0);
+        if (totalPts >= 1) {
+          const level: RiskLevel = totalPts >= 8 ? "safeplus" : totalPts >= 4 ? "safe" : totalPts >= 3 ? "risky" : "riskiest";
+          if (!(rthFlag && utcH >= 20 && level !== "safe" && level !== "safeplus")) {
+            const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
+            if (i - (rthFlag ? lastShortBar : lastShortEthBar) >= cd) {
+              if (rthFlag) lastShortBar = i; else lastShortEthBar = i;
+              raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Short", riskLevel: level, price: c.close,
+                tp1: c.close - TP_FIXED_1, tp2: c.close - TP_FIXED_2, sl: c.close + SL_FIXED,
+                milkOk: milkBearOk, secondaryVecOk: secShortOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
+            }
+          }
+        }
+      }
+    }
   }
   return raw;
 }
@@ -299,13 +381,74 @@ function computeOutcome(
   return { outcome: "Open", tpHit: null, points: null };
 }
 
-// ── exit strategy profiles (mirrors EXIT_STRATEGY_PROFILES in market.tsx) ─────
+// ── exit strategy profiles — exact mirror of EXIT_STRATEGY_PROFILES in market.tsx ─────
+// Each profile has per-tier TP/SL values so simulated outcomes respect the signal's risk level.
 const EXIT_VIEW_PROFILES = {
-  safe:     { rth: { tp1: 8.5,  tp2: 14.0, sl: 3.5 }, eth: { tp1: 6.0,  tp2: 10.0, sl: 2.5 }, label: "Tight",    color: "#26c87a" },
-  risky:    { rth: { tp1: 10.0, tp2: 20.0, sl: 5.0 }, eth: { tp1: 5.0,  tp2: 10.0, sl: 3.0 }, label: "Standard", color: "#f59e0b" },
-  riskiest: { rth: { tp1: 14.0, tp2: 28.0, sl: 8.0 }, eth: { tp1: 10.0, tp2: 18.0, sl: 5.0 }, label: "Wide",     color: "#ef5350" },
+  safe: {
+    label: "Tight", color: "#26c87a",
+    rth: {
+      safeplus: { tp1: 14.0, tp2: 28.0, sl: 3.5 },
+      safe:     { tp1: 12.5, tp2: 25.0, sl: 4.0 },
+      risky:    { tp1:  9.0, tp2: 20.0, sl: 5.5 },
+      riskiest: { tp1:  7.0, tp2: 16.0, sl: 8.0 },
+    },
+    eth: {
+      safeplus: { tp1:  8.5, tp2: 17.0, sl: 2.5 },
+      safe:     { tp1:  7.5, tp2: 15.0, sl: 3.0 },
+      risky:    { tp1:  5.5, tp2: 12.0, sl: 4.0 },
+      riskiest: { tp1:  4.0, tp2:  9.0, sl: 5.5 },
+    },
+  },
+  risky: {
+    label: "Standard", color: "#f59e0b",
+    rth: {
+      safeplus: { tp1: 12.0, tp2: 22.0, sl: 4.0 },
+      safe:     { tp1: 10.0, tp2: 20.0, sl: 5.0 },
+      risky:    { tp1:  7.5, tp2: 17.0, sl: 6.5 },
+      riskiest: { tp1:  5.5, tp2: 13.0, sl: 9.0 },
+    },
+    eth: {
+      safeplus: { tp1:  7.0, tp2: 13.0, sl: 3.0 },
+      safe:     { tp1:  6.0, tp2: 12.0, sl: 3.5 },
+      risky:    { tp1:  4.5, tp2: 10.0, sl: 4.5 },
+      riskiest: { tp1:  3.5, tp2:  8.0, sl: 6.0 },
+    },
+  },
+  riskiest: {
+    label: "Wide", color: "#ef5350",
+    rth: {
+      safeplus: { tp1: 18.0, tp2: 35.0, sl:  8.0 },
+      safe:     { tp1: 16.0, tp2: 30.0, sl: 10.0 },
+      risky:    { tp1: 12.0, tp2: 25.0, sl: 12.0 },
+      riskiest: { tp1: 10.0, tp2: 20.0, sl: 15.0 },
+    },
+    eth: {
+      safeplus: { tp1: 10.0, tp2: 20.0, sl: 5.5 },
+      safe:     { tp1:  9.0, tp2: 17.0, sl: 7.0 },
+      risky:    { tp1:  7.0, tp2: 14.0, sl: 8.5 },
+      riskiest: { tp1:  6.0, tp2: 12.0, sl: 10.0 },
+    },
+  },
 } as const;
-type ExitView = "current" | "safe" | "risky" | "riskiest";
+type ExitView = "current" | "safe" | "risky" | "riskiest" | "mc";
+
+// ── MC calibration types ───────────────────────────────────────────────────────
+interface TierCal {
+  tier: string;
+  sl_atr: number; tp1_atr: number; tp2_atr: number;
+  win_rate_tp1: number; win_rate_tp2: number;
+  ev_tp1: number; ev_combined: number;
+  sample_count: number; calibrated_at: string;
+  ev_ci_low: number; ev_ci_high: number;
+  top5: Array<{ tp_atr: number; sl_atr: number; ev: number; wr: number }>;
+  mae_p70_atr: number; mfe_p50_atr: number; mfe_p75_atr: number;
+  date_range: string;
+}
+type MCCalibration = Record<string, TierCal>;
+
+const MC_TIER_MULT: Record<string, number> = { safe: 1.0, risky: 1.25, riskiest: 1.50 };
+const MC_ATR_FLOOR = 1.25;
+const MC_TICK      = 0.25; // MES tick size
 
 // ── constants ─────────────────────────────────────────────────────────────────
 const SYMBOLS   = ["MES", "ES", "SPY", "QQQ", "NQ", "MNQ"];
@@ -317,28 +460,33 @@ function defaultStartDate(): string {
 }
 
 // ── main component ─────────────────────────────────────────────────────────────
-export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = "5m", onClose, onViewOnChart, externalSignals, milkZones, allCandles, footprintAlerts }: SignalsPanelProps) { // FOOTPRINT-UI:
+export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = "5m", onClose, onViewOnChart, externalSignals, milkZones, allCandles, footprintAlerts, frozenImbalances, onRefreshSignals, defaultRiskLevel }: SignalsPanelProps) { // FOOTPRINT-UI:
   const [sym,       setSym]       = useState(defaultSymbol);
   const [ival,      setIval]      = useState<IntervalKey>(defaultInterval);
-  const [activeTab,   setActiveTab]   = useState<"signals" | "learned">("signals");
+  const [activeTab,   setActiveTab]   = useState<"signals" | "learned" | "montecarlo">("signals");
   const [direction,   setDirection]   = useState<"all"|"long"|"short">("all");
-  const [riskFilter,  setRiskFilter]  = useState<"all"|RiskLevel>("all");
-  const [rthOnly,     setRthOnly]     = useState(true);
+  const [riskFilter,  setRiskFilter]  = useState<"all"|RiskLevel>(defaultRiskLevel ?? "all");
+  const [rthOnly,     setRthOnly]     = useState(false);
   const [exitView,    setExitView]    = useState<ExitView>("current");
   const [minPts,      setMinPts]      = useState(0);
   const [startDate, setStartDate] = useState(defaultStartDate);
   const [editMode,      setEditMode]      = useState(false);
   const [selKey,        setSelKey]        = useState<string | null>(null);
   const [editNote,      setEditNote]      = useState("");
-  const [learnLoading,  setLearnLoading]  = useState(false);
-  const [learnLog,      setLearnLog]      = useState<any | null>(null);
-  const [learnToast,    setLearnToast]    = useState<string | null>(null);
+  const [learnLoading,      setLearnLoading]      = useState(false);
+  const [learnLog,          setLearnLog]          = useState<any | null>(null);
+  const [learnToast,        setLearnToast]        = useState<string | null>(null);
+  const [signalsRefreshing, setSignalsRefreshing] = useState(false);
 
   const [showLearnedTrades, setShowLearnedTrades] = useState(false);
 
-  const [previewSig,        setPreviewSig]        = useState<SignalEntry | null>(null);
-  const [previewShowVector, setPreviewShowVector] = useState(true);
-  const [previewShowZones,  setPreviewShowZones]  = useState(true);
+  const [previewSig,               setPreviewSig]               = useState<SignalEntry | null>(null);
+  const [previewShowVector,        setPreviewShowVector]        = useState(true);
+  const [previewShowZones,         setPreviewShowZones]         = useState(true);
+  const [previewShowExtraVectors,  setPreviewShowExtraVectors]  = useState(true);
+  const [previewShowFpFrozen,      setPreviewShowFpFrozen]      = useState(true);
+  const [previewShowFootprint,     setPreviewShowFootprint]     = useState(true);
+  const [previewShowFpBands,       setPreviewShowFpBands]       = useState(true);
   const previewChartRef = useRef<ChartHandle>(null);
 
   const [annotations, setAnnotations] = useState<Record<string, Annotation>>(() => {
@@ -355,10 +503,15 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   }, []);
 
   // ── date range ──────────────────────────────────────────────────────────────
-  const toTs   = useMemo(() => Math.floor(Date.now() / 1000), []);
+  // toTs: no upper-bound filter — live signals fired during the session must not be cut off.
+  // A stale useMemo(()=>Date.now(),[]) would silently drop any signal whose candle closes
+  // after the panel was first mounted.
+  const toTs   = 9_999_999_999;
   const fromTs = useMemo(() => {
-    const d = new Date(startDate + "T09:30:00");  // start of trading day ET
-    return Math.floor(d.getTime() / 1000) - 4 * 3600; // convert ET to UTC
+    // Interpret startDate as a calendar day in ET and find midnight UTC for that day.
+    // new Date(date + "T00:00:00") = midnight local; subtract local UTC offset to get UTC midnight.
+    const d = new Date(startDate + "T00:00:00");
+    return Math.floor(d.getTime() / 1000); // UTC midnight of the selected date
   }, [startDate]);
 
   // ── data fetching ───────────────────────────────────────────────────────────
@@ -383,6 +536,17 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
     },
     enabled: ival === "1m",
     staleTime: 60_000,
+  });
+
+  // ── MC calibration ──────────────────────────────────────────────────────────
+  const { data: mcCalibration } = useQuery<MCCalibration | null>({
+    queryKey: ["mc-calibration"],
+    queryFn: async () => {
+      const r = await fetch("/api/mc-calibration");
+      if (!r.ok) return null;
+      return r.json();
+    },
+    staleTime: 5 * 60_000,
   });
 
   // ── candle derivation ───────────────────────────────────────────────────────
@@ -412,6 +576,22 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
     return [...src].sort((a, b) => a.time - b.time);
   }, [allCandles, sortedPrimary]);
 
+  // ── ATR-14 map (time → atr) for MC exit computation ─────────────────────────
+  const atr14Map = useMemo(() => {
+    const map = new Map<number, number>();
+    const s = [...sortedPrimary];
+    for (let i = 1; i < s.length; i++) {
+      const start = Math.max(1, i - 13);
+      let sum = 0, count = 0;
+      for (let j = start; j <= i; j++) {
+        const tr = Math.max(s[j].high - s[j].low, Math.abs(s[j].high - s[j - 1].close), Math.abs(s[j].low - s[j - 1].close));
+        sum += tr; count++;
+      }
+      if (count > 0) map.set(s[i].time, sum / count);
+    }
+    return map;
+  }, [sortedPrimary]);
+
   // ── learnings fetch ─────────────────────────────────────────────────────────
   const { data: learningsData, refetch: refetchLearnings } = useQuery<{ content: string }>({
     queryKey: ["learnings"],
@@ -429,17 +609,14 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   const embedded = externalSignals != null;
   const useExternal = embedded;
 
-  // ML zones — used by computeSignals fallback path (when not using external signals)
-  const { data: spMlZonesData } = useQuery<{ zones: MLZone[] }>({
-    queryKey: ["/api/ml/zones/strong", fromTs, toTs],
-    queryFn: async () => {
-      const r = await fetch(`/api/ml/zones/strong?from_ts=${fromTs}&to_ts=${toTs}`);
-      if (!r.ok) throw new Error("Failed");
-      return r.json();
-    },
-    enabled: !useExternal && fromTs > 0 && toTs > 0,
-    staleTime: 30 * 60_000,
-  });
+  // Sync ival/sym with parent props when interval or symbol changes on the chart.
+  // useState only uses the initial value — without this effect the panel shows the wrong
+  // interval's signals after the user switches intervals on the chart.
+  useEffect(() => {
+    if (!embedded) return;
+    setIval(defaultInterval as IntervalKey);
+    setSym(defaultSymbol);
+  }, [defaultInterval, defaultSymbol, embedded]);
 
   // ── signal computation ──────────────────────────────────────────────────────
   const openMap = useMemo(() => new Map(sortedPrimary.map(c => [c.time, c.open])), [sortedPrimary]);
@@ -458,15 +635,14 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         tp1: s.tp1, tp2: s.tp2, sl: s.sl,
         milkOk: s.confirmations.milkOk,
         secondaryVecOk: s.confirmations.secondaryVecOk,
-        reclassifyReason: s.reclassifyReason,
         preOutcome: s.outcome,
-        signalType: s.signalType,
+        zonesLoaded: s.zonesLoaded,
         footprintReading: s.footprintReading, // FOOTPRINT-UI:
         confidence: s.confidence,
       }));
     }
-    return computeSignals(primaryCandles, secondaryCandles, spMlZonesData?.zones ?? []);
-  }, [useExternal, externalSignals, openMap, primaryCandles, secondaryCandles, spMlZonesData]);
+    return computeSignals(primaryCandles, secondaryCandles, milkZones ?? []);
+  }, [useExternal, externalSignals, openMap, primaryCandles, secondaryCandles, milkZones]);
 
   const signals = useMemo((): SignalEntry[] => {
     return rawSignals
@@ -475,14 +651,37 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         let tpHit: 1 | 2 | null;
         let points: number | null;
 
-        if (exitView !== "current") {
-          // Re-compute outcome using the selected exit strategy profile's TP/SL levels
+        if (exitView === "mc" && mcCalibration) {
+          // MC-calibrated exits: 3-step SL, MFE-based TPs, tier multiplier
+          const tierKey = (s.riskLevel === "safeplus" ? "safe" : s.riskLevel) as string;
+          const cal = mcCalibration[tierKey];
+          if (cal) {
+            const atr    = atr14Map.get(s.time) ?? 8.0;
+            const mult   = MC_TIER_MULT[tierKey] ?? 1.0;
+            const slDist = Math.max(MC_ATR_FLOOR * atr, (cal.mae_p70_atr || 0) * atr, cal.sl_atr * atr) * mult;
+            const tp1Dist = (cal.mfe_p50_atr > 0 ? cal.mfe_p50_atr : cal.tp1_atr) * atr;
+            const tp2Dist = (cal.mfe_p75_atr > 0 ? cal.mfe_p75_atr : cal.tp2_atr) * atr;
+            const snap = (d: number) => Math.round(d / MC_TICK) * MC_TICK;
+            const isLong = s.direction === "Long";
+            const eTp1 = isLong ? s.price + snap(tp1Dist) : s.price - snap(tp1Dist);
+            const eTp2 = isLong ? s.price + snap(tp2Dist) : s.price - snap(tp2Dist);
+            const eSl  = isLong ? s.price - snap(slDist)  : s.price + snap(slDist);
+            const res  = computeOutcome({ ...s, tp1: eTp1, tp2: eTp2, sl: eSl }, allSortedCandles);
+            outcome = res.outcome; tpHit = res.tpHit; points = res.points;
+          } else {
+            const res = computeOutcome(s, allSortedCandles);
+            outcome = res.outcome; tpHit = res.tpHit; points = res.points;
+          }
+        } else if (exitView !== "current" && exitView !== "mc") {
+          // Re-compute outcome using the selected exit strategy profile's TP/SL levels.
+          // Use the signal's actual riskLevel tier so the simulation is tier-accurate.
           const ep  = EXIT_VIEW_PROFILES[exitView];
           const ses = isRTH(s.time) ? ep.rth : ep.eth;
+          const tier = (ses as Record<string, { tp1: number; tp2: number; sl: number }>)[s.riskLevel] ?? ses.riskiest;
           const isLong = s.direction === "Long";
-          const eTp1 = isLong ? s.price + ses.tp1 : s.price - ses.tp1;
-          const eTp2 = isLong ? s.price + ses.tp2 : s.price - ses.tp2;
-          const eSl  = isLong ? s.price - ses.sl  : s.price + ses.sl;
+          const eTp1 = isLong ? s.price + tier.tp1 : s.price - tier.tp1;
+          const eTp2 = isLong ? s.price + tier.tp2 : s.price - tier.tp2;
+          const eSl  = isLong ? s.price - tier.sl  : s.price + tier.sl;
           const res  = computeOutcome({ ...s, tp1: eTp1, tp2: eTp2, sl: eSl }, allSortedCandles);
           outcome = res.outcome; tpHit = res.tpHit; points = res.points;
         } else if (s.preOutcome) {
@@ -497,7 +696,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           const res = computeOutcome(s, sortedPrimary);
           outcome = res.outcome; tpHit = res.tpHit; points = res.points;
         }
-        return { key: `${sym}-${s.time}-${ival}`, ...s, interval: ival, rth: isRTH(s.time), outcome, tpHit, points };
+        return { key: `${sym}-${s.time}-${s.direction}-${ival}`, ...s, interval: ival, rth: isRTH(s.time), outcome, tpHit, points };
       })
       .filter(s => {
         if (s.time < fromTs || s.time > toTs) return false;
@@ -510,7 +709,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         return true;
       })
       .sort((a, b) => a.time - b.time);
-  }, [rawSignals, sortedPrimary, allSortedCandles, sym, ival, fromTs, toTs, rthOnly, direction, riskFilter, minPts, exitView]);
+  }, [rawSignals, sortedPrimary, allSortedCandles, sym, ival, fromTs, toTs, rthOnly, direction, riskFilter, minPts, exitView, mcCalibration, atr14Map]);
 
   const selectedSignal = useMemo(() => signals.find(s => s.key === selKey) ?? null, [signals, selKey]);
 
@@ -641,6 +840,40 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
     };
   }, [previewSig, previewData]);
 
+  // ── secondary vector lines for preview (15m + 60m computed from allCandles) ──
+  const previewExtraVectors = useMemo((): Array<{ label: string; color: string; data: Array<{ time: number; value: number }> }> => {
+    if (!previewData || !allCandles?.length) return [];
+    const base = [...allCandles].sort((a, b) => a.time - b.time);
+    const chartTimes = previewData.displayCandles.map(c => c.time);
+    const result: Array<{ label: string; color: string; data: Array<{ time: number; value: number }> }> = [];
+
+    const candles15m = aggToInterval(base, 900);
+    if (candles15m.length) {
+      const vec15 = computeVectorLine(candles15m);
+      if (vec15.length) result.push({ label: "15m", color: "#fbbf24", data: forwardFillVector(vec15, chartTimes) });
+    }
+
+    const candles60m = aggToInterval(base, 3600);
+    if (candles60m.length) {
+      const vec60 = computeVectorLine(candles60m);
+      if (vec60.length) result.push({ label: "60m", color: "#a855f7", data: forwardFillVector(vec60, chartTimes) });
+    }
+
+    return result;
+  }, [previewData, allCandles]);
+
+  // ── footprint candle map for preview (proxy footprints from OHLCV) ────────────
+  const previewCandleFootprints = useMemo((): Map<number, FootprintCandle> | undefined => {
+    if (!previewData?.displayCandles.length) return undefined;
+    return buildCandleFootprints(previewData.displayCandles);
+  }, [previewData]);
+
+  // ── FP imbalance bands for preview (stacked imbalance zone overlays) ──────────
+  const previewFpBands = useMemo((): FpZoneBand[] => {
+    if (!previewData?.displayCandles.length) return [];
+    return buildFpImbalanceBands(previewData.displayCandles);
+  }, [previewData]);
+
   // After chart mounts / signal changes, center the view on the signal.
   // The chart's default wasFirstLoad path calls scrollToRealTime() which scrolls
   // past historical data — fix by re-scrolling to the signal bar after a frame.
@@ -653,7 +886,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
     return () => cancelAnimationFrame(frame);
   }, [previewSig]);
 
-  const rlColor = (rl: string) => rl === "safe" ? "#26c87a" : rl === "risky" ? "#f59e0b" : "#ef4444";
+  const rlColor = (rl: string) => rl === "safeplus" ? "#a78bfa" : rl === "safe" ? "#26c87a" : rl === "risky" ? "#f59e0b" : "#ef4444";
   const ocColor = (oc: OutcomeResult) => oc === "Win" ? "#26c87a" : oc === "Loss" ? "#ef5350" : MW.muted;
 
   const sel = (active: boolean, color = MW.accent) => ({
@@ -684,11 +917,23 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
             </span>
             <span style={{ fontSize: 10, color: MW.muted }}>{fmtDateShort(previewSig.time)} {fmtTime(previewSig.time)}</span>
             <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: rlColor(previewSig.riskLevel) + "18", color: rlColor(previewSig.riskLevel) }}>{previewSig.riskLevel}</span>
-            <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+            <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
               <button style={sel(previewShowVector, MW.accent)} onClick={() => setPreviewShowVector(v => !v)}>Vector</button>
+              {previewExtraVectors.length > 0 && (
+                <button style={sel(previewShowExtraVectors, "#9ca3af")} onClick={() => setPreviewShowExtraVectors(v => !v)}>15m/60m</button>
+              )}
               {milkZones?.length ? (
                 <button style={sel(previewShowZones, "#22c55e")} onClick={() => setPreviewShowZones(v => !v)}>Zones</button>
               ) : null}
+              {frozenImbalances?.length ? (
+                <button style={sel(previewShowFpFrozen, "#f97316")} onClick={() => setPreviewShowFpFrozen(v => !v)}>Prior Imbalances</button>
+              ) : null}
+              {previewCandleFootprints && (
+                <button style={sel(previewShowFootprint, "#818cf8")} onClick={() => setPreviewShowFootprint(v => !v)}>Footprint</button>
+              )}
+              {previewFpBands.length > 0 && (
+                <button style={sel(previewShowFpBands, "#f59e0b")} onClick={() => setPreviewShowFpBands(v => !v)}>FP Bands</button>
+              )}
               <button onClick={() => setPreviewSig(null)} style={{ background: "none", border: "none", color: MW.muted, cursor: "pointer", fontSize: 15, padding: "0 2px", lineHeight: 1 }}>✕</button>
             </div>
           </div>
@@ -699,7 +944,13 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
               candles={previewData.displayCandles}
               vectorData={previewShowVector ? previewData.vector : undefined}
               showVector={previewShowVector}
-              zones={previewShowZones && previewZones.length ? previewZones : undefined}
+              extraVectors={previewShowExtraVectors ? previewExtraVectors : undefined}
+              zones={[
+                ...(previewShowZones ? previewZones : []),
+                ...(previewShowFpBands ? previewFpBands : []),
+              ]}
+              frozenImbalances={previewShowFpFrozen ? frozenImbalances : undefined}
+              candleFootprints={previewShowFootprint ? previewCandleFootprints : undefined}
               confluenceSignals={[previewConfluenceSig]}
               activeSignalTime={previewSig.time}
               showVolume={false}
@@ -712,23 +963,51 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", borderBottom: `1px solid ${MW.border}`, background: MW.panel, flexShrink: 0 }}>
         {/* Tab buttons */}
-        {(["signals", "learned"] as const).map(tab => (
-          <button key={tab} onClick={() => { setActiveTab(tab); if (tab === "learned") refetchLearnings(); }}
+        {([
+          { id: "signals",     label: "Signals",   color: MW.accent },
+          { id: "learned",     label: "Learned",   color: "#a78bfa" },
+          { id: "montecarlo",  label: "Monte Carlo", color: "#22d3ee" },
+        ] as const).map(({ id, label, color }) => (
+          <button key={id} onClick={() => { setActiveTab(id); if (id === "learned") refetchLearnings(); }}
             style={{
               padding: "3px 12px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
-              background: activeTab === tab ? (tab === "learned" ? "rgba(167,139,250,0.18)" : "rgba(66,165,245,0.15)") : "transparent",
-              border: `1px solid ${activeTab === tab ? (tab === "learned" ? "#a78bfa88" : MW.accent + "88") : MW.border}`,
-              color: activeTab === tab ? (tab === "learned" ? "#a78bfa" : MW.accent) : MW.muted,
+              background: activeTab === id ? color + "22" : "transparent",
+              border: `1px solid ${activeTab === id ? color + "88" : MW.border}`,
+              color: activeTab === id ? color : MW.muted,
               fontFamily: "'Trebuchet MS', monospace", textTransform: "uppercase", letterSpacing: "0.05em",
             }}
-          >{tab}</button>
+          >{label}</button>
         ))}
 
         <span style={{ color: MW.muted, fontSize: 11 }}>
-          {activeTab === "signals" ? `${stats.total} signals` : `${lessons.length} lessons`}
+          {activeTab === "signals" ? `${stats.total} signals` : activeTab === "learned" ? `${lessons.length} lessons` : "MC calibration"}
         </span>
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+          {activeTab === "signals" && onRefreshSignals && (
+            <button
+              onClick={async () => {
+                if (signalsRefreshing) return;
+                setSignalsRefreshing(true);
+                try { await onRefreshSignals(); } finally { setSignalsRefreshing(false); }
+              }}
+              disabled={signalsRefreshing}
+              title="Refresh signals — refetch candle data and recompute all signals"
+              style={{
+                padding: "3px 10px", borderRadius: 4, fontSize: 11,
+                cursor: signalsRefreshing ? "not-allowed" : "pointer",
+                background: "transparent",
+                border: `1px solid ${MW.border}`,
+                color: signalsRefreshing ? MW.accent : MW.muted,
+                fontFamily: "'Trebuchet MS', monospace",
+                display: "flex", alignItems: "center", gap: 5,
+                opacity: signalsRefreshing ? 0.7 : 1,
+              }}
+            >
+              <RefreshCw size={11} style={{ animation: signalsRefreshing ? "spin 1s linear infinite" : "none" }} />
+              {signalsRefreshing ? "Refreshing…" : "Refresh"}
+            </button>
+          )}
           {activeTab === "signals" && (
             <button
               onClick={() => setEditMode(v => !v)}
@@ -791,10 +1070,13 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
             <div style={{ display: "flex", alignItems: "baseline", gap: 5 }}>
               <span style={{ fontSize: 22, fontWeight: 800, color: stats.wr >= 50 ? "#26c87a" : "#ef5350", lineHeight: 1 }}>{stats.wr}%</span>
               <span style={{ fontSize: 10, color: MW.muted }}>win rate</span>
-              {exitView !== "current" && (
+              {exitView !== "current" && exitView !== "mc" && (
                 <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: EXIT_VIEW_PROFILES[exitView].color + "18", color: EXIT_VIEW_PROFILES[exitView].color, marginLeft: 4 }}>
                   {EXIT_VIEW_PROFILES[exitView].label}
                 </span>
+              )}
+              {exitView === "mc" && (
+                <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: "rgba(34,211,238,0.12)", color: "#22d3ee", marginLeft: 4 }}>MC</span>
               )}
             </div>
           ) : (
@@ -838,6 +1120,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
 
         {/* Risk filter */}
         <button style={sel(riskFilter === "all")}                   onClick={() => setRiskFilter("all")}>All Risk</button>
+        <button style={sel(riskFilter === "safeplus",  "#a78bfa")}   onClick={() => setRiskFilter("safeplus")}>SAFE+</button>
         <button style={sel(riskFilter === "safe",     "#26c87a")}   onClick={() => setRiskFilter("safe")}>Safe</button>
         <button style={sel(riskFilter === "risky",    "#f59e0b")}   onClick={() => setRiskFilter("risky")}>Risky</button>
         <button style={sel(riskFilter === "riskiest", "#ef5350")}   onClick={() => setRiskFilter("riskiest")}>Riskiest</button>
@@ -886,10 +1169,17 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         <button style={sel(exitView === "current")} onClick={() => setExitView("current")} title="Show outcomes using the signal's actual TP/SL levels">Current</button>
         {(["safe", "risky", "riskiest"] as const).map(ev => (
           <button key={ev} style={sel(exitView === ev, EXIT_VIEW_PROFILES[ev].color)} onClick={() => setExitView(ev)}
-            title={`Simulate outcomes using ${EXIT_VIEW_PROFILES[ev].label} exit levels (TP1=${EXIT_VIEW_PROFILES[ev].rth.tp1} TP2=${EXIT_VIEW_PROFILES[ev].rth.tp2} SL=${EXIT_VIEW_PROFILES[ev].rth.sl} pts)`}>
+            title={`Simulate outcomes using ${EXIT_VIEW_PROFILES[ev].label} exit levels — SAFE tier: TP1=${EXIT_VIEW_PROFILES[ev].rth.safe.tp1} TP2=${EXIT_VIEW_PROFILES[ev].rth.safe.tp2} SL=${EXIT_VIEW_PROFILES[ev].rth.safe.sl} pts`}>
             {EXIT_VIEW_PROFILES[ev].label}
           </button>
         ))}
+        <button
+          style={sel(exitView === "mc", "#22d3ee")}
+          onClick={() => setExitView("mc")}
+          title={mcCalibration ? "MC-calibrated exits: ATR-floor SL + MFE-based TPs + tier multipliers" : "No MC calibration — run exit_strategy.py recalibrate first"}
+        >
+          MC {mcCalibration ? "✓" : "–"}
+        </button>
       </div>}
 
       {/* ── Body ──────────────────────────────────────────────────────────── */}
@@ -992,11 +1282,11 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
                 ) : tradesToShow.map((s) => {
                   const ann = annotations[s.key];
                   const dirColor = s.direction === "Long" ? "#26c87a" : "#ef5350";
-                  const rlColor = s.riskLevel === "safe" ? "#26c87a" : s.riskLevel === "risky" ? "#f59e0b" : "#ef4444";
+                  const rlColor = s.riskLevel === "safeplus" ? "#a78bfa" : s.riskLevel === "safe" ? "#26c87a" : s.riskLevel === "risky" ? "#f59e0b" : "#ef4444";
                   const ocColor = s.outcome === "Win" ? "#26c87a" : s.outcome === "Loss" ? "#ef5350" : MW.muted;
                   const dt = new Date(s.time * 1000);
-                  const dateStr = dt.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-                  const timeStr = dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true });
+                  const dateStr = dt.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" });
+                  const timeStr = dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "America/New_York" });
                   return (
                     <div key={s.key} style={{ padding: "10px 12px", borderRadius: 6, background: MW.panel, border: `1px solid ${MW.border}` }}>
                       {/* Row 1: meta */}
@@ -1052,7 +1342,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
               <thead style={{ position: "sticky", top: 0, background: MW.panel, zIndex: 2 }}>
                 <tr style={{ borderBottom: `1px solid ${MW.border}` }}>
-                  {["", "Date", "Time", "Dir", "Risk", "Entry", "TP1", "SL", "W/L", "P&L", ""].map((h, i) => (
+                  {["", "Date", "Time", "Dir", "Risk", "Entry", "TP1", "SL", "R:R", "W/L", "P&L", ""].map((h, i) => (
                     <th key={i} style={{ padding: "5px 8px", textAlign: "left", fontSize: 9, color: MW.muted, fontWeight: 600, whiteSpace: "nowrap" }}>{h}</th>
                   ))}
                 </tr>
@@ -1074,9 +1364,19 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
                         opacity: s.riskLevel === "riskiest" ? 0.65 : 1,
                       }}
                     >
-                      {/* Bad trade marker */}
-                      <td style={{ padding: "5px 4px 5px 10px", width: 12 }}>
-                        {ann?.markedBad && <span style={{ color: "#ef5350", fontSize: 8 }}>●</span>}
+                      {/* Bad trade marker + confidence */}
+                      <td style={{ padding: "5px 4px 5px 10px", width: 28 }}>
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1 }}>
+                          {ann?.markedBad && <span style={{ color: "#ef5350", fontSize: 8 }}>●</span>}
+                          {s.confidence != null && (
+                            <span style={{
+                              fontSize: 8, fontWeight: 700,
+                              color: s.confidence >= 90 ? "#26c87a" : s.confidence >= 75 ? "#f59e0b" : "#6b7280",
+                            }}>
+                              {s.confidence}%
+                            </span>
+                          )}
+                        </div>
                       </td>
                       {/* Date */}
                       <td style={{ padding: "5px 8px", color: MW.muted, whiteSpace: "nowrap", fontSize: 10 }}>
@@ -1092,19 +1392,16 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
                           {fmtTime(s.time)}
                         </span>
                       </td>
-                      {/* Direction + tabletop badge */}
+                      {/* Direction */}
                       <td style={{ padding: "5px 8px", color: s.direction === "Long" ? "#26c87a" : "#ef5350", fontWeight: 700, fontSize: 10 }}>
                         <span>{s.direction === "Long" ? "▲ L" : "▼ S"}</span>
-                        {s.signalType === "pure_tabletop" && (
-                          <span title="Pure Tabletop" style={{ marginLeft: 4, fontSize: 8, padding: "0 3px", borderRadius: 2, background: "rgba(245,158,11,0.18)", color: "#f59e0b", border: "1px solid rgba(245,158,11,0.4)", verticalAlign: "middle" }}>⊤</span>
-                        )}
-                        {s.signalType === "side_tabletop" && (
-                          <span title="Side-Entry Tabletop" style={{ marginLeft: 4, fontSize: 8, padding: "0 3px", borderRadius: 2, background: "rgba(34,211,238,0.15)", color: "#22d3ee", border: "1px solid rgba(34,211,238,0.35)", verticalAlign: "middle" }}>⊏</span>
-                        )}
                       </td>
-                      {/* Risk */}
+                      {/* Risk + MZ badge */}
                       <td style={{ padding: "5px 8px" }}>
-                        <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: rl + "18", color: rl }}>{s.riskLevel}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: rl + "18", color: rl }}>{s.riskLevel}</span>
+                          {s.milkOk && <span style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: "rgba(245,158,11,0.15)", color: "#f59e0b", fontWeight: 700 }}>MZ</span>}
+                        </div>
                       </td>
                       {/* Entry */}
                       <td style={{ padding: "5px 8px", color: "#e2e8f0" }}>{s.price.toFixed(2)}</td>
@@ -1112,6 +1409,14 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
                       <td style={{ padding: "5px 8px", color: "#67e8f9" }}>{s.tp1.toFixed(2)}</td>
                       {/* SL */}
                       <td style={{ padding: "5px 8px", color: "#f87171" }}>{s.sl.toFixed(2)}</td>
+                      {/* R:R (TP1/SL) */}
+                      <td style={{ padding: "5px 8px", color: MW.muted, fontSize: 10 }}>
+                        {(() => {
+                          const sl = Math.abs(s.sl - s.price);
+                          const tp = Math.abs(s.tp1 - s.price);
+                          return sl > 0 ? (tp / sl).toFixed(1) : "—";
+                        })()}
+                      </td>
                       {/* W/L badge */}
                       <td style={{ padding: "5px 6px" }}>
                         {s.outcome === "Open" ? (
@@ -1172,6 +1477,9 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           </div>
         )}
       </div>}
+
+      {/* ── Monte Carlo Tab ──────────────────────────────────────────────────── */}
+      {activeTab === "montecarlo" && <MonteCarloTab cal={mcCalibration ?? null} />}
 
       {/* ── Learn toast ───────────────────────────────────────────────────────── */}
       {learnToast && (
@@ -1271,7 +1579,223 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
       <style>{`
         input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.5); cursor: pointer; }
         input[type="number"]::-webkit-inner-spin-button { opacity: 0.4; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
+    </div>
+  );
+}
+
+// ── Monte Carlo Tab ───────────────────────────────────────────────────────────
+function MonteCarloTab({ cal }: { cal: MCCalibration | null }) {
+  const [selTier, setSelTier] = useState<"safe" | "risky" | "riskiest">("safe");
+  const MW2 = { bg: "#05080d", panel: "#090d14", border: "#1a2535", text: "#c8d8e8", muted: "#4a6080", accent: "#42a5f5" };
+  const tierColor = (t: string) => t === "safe" ? "#26c87a" : t === "risky" ? "#f59e0b" : "#ef5350";
+  const REF_ATR = 8.0;
+  const TICK_SZ = 0.25;
+  const pts = (x: number) => (x * REF_ATR).toFixed(2);
+  const ticks = (x: number) => Math.round(x * REF_ATR / TICK_SZ);
+
+  if (!cal) {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, padding: 40, color: MW2.muted, fontFamily: "'Trebuchet MS', monospace" }}>
+        <div style={{ fontSize: 32 }}>📊</div>
+        <div style={{ fontSize: 13, color: MW2.text, textAlign: "center" }}>No MC calibration found</div>
+        <div style={{ fontSize: 11, color: MW2.muted, textAlign: "center", maxWidth: 320, lineHeight: 1.7 }}>
+          Run the calibration engine to generate exit strategy data:
+        </div>
+        <code style={{ fontSize: 10, padding: "6px 12px", borderRadius: 4, background: "#0d1420", border: "1px solid #1a2535", color: "#22d3ee" }}>
+          python exit_strategy.py recalibrate
+        </code>
+      </div>
+    );
+  }
+
+  const c = cal[selTier];
+  const mult = MC_TIER_MULT[selTier] ?? 1.0;
+  const finalSl = Math.max(MC_ATR_FLOOR, c.mae_p70_atr || 0, c.sl_atr) * mult;
+  const tp1Use  = c.mfe_p50_atr > 0 ? c.mfe_p50_atr : c.tp1_atr;
+  const tp2Use  = c.mfe_p75_atr > 0 ? c.mfe_p75_atr : c.tp2_atr;
+  const rr1 = finalSl > 0 ? tp1Use / finalSl : 0;
+  const rr2 = finalSl > 0 ? tp2Use / finalSl : 0;
+  const evDol = c.ev_tp1 * (REF_ATR / TICK_SZ) * 1.25;
+
+  const firstCal = Object.values(cal)[0];
+  const dateRange  = firstCal?.date_range ?? "";
+  const calAt      = firstCal?.calibrated_at?.slice(0, 19) ?? "";
+  const totalN     = Object.values(cal).reduce((s, t) => s + t.sample_count, 0);
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", fontFamily: "'Trebuchet MS', monospace", color: MW2.text }}>
+
+      {/* Header banner */}
+      <div style={{ padding: "12px 16px", borderBottom: "1px solid #1a2535", background: "#070b11" }}>
+        <div style={{ fontSize: 13, fontWeight: 800, color: "#22d3ee", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 4 }}>
+          Monte Carlo Exit Calibration
+        </div>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 10, color: MW2.muted }}>
+          {dateRange && <span>Range: <span style={{ color: MW2.text }}>{dateRange}</span></span>}
+          {calAt     && <span>Calibrated: <span style={{ color: MW2.text }}>{calAt}</span></span>}
+          <span>Total signals: <span style={{ color: MW2.text }}>{totalN}</span></span>
+          <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.25)", color: "#22d3ee" }}>
+            ref ATR = {REF_ATR} pts
+          </span>
+        </div>
+      </div>
+
+      {/* Tier selector */}
+      <div style={{ display: "flex", gap: 8, padding: "10px 16px", borderBottom: "1px solid #1a2535" }}>
+        {(["safe", "risky", "riskiest"] as const).map(t => {
+          const tc = cal[t];
+          return (
+            <button key={t} onClick={() => setSelTier(t)} style={{
+              padding: "5px 14px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
+              background: selTier === t ? tierColor(t) + "22" : "transparent",
+              border: `1px solid ${selTier === t ? tierColor(t) + "99" : "#1a2535"}`,
+              color: selTier === t ? tierColor(t) : MW2.muted,
+              fontFamily: "'Trebuchet MS', monospace", textTransform: "uppercase",
+            }}>
+              {t} <span style={{ fontSize: 9, marginLeft: 4, color: MW2.muted }}>n={tc?.sample_count ?? 0}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 14 }}>
+
+        {/* Exit levels overview */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+          {[
+            { label: "Stop Loss", val: `${pts(finalSl)} pts`, sub: `${ticks(finalSl)} ticks · ${finalSl.toFixed(2)}× ATR`, color: "#f87171" },
+            { label: "TP1  (50% exit)", val: `${pts(tp1Use)} pts`, sub: `${ticks(tp1Use)} ticks · R:R ${rr1.toFixed(2)}`, color: "#67e8f9" },
+            { label: "TP2  (50% exit)", val: `${pts(tp2Use)} pts`, sub: `${ticks(tp2Use)} ticks · R:R ${rr2.toFixed(2)}`, color: "#22d3ee" },
+          ].map(({ label, val, sub, color }) => (
+            <div key={label} style={{ padding: "10px 12px", borderRadius: 6, background: MW2.panel, border: `1px solid ${color}33`, textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: MW2.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{label}</div>
+              <div style={{ fontSize: 16, fontWeight: 800, color }}>{val}</div>
+              <div style={{ fontSize: 9, color: MW2.muted, marginTop: 2 }}>{sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Win rate + EV */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+          {[
+            { label: "Win Rate (TP1)", val: `${(c.win_rate_tp1 * 100).toFixed(1)}%`, color: c.win_rate_tp1 >= 0.5 ? "#26c87a" : "#ef5350" },
+            { label: "Win Rate (TP2)", val: `${(c.win_rate_tp2 * 100).toFixed(1)}%`, color: c.win_rate_tp2 >= 0.5 ? "#26c87a" : "#ef5350" },
+            { label: "EV / Trade", val: `$${evDol >= 0 ? "+" : ""}${evDol.toFixed(2)}`, color: evDol >= 0 ? "#26c87a" : "#ef5350" },
+          ].map(({ label, val, color }) => (
+            <div key={label} style={{ padding: "10px 12px", borderRadius: 6, background: MW2.panel, border: "1px solid #1a2535", textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: MW2.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{label}</div>
+              <div style={{ fontSize: 16, fontWeight: 800, color }}>{val}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* 3-Step SL Methodology */}
+        <div style={{ padding: "12px 14px", borderRadius: 6, background: "#070b11", border: "1px solid #1a2535" }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#f59e0b", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
+            3-Step Stop Loss Methodology
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 11 }}>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(245,158,11,0.05)", border: "1px solid rgba(245,158,11,0.15)" }}>
+              <span style={{ color: "#f59e0b", fontWeight: 700, minWidth: 52 }}>Step A</span>
+              <span style={{ color: MW2.muted }}>ATR floor: min 1.25× ATR</span>
+              <span style={{ marginLeft: "auto", color: MW2.text }}>= {pts(MC_ATR_FLOOR)} pts ({ticks(MC_ATR_FLOOR)} t)</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(245,158,11,0.05)", border: "1px solid rgba(245,158,11,0.15)" }}>
+              <span style={{ color: "#f59e0b", fontWeight: 700, minWidth: 52 }}>Step B</span>
+              <span style={{ color: MW2.muted }}>MC MAE-p70: {(c.mae_p70_atr || 0).toFixed(2)}× ATR</span>
+              <span style={{ marginLeft: "auto", color: MW2.text }}>= {pts(c.mae_p70_atr || 0)} pts ({ticks(c.mae_p70_atr || 0)} t)</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(245,158,11,0.05)", border: "1px solid rgba(245,158,11,0.15)" }}>
+              <span style={{ color: "#f59e0b", fontWeight: 700, minWidth: 52 }}>Step C</span>
+              <span style={{ color: MW2.muted }}>Tier multiplier ({selTier}): {mult.toFixed(2)}×</span>
+              <span style={{ marginLeft: "auto", color: MW2.text }}>base × {mult.toFixed(2)}</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(34,211,238,0.06)", border: "1px solid rgba(34,211,238,0.2)" }}>
+              <span style={{ color: "#22d3ee", fontWeight: 700, minWidth: 52 }}>Result</span>
+              <span style={{ color: MW2.muted }}>max(A, B, MC-SL) × C</span>
+              <span style={{ marginLeft: "auto", color: "#22d3ee", fontWeight: 700 }}>= {pts(finalSl)} pts ({ticks(finalSl)} t)</span>
+            </div>
+          </div>
+        </div>
+
+        {/* TP methodology */}
+        <div style={{ padding: "12px 14px", borderRadius: 6, background: "#070b11", border: "1px solid #1a2535" }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#67e8f9", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
+            MFE-Based Take Profits + Partial Exit Plan
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 11 }}>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(103,232,249,0.05)", border: "1px solid rgba(103,232,249,0.15)" }}>
+              <span style={{ color: "#67e8f9", fontWeight: 700, minWidth: 52 }}>TP1</span>
+              <span style={{ color: MW2.muted }}>MFE-p50 {c.mfe_p50_atr > 0 ? `= ${c.mfe_p50_atr.toFixed(2)}× ATR` : `(fallback: ${c.tp1_atr.toFixed(2)}× ATR)`}</span>
+              <span style={{ marginLeft: "auto", color: "#67e8f9" }}>{pts(tp1Use)} pts · Close 50% here</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.15)" }}>
+              <span style={{ color: "#22d3ee", fontWeight: 700, minWidth: 52 }}>BE</span>
+              <span style={{ color: MW2.muted }}>Move SL to breakeven once TP1 hit</span>
+              <span style={{ marginLeft: "auto", color: MW2.muted }}>entry price</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, padding: "6px 10px", borderRadius: 4, background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.15)" }}>
+              <span style={{ color: "#22d3ee", fontWeight: 700, minWidth: 52 }}>TP2</span>
+              <span style={{ color: MW2.muted }}>MFE-p75 {c.mfe_p75_atr > 0 ? `= ${c.mfe_p75_atr.toFixed(2)}× ATR` : `(fallback: ${c.tp2_atr.toFixed(2)}× ATR)`}</span>
+              <span style={{ marginLeft: "auto", color: "#22d3ee" }}>{pts(tp2Use)} pts · Close remaining 50%</span>
+            </div>
+          </div>
+        </div>
+
+        {/* CI + MC stats */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div style={{ padding: "10px 12px", borderRadius: 6, background: MW2.panel, border: "1px solid #1a2535" }}>
+            <div style={{ fontSize: 9, color: MW2.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>95% Confidence Interval (EV)</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: MW2.text }}>
+              [{c.ev_ci_low >= 0 ? "+" : ""}{c.ev_ci_low.toFixed(3)}, {c.ev_ci_high >= 0 ? "+" : ""}{c.ev_ci_high.toFixed(3)}] ATR
+            </div>
+            <div style={{ fontSize: 9, color: MW2.muted, marginTop: 2 }}>
+              {c.ev_ci_low > 0 ? "✓ Positive EV with 95% confidence" : "⚠ EV crosses zero — uncertain edge"}
+            </div>
+          </div>
+          <div style={{ padding: "10px 12px", borderRadius: 6, background: MW2.panel, border: "1px solid #1a2535" }}>
+            <div style={{ fontSize: 9, color: MW2.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Sample Statistics</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: MW2.text }}>n = {c.sample_count} signals</div>
+            <div style={{ fontSize: 9, color: MW2.muted, marginTop: 2 }}>
+              {c.sample_count >= 50 ? "HIGH confidence" : c.sample_count >= 20 ? "MEDIUM confidence" : "LOW confidence — needs more data"}
+            </div>
+          </div>
+        </div>
+
+        {/* Top-5 MC grid cells */}
+        {c.top5 && c.top5.length > 0 && (
+          <div style={{ padding: "12px 14px", borderRadius: 6, background: "#070b11", border: "1px solid #1a2535" }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: "#a78bfa", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>
+              Top-5 MC Grid Cells (bootstrap optimum)
+            </div>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid #1a2535" }}>
+                  {["#", "TP (×ATR)", "SL (×ATR)", "EV", "Win%"].map(h => (
+                    <th key={h} style={{ padding: "3px 8px", textAlign: "left", fontSize: 9, color: MW2.muted, fontWeight: 600 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {c.top5.map((row, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid #0d1420", background: i === 0 ? "rgba(167,139,250,0.05)" : "transparent" }}>
+                    <td style={{ padding: "4px 8px", color: i === 0 ? "#a78bfa" : MW2.muted }}>{i + 1}</td>
+                    <td style={{ padding: "4px 8px", color: "#22d3ee" }}>{row.tp_atr.toFixed(2)}×</td>
+                    <td style={{ padding: "4px 8px", color: "#f87171" }}>{row.sl_atr.toFixed(2)}×</td>
+                    <td style={{ padding: "4px 8px", color: row.ev >= 0 ? "#26c87a" : "#ef5350", fontWeight: i === 0 ? 700 : 400 }}>
+                      {row.ev >= 0 ? "+" : ""}{row.ev.toFixed(4)}
+                    </td>
+                    <td style={{ padding: "4px 8px", color: row.wr >= 0.5 ? "#26c87a" : "#ef5350" }}>{(row.wr * 100).toFixed(1)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+      </div>
     </div>
   );
 }
@@ -1339,18 +1863,45 @@ interface DetailProps {
   footprintAlert?: { pocPrice: number; message: string }; // FOOTPRINT-UI:
 }
 
+const FEEDBACK_REASONS = [
+  "", // no reason (default)
+  "Zone invalidated",
+  "Against dominant trend",
+  "Chop / no clear direction",
+  "Missed entry timing",
+  "FUD / news event",
+  "Wrong timeframe",
+  "Late entry",
+  "SL too tight",
+  "Other",
+] as const;
+
 function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, onSave, onViewOnChart, onClose, candles, footprintAlert }: DetailProps) { // FOOTPRINT-UI:
-  const isFpDegraded = s.riskLevel === "safe" && s.reclassifyReason?.includes("Footprint"); // FIX: SAFE with no/partial footprint data
+  const isFpDegraded = false; // reclassifyReason removed
   const rlC = s.riskLevel === "safe" ? (isFpDegraded ? "rgba(38,200,122,0.65)" : "#26c87a") : s.riskLevel === "risky" ? "#f59e0b" : "#ef4444"; // FIX: 65% opacity for footprint-degraded SAFE
   const ocC = s.outcome === "Win" ? "#26c87a" : s.outcome === "Loss" ? "#ef5350" : MW.muted;
   const isBad = annotation?.markedBad ?? false;
 
+  const [feedbackReason, setFeedbackReason] = useState((annotation as any)?.reason ?? "");
   const [teachState, setTeachState]   = useState<"idle" | "loading" | "done" | "error">("idle");
   const [teachLesson, setTeachLesson] = useState("");
 
+  const saveWithServer = (ann: Annotation) => {
+    onSave(ann);
+    fetch("/api/signals/label", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        key: s.key, time: s.time, direction: s.direction,
+        riskLevel: s.riskLevel, outcome: s.outcome,
+        isBad: ann.markedBad, reason: ann.reason ?? feedbackReason, note: ann.note,
+      }),
+    }).catch(() => {});
+  };
+
   const handleTeach = async () => {
     if (!editNote.trim()) return;
-    onSave({ note: editNote, markedBad: isBad });
+    saveWithServer({ note: editNote, markedBad: isBad, reason: feedbackReason });
     setTeachState("loading");
     try {
       const r = await fetch("/api/ai/teach-signal", {
@@ -1421,6 +1972,20 @@ function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, 
       {/* Why signal fired */}
       <div>
         <div style={{ fontSize: 9, color: MW.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 7 }}>Why Signal Fired</div>
+        {/* Zones loaded badge — tells user whether dated milk zones were active at compute time */}
+        <div style={{ marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 3,
+            background: s.zonesLoaded ? "rgba(38,200,122,0.12)" : "rgba(100,116,139,0.12)",
+            color: s.zonesLoaded ? "#26c87a" : MW.muted,
+            border: `1px solid ${s.zonesLoaded ? "rgba(38,200,122,0.35)" : "rgba(100,116,139,0.25)"}`,
+            textTransform: "uppercase", letterSpacing: "0.06em",
+          }}>
+            {s.zonesLoaded ? "Zones Active" : "No Zones Loaded"}
+          </span>
+          {!s.zonesLoaded && s.milkOk && (
+            <span style={{ fontSize: 9, color: "#f59e0b" }}>⚠ zone data unavailable at signal time</span>
+          )}
+        </div>
         {[
           { ok: true,                  label: "Primary Vector",             sub: "always required"           },
           { ok: s.milkOk,              label: "Milk Zone",                  sub: "FVG / Order Block / Struct" },
@@ -1434,16 +1999,6 @@ function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, 
             </div>
           </div>
         ))}
-        {/* SAFE bonus: pattern confluence (placeholder — fires when pattern recognition is implemented) */}
-        {s.riskLevel === "safe" && ( // FIX: removed false && — pattern confluence section now active for SAFE signals
-          <div style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 5 }}>
-            <span style={{ fontSize: 13, lineHeight: 1, color: "#a78bfa", marginTop: 1 }}>✓</span>
-            <div>
-              <div style={{ fontSize: 11, color: "#a78bfa" }}>Pattern confluence present</div>
-              <div style={{ fontSize: 9, color: MW.muted }}>additional confirmation</div>
-            </div>
-          </div>
-        )}
         {/* RISKIEST warning: no MilkZone or Vector confirmed */}
         {s.riskLevel === "riskiest" && (
           <div style={{ marginTop: 4, fontSize: 10, color: "#f87171", background: "rgba(239,68,68,0.07)", borderRadius: 4, padding: "5px 8px", border: "1px solid rgba(239,68,68,0.18)" }}>
@@ -1560,11 +2115,6 @@ function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, 
             {s.riskLevel === "safe" ? "Zone + Vector + Footprint confirmed" : s.riskLevel === "risky" ? "One of Zone / Vector / Footprint" : "No Zone, Vector, or Footprint"} {/* FIX: updated tier descriptions to include Footprint */}
           </span>
         </div>
-        {s.reclassifyReason && (
-          <div style={{ fontSize: 10, color: "#fbbf24", background: "rgba(245,158,11,0.07)", borderRadius: 4, padding: "5px 8px", border: "1px solid rgba(245,158,11,0.18)", marginBottom: 4 }}>
-            ⚠ {s.reclassifyReason}
-          </div>
-        )}
         <div style={{ display: "flex", gap: 12, fontSize: 10 }}>
           <span style={{ color: MW.muted }}>Stop: <span style={{ color: "#f87171" }}>{Math.abs(s.sl - s.price).toFixed(2)} pts</span></span>
           <span style={{ color: MW.muted }}>Target: <span style={{ color: "#22d3ee" }}>{Math.abs(s.tp2 - s.price).toFixed(2)} pts</span></span>
@@ -1587,21 +2137,30 @@ function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, 
       {/* Edit mode annotation */}
       {editMode && (
         <div>
-          <div style={{ fontSize: 9, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Trade Note</div>
+          <div style={{ fontSize: 9, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Trade Feedback</div>
+          {/* Reason dropdown */}
+          <select
+            value={feedbackReason}
+            onChange={e => setFeedbackReason(e.target.value)}
+            style={{ width: "100%", padding: "5px 8px", borderRadius: 4, fontSize: 11, marginBottom: 6, background: "#0d1420", border: `1px solid ${MW.border}`, color: feedbackReason ? MW.text : MW.muted, fontFamily: "'Trebuchet MS', monospace" }}
+          >
+            <option value="">Reason for review…</option>
+            {FEEDBACK_REASONS.slice(1).map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
           <textarea
             value={editNote}
             onChange={e => { setEditNote(e.target.value); if (teachState !== "idle") setTeachState("idle"); }}
-            placeholder="Describe why this trade was bad, what you noticed, what the market was doing..."
+            placeholder="Additional notes — what you noticed, what the market was doing..."
             rows={3}
             style={{ width: "100%", padding: "6px 8px", borderRadius: 4, fontSize: 11, resize: "vertical", boxSizing: "border-box", background: "#0d1420", border: `1px solid ${MW.border}`, color: MW.text, fontFamily: "'Trebuchet MS', monospace", outline: "none" }}
           />
           <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
             <button
-              onClick={() => onSave({ note: editNote, markedBad: true })}
+              onClick={() => saveWithServer({ note: editNote, markedBad: true, reason: feedbackReason })}
               style={{ flex: 1, padding: "4px 0", borderRadius: 4, fontSize: 11, cursor: "pointer", fontFamily: "'Trebuchet MS', monospace", background: isBad ? "rgba(239,83,80,0.18)" : "transparent", border: `1px solid ${isBad ? "#ef5350" : MW.border}`, color: isBad ? "#ef5350" : MW.muted }}
             >{isBad ? "● Marked Bad" : "Mark as Bad"}</button>
             <button
-              onClick={handleTeach}
+              onClick={() => { saveWithServer({ note: editNote, markedBad: isBad, reason: feedbackReason }); handleTeach(); }}
               disabled={teachState === "loading" || !editNote.trim()}
               style={{
                 flex: 1, padding: "4px 0", borderRadius: 4, fontSize: 11, cursor: teachState === "loading" ? "default" : "pointer",
@@ -1633,9 +2192,10 @@ function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, 
       )}
 
       {/* Annotation display (read mode) */}
-      {!editMode && annotation && (annotation.note || annotation.markedBad) && (
+      {!editMode && annotation && (annotation.note || annotation.markedBad || annotation.reason) && (
         <div style={{ borderTop: `1px solid ${MW.border}`, paddingTop: 8 }}>
           {annotation.markedBad && <div style={{ fontSize: 10, color: "#ef5350", fontWeight: 600, marginBottom: 3 }}>● Marked as bad trade</div>}
+          {annotation.reason && <div style={{ fontSize: 10, color: "#f59e0b", marginBottom: 3 }}>Reason: {annotation.reason}</div>}
           {annotation.note && <div style={{ fontSize: 11, color: MW.muted, lineHeight: 1.6 }}>{annotation.note}</div>}
         </div>
       )}

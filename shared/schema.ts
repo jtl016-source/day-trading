@@ -80,7 +80,7 @@ export const signalHistory = sqliteTable("signal_history", {
   sl: real("sl").notNull(),
   outcome: text("outcome"),
   patternBars: integer("pattern_bars"),
-  footprintReading: text("footprint_reading"), // FOOTPRINT-STRATEGY: JSON FootprintReading, nullable
+  footprintReading: text("footprint_reading"),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 }, (t) => [
   uniqueIndex("signal_history_sym_iv_ts_dir").on(t.symbol, t.interval, t.timestamp, t.direction),
@@ -94,8 +94,8 @@ export const discordMessages = sqliteTable("discord_messages", {
   authorId:    text("author_id").notNull(),
   content:     text("content").notNull(),
   postedAt:    integer("posted_at").notNull(),
-  attachments: text("attachments"),  // JSON: [{url,filename,contentType,size,width?,height?}]
-  embeds:      text("embeds"),        // JSON: Discord embed objects (link previews, images)
+  attachments: text("attachments"),
+  embeds:      text("embeds"),
   savedAt:     text("saved_at").notNull(),
   hasSignal:   integer("has_signal").notNull().default(0),
   historical:  integer("historical").notNull().default(0),
@@ -144,11 +144,10 @@ export const learningSessions = sqliteTable("learning_sessions", {
   symbol:      text("symbol").notNull().default("MES"),
   interval:    text("interval").notNull().default("5m"),
   signalCount: integer("signal_count").notNull().default(0),
-  summary:     text("summary"),          // JSON: LearningLog
+  summary:     text("summary"),
   createdAt:   text("created_at").default(sql`(datetime('now'))`),
 });
 
-// SELF-LEARNING: machine-generated strategy rule proposals, approved/rejected by user
 export const strategyProposals = sqliteTable("strategy_proposals", {
   id:             integer("id").primaryKey({ autoIncrement: true }),
   strategyId:     text("strategy_id").notNull(),
@@ -159,7 +158,7 @@ export const strategyProposals = sqliteTable("strategy_proposals", {
   confidence:     real("confidence").notNull().default(0),
   currentValue:   text("current_value").notNull(),
   proposedValue:  text("proposed_value").notNull(),
-  status:         text("status").notNull().default("pending"),  // "pending" | "approved" | "rejected"
+  status:         text("status").notNull().default("pending"),
   createdAt:      text("created_at").default(sql`(datetime('now'))`),
   reviewedAt:     text("reviewed_at"),
 });

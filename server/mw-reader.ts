@@ -6,17 +6,17 @@
  * upserts into cached_candles so the existing chart data flow works unchanged,
  * and polls every 2 s to broadcast live updates via the shared WebSocket.
  *
- * File format (confirmed via hex analysis of MESM6.CME files):
- *   Header : 86 bytes  (skipped)
+ * File format (confirmed via hex analysis of actual MESH6/MESM6.CME bar files):
+ *   Header : 48 bytes  (skipped)
  *   Records: 30 bytes each
- *     [0..1]   uint16BE — bar sequence number (minutes from file start)
- *     [2..5]   float32BE — open
- *     [6..9]   float32BE — high
- *     [10..13] float32BE — low
- *     [14..17] float32BE — close
- *     [18..21] float32BE — volume
- *     [22..29] 8 bytes   — unknown (ignored)
- *   bar_time_sec = (filename_ms + seq * 60_000) / 1000
+ *     [0..3]   float32BE — open
+ *     [4..7]   float32BE — high
+ *     [8..11]  float32BE — low
+ *     [12..15] float32BE — close
+ *     [16..19] float32BE — volume
+ *     [20..27] 8 bytes   — unknown (zeroes, ignored)
+ *     [28..29] uint16BE  — minuteOffset (minutes since file epoch → bar timestamp)
+ *   bar_time_sec = floor(filename_ms / 1000) + minuteOffset * 60
  */
 
 import fs   from "fs";
@@ -28,6 +28,16 @@ import { type Express }    from "express";
 import { type Server as HttpServer } from "http";
 
 // ── Config ────────────────────────────────────────────────────────────────────
+
+// Tick-size sanity check for applyTick — rejects ticks that deviate too many
+// points from the last known good price (catches corrupt tick-file bytes).
+const TICK_SIZE              = 0.25;   // MES/ES minimum tick = 0.25 index points
+const DEFAULT_TICK_SIZE      = 0.25;
+// 600 ticks = 150 pts. Catches corrupt float32 misreads (~796 ticks / 199 pts seen in practice)
+// while allowing legitimate 100-pt single-tick gaps during extreme volatility.
+// First tick after a long session gap (>30 min) bypasses this check entirely (see applyTick).
+const MAX_TICK_DEVIATION     = 600;
+const DEFAULT_MAX_TICK_DEVIATION = 600;
 
 const MW_DATA_ROOT = path.join(
   process.env.USERPROFILE ?? "C:\\Users\\jacks",
@@ -42,13 +52,23 @@ const MW_INSTRUMENTS: { symbol: string; dirPattern: RegExp; activeDir: string }[
   { symbol: "MES", dirPattern: /^MES[A-Z]\d+\.CME$/, activeDir: "MESM6.CME" },
 ];
 
-/** Return all subdirectories under MW_DATA_ROOT whose names match pattern. */
+/** Return all subdirectories under MW_DATA_ROOT whose names match pattern.
+ *  Only returns dirs that have at least one .tick_data file — MW writes tick files only
+ *  for contracts it is actively tracking (current or recently expired front-month).
+ *  This naturally excludes deferred contracts like MESU6 whose prices differ from the
+ *  active front-month by the forward roll premium, which would corrupt merged bar data. */
 function getContractDirs(pattern: RegExp): string[] {
   try {
     return fs.readdirSync(MW_DATA_ROOT)
       .filter(d => pattern.test(d))
       .map(d => path.join(MW_DATA_ROOT, d))
-      .filter(d => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
+      .filter(d => {
+        try {
+          if (!fs.statSync(d).isDirectory()) return false;
+          // Must have at least one tick file — signals this was/is an active contract
+          return fs.readdirSync(d).some(f => f.endsWith(".tick_data"));
+        } catch { return false; }
+      });
   } catch { return []; }
 }
 
@@ -57,11 +77,11 @@ function getContractDirs(pattern: RegExp): string[] {
  * (preferring the bar with higher volume = front-month contract), then
  * wipe + re-insert the DB rows for `symbol`.
  */
-// How far back to read tick files for intraday gap-filling.
-// Bar files cover history densely (57+ bars/hr) up through the most recent weekly file.
-// Tick files are only needed for the last ~1 week (the period after the latest dense bar file).
-// 8 days × 24 files/day = ~192 files ≈ 125 MB — reads in < 2 s on any modern disk.
-const TICK_HISTORY_MS = 8 * 24 * 3600 * 1000;
+// How far back to read tick files for gap-filling.
+// Bar files are sparse (weekly summaries, ~15 bars/file). Tick files contain the actual
+// minute-by-minute trading data. MW keeps ~9 months of hourly tick files per contract.
+// 300 days × 24 files/day × both contracts = ~14k files — reads in ~60s on first load.
+const TICK_HISTORY_MS = 300 * 24 * 3600 * 1000;
 
 async function loadMultiDir(symbol: string, instrDirs: string[]) {
   // ── Step 1: Load all bar_data1 files (authoritative OHLCV) ─────────────────
@@ -86,29 +106,28 @@ async function loadMultiDir(symbol: string, instrDirs: string[]) {
     if (!ex || b.volume > ex.volume) minMap.set(b.timeSec, b);
   }
 
-  // ── Step 2: Fill gaps with recent tick files ────────────────────────────────
-  // Tick files have tick-level density (thousands of records/hour) but no per-tick
-  // timestamps — we distribute them proportionally across the 1-hour file window.
-  // Bar file data takes priority; tick data only fills minutes not already covered.
-  const tickCutoffMs = Date.now() - TICK_HISTORY_MS;
-  let totalTickFiles = 0;
-
-  for (const instrDir of instrDirs) {
-    const tickFiles = getTickFiles(instrDir, tickCutoffMs);
-    totalTickFiles += tickFiles.length;
-    for (const fp of tickFiles) {
-      for (const b of parseTickFileAsBars(fp)) {
-        if (!minMap.has(b.timeSec)) minMap.set(b.timeSec, b);
+  // ── Step 2: Detect and log intraday gaps (no synthetic fill) ─────────────
+  // Only warn for genuine intraday gaps (> 2 min and < 55 min).
+  // Excludes: overnight/weekend (> 4h), CME daily maintenance window (~61 min).
+  {
+    const sortedTimes = Array.from(minMap.keys()).sort((a, b) => a - b);
+    for (let i = 1; i < sortedTimes.length; i++) {
+      const delta = sortedTimes[i] - sortedTimes[i - 1];
+      if (delta > 120 && delta < 55 * 60) {
+        const ts = new Date(sortedTimes[i - 1] * 1000).toISOString();
+        console.warn(`[MW-READER] Gap at ${ts}: no bar data available, skipped`);
       }
     }
   }
 
-  if (totalTickFiles > 0) {
-    console.log(`[mw-reader] Loaded ${totalTickFiles} tick files for gap-filling`);
-  }
-
   // ── Step 3: Aggregate and write to DB ──────────────────────────────────────
-  const bars1 = Array.from(minMap.values()).sort((a, b) => a.timeSec - b.timeSec);
+  // Strip future-dated bars: sparse contract bar files (MESU6, etc.) sometimes contain
+  // placeholder bars for the remainder of the contract life. Cap at current time + 1h
+  // to avoid pushing the chart's default view into an empty future region.
+  const nowSec = Math.floor(Date.now() / 1000) + 3600;
+  const bars1 = Array.from(minMap.values())
+    .filter(b => b.timeSec <= nowSec)
+    .sort((a, b) => a.timeSec - b.timeSec);
   const bars5  = aggregate(bars1, 5);
   const bars60 = aggregate(bars1, 60);
 
@@ -137,12 +156,15 @@ async function loadMultiDir(symbol: string, instrDirs: string[]) {
   }
 
   console.log(
-    `[mw-reader] ${symbol}: ${totalBarFiles} bar files + ${totalTickFiles} tick files → ` +
+    `[mw-reader] ${symbol}: ${totalBarFiles} bar files → ` +
     `${bars1.length} 1-min, ${bars5.length} 5-min, ${bars60.length} 60-min bars`,
   );
 }
 
-const HEADER_SIZE  = 86;
+// bar_data1 format: 48-byte header, then 30-byte records
+// Each record: open(f32) high(f32) low(f32) close(f32) vol(f32) 8-padding minuteOffset(u16)
+// minuteOffset = minutes since file epoch — used to compute the bar's exact timestamp.
+const HEADER_SIZE  = 48;
 const RECORD_SIZE  = 30;
 const POLL_INTERVAL_MS = 1_000;
 
@@ -181,12 +203,17 @@ function parseTickFileAsBars(filePath: string): MinBar[] {
 
   const minuteMap = new Map<number, MinBar>();
 
+  // Cap elapsed time to [60s, 3600s] — prevents future-dated ticks for the current hour's file.
+  // Old files: Date.now() - fileMs > 3_600_000 → clamp to full hour (correct).
+  // Current file: elapsed < 3_600_000 → distribute only across the portion of the hour that has passed.
+  const elapsedMs = Math.max(60_000, Math.min(3_600_000, Date.now() - fileMs));
+
   for (let i = 0; i < totalRecords; i++) {
     const price = buf.readFloatBE(TICK_HEADER + i * TICK_RECORD + TICK_ASK_OFF);
     if (!isFinite(price) || price < 400 || price > 50_000) continue;
 
-    // Distribute ticks proportionally across the 1-hour file window
-    const tickMs     = fileMs + Math.floor((i / totalRecords) * 3_600_000);
+    // Distribute ticks proportionally across the elapsed portion of the file window
+    const tickMs     = fileMs + Math.floor((i / totalRecords) * elapsedMs);
     const bucketSec  = Math.floor(tickMs / 60_000) * 60;
 
     const ex = minuteMap.get(bucketSec);
@@ -228,11 +255,29 @@ export function getMemBars(symbol: string, resolution: string): MinBar[] {
 const latestBar5       = new Map<string, MinBar>();
 const inProgressBar1m  = new Map<string, MinBar>(); // current forming 1-min bar
 const inProgressBar5m  = new Map<string, MinBar>(); // current forming 5-min bar
+const inProgressBar60m = new Map<string, MinBar>(); // current forming 60-min bar
 const lastTickPrice      = new Map<string, number>();  // last seen ask price per symbol
 const lastTickAt         = new Map<string, number>();  // symbol → Date.now() of last tick received
 const prevFeedStatus     = new Map<string, string>();  // symbol → last broadcast feed status
 const lastExternalTickMs     = new Map<string, number>();  // symbol → last tick from TickRelay WebSocket
 const lastFormingBroadcastMs = new Map<string, number>();  // symbol → last forming-bar broadcast time
+
+// TickRelay connection state — true while MW study WS is open; disk polling suppressed during this time
+let tickRelayConnected = false;
+
+export function setTickRelayConnected(connected: boolean): void {
+  if (tickRelayConnected === connected) return;
+  tickRelayConnected = connected;
+  console.log(`[mw-reader] tickRelayConnected → ${connected}`);
+  if (connected) {
+    // Wipe bars seeded by disk polling so the next TickRelay tick opens a fresh bar
+    // with the correct live price as open (not a stale disk-read price from hours ago).
+    inProgressBar1m.clear();
+    inProgressBar5m.clear();
+    inProgressBar60m.clear();
+    console.log("[mw-reader] Cleared in-progress bars — TickRelay is now authoritative");
+  }
+}
 
 // Track current active tick file per instrument so we don't scan the directory on every event
 const activeTickFile  = new Map<string, string>();   // instrDir → absolute file path
@@ -340,13 +385,14 @@ function readLastTickRecord(filePath: string): number | null {
 function applyTick(symbol: string, price: number) {
   const sym = symbol.toUpperCase();
 
-  // Sanity check: reject ticks that deviate >15% from the last known good price.
-  // Catches corrupt tick-file bytes (e.g. half the real price) from stale sessions.
+  // Sanity check: reject ticks that deviate more than MAX_TICK_DEVIATION ticks from reference.
+  // Bypass for first tick after a long session gap (>30 min) — allows legitimate gap opens.
   const refBar = inProgressBar1m.get(sym) ?? latestBar5.get(sym);
-  if (refBar && refBar.close > 0) {
-    const ratio = price / refBar.close;
-    if (ratio < 0.85 || ratio > 1.15) {
-      console.warn(`[mw-tick] ${sym} rejected suspicious price ${price.toFixed(2)} (ref ${refBar.close.toFixed(2)}, ratio ${ratio.toFixed(3)})`);
+  const msSinceLastTick = Date.now() - (lastTickAt.get(sym) ?? 0);
+  if (refBar && refBar.close > 0 && msSinceLastTick < 1_800_000) {
+    const deviationTicks = Math.abs(price - refBar.close) / TICK_SIZE;
+    if (deviationTicks > MAX_TICK_DEVIATION) {
+      console.warn(`[mw-tick] ${sym} rejected suspicious price ${price.toFixed(2)} (ref ${refBar.close.toFixed(2)}, deviation ${deviationTicks.toFixed(1)} ticks)`);
       return;
     }
   }
@@ -403,12 +449,26 @@ function applyTick(symbol: string, price: number) {
     });
   }
 
+  // ── 60-min in-progress bar ────────────────────────────────────────────────
+  const bucket60m = Math.floor(nowSec / 3600) * 3600;
+  const prev60m = inProgressBar60m.get(sym);
+  if (prev60m && prev60m.timeSec === bucket60m) {
+    prev60m.close = price;
+    if (price > prev60m.high) prev60m.high = price;
+    if (price < prev60m.low)  prev60m.low  = price;
+  } else {
+    const is60mContiguous = prev60m != null && (bucket60m - prev60m.timeSec <= 3600);
+    inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 0 });
+  }
+
   if (!_broadcast) return;
-  const bar1m = inProgressBar1m.get(sym)!;
-  const bar5m = inProgressBar5m.get(sym)!;
-  // Broadcast both resolutions so all open chart tabs update immediately
-  _broadcast({ type: "bar", resolution: "1",  bar: { symbol: sym, time: bar1m.timeSec, open: bar1m.open, high: bar1m.high, low: bar1m.low, close: bar1m.close, volume: bar1m.volume, complete: false } });
-  _broadcast({ type: "bar", resolution: "5",  bar: { symbol: sym, time: bar5m.timeSec, open: bar5m.open, high: bar5m.high, low: bar5m.low, close: bar5m.close, volume: bar5m.volume, complete: false } });
+  const bar1m  = inProgressBar1m.get(sym)!;
+  const bar5m  = inProgressBar5m.get(sym)!;
+  const bar60m = inProgressBar60m.get(sym)!;
+  // Broadcast all resolutions so 1m, 5m, and 60m chart tabs all update immediately
+  _broadcast({ type: "bar", resolution: "1",  bar: { symbol: sym, time: bar1m.timeSec,  open: bar1m.open,  high: bar1m.high,  low: bar1m.low,  close: bar1m.close,  volume: bar1m.volume,  complete: false } });
+  _broadcast({ type: "bar", resolution: "5",  bar: { symbol: sym, time: bar5m.timeSec,  open: bar5m.open,  high: bar5m.high,  low: bar5m.low,  close: bar5m.close,  volume: bar5m.volume,  complete: false } });
+  _broadcast({ type: "bar", resolution: "60", bar: { symbol: sym, time: bar60m.timeSec, open: bar60m.open, high: bar60m.high, low: bar60m.low, close: bar60m.close, volume: bar60m.volume, complete: false } });
   // Lightweight tick broadcast — just the raw price, no OHLCV.
   // Client uses this for the direct series.update() fast path (bypasses React state).
   _broadcast({ type: "tick", symbol: sym, price });
@@ -419,11 +479,13 @@ function applyTick(symbol: string, price: number) {
  * Reads only the last 45 bytes of the active tick file — sub-millisecond.
  */
 function onTickFileChange(symbol: string, instrDir: string, changedFilename: string | null) {
-  // TickRelay WebSocket is active — its prices are authoritative.
-  // Suppress disk tick reads for 60 s after the last MW tick to prevent stale disk
-  // prices from conflicting with live WebSocket data.
+  // TickRelay WebSocket is active — its prices are authoritative; skip disk reads.
+  if (tickRelayConnected) return;
   const sym0 = symbol.toUpperCase();
-  if (Date.now() - (lastExternalTickMs.get(sym0) ?? 0) < 60_000) return;
+  // Secondary guard: if a TickRelay tick arrived within the last 5 s, the flag may have
+  // been briefly flipped false by the close-handler bug — don't let a stale disk read
+  // corrupt the live price during that window.
+  if (Date.now() - (lastExternalTickMs.get(sym0) ?? 0) < 5_000) return;
 
   // If the changed file is a new tick file (not the one we tracked), refresh active file
   let fp = activeTickFile.get(instrDir);
@@ -474,7 +536,20 @@ interface MinBar {
 
 /** Persist a completed 5-min bar to the DB. Fire-and-forget. */
 function persistCompletedBar5(symbol: string, bar: MinBar) {
-  bulkUpsert(symbol, "5", [bar]).catch(() => {}); // FIX: removed erroneous bulkUpsert(..., "1") — 5m bars must not be written as 1m
+  const sym = symbol.toUpperCase();
+  const prev = latestBar5.get(sym);
+  // Reject bars whose open jumps >2% from the previous bar's close within a 30-min window.
+  // Catches corrupt LiveBarRelay bars (e.g. O=7280 when prev.close=7439) that pass the
+  // body-anomaly check because their mid is close to correct.
+  if (prev && prev.close > 0 && prev.timeSec > 0) {
+    const gapSec = bar.timeSec - prev.timeSec;
+    const openDev = Math.abs(bar.open - prev.close) / prev.close;
+    if (gapSec < 1800 && openDev > 0.02) {
+      console.warn(`[mw-tick] ${sym} rejected corrupt 5m bar: open=${bar.open.toFixed(2)} vs prev.close=${prev.close.toFixed(2)} (${(openDev*100).toFixed(1)}% gap=${gapSec}s)`);
+      return;
+    }
+  }
+  bulkUpsert(symbol, "5", [bar]).catch(() => {});
 }
 
 /**
@@ -540,6 +615,24 @@ export function notifyExternalTick(symbol: string, price: number) {
     inProgressBar5m.set(sym, { timeSec: bucket5m, open: is5mContiguous ? prev5m.close : price, high: price, low: price, close: price, volume: 0 }); // CANDLE FIX: gap-safe open
   }
 
+  // ── 60-min in-progress bar ────────────────────────────────────────────────
+  const bucket60m = Math.floor(nowSec / 3600) * 3600;
+  const prev60m = inProgressBar60m.get(sym);
+  if (prev60m && prev60m.timeSec === bucket60m) {
+    prev60m.close = price;
+    if (price > prev60m.high) prev60m.high = price;
+    if (price < prev60m.low)  prev60m.low  = price;
+  } else {
+    if (prev60m && prev60m.timeSec > 0 && prev60m.open > 0) {
+      bulkUpsert(sym, "60", [prev60m]).catch(() => {});
+      if (_broadcast) {
+        _broadcast({ type: "bar", resolution: "60", bar: { symbol: sym, time: prev60m.timeSec, open: prev60m.open, high: prev60m.high, low: prev60m.low, close: prev60m.close, volume: prev60m.volume, complete: true } });
+      }
+    }
+    const is60mContiguous = prev60m != null && (bucket60m - prev60m.timeSec <= 3600);
+    inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 0 });
+  }
+
   // Broadcast the forming bars so the browser's liveCandles stays in sync (for signal computation).
   // Throttled to once per second — the tick fast path already handles the Y-axis in real time.
   if (_broadcast) {
@@ -547,16 +640,18 @@ export function notifyExternalTick(symbol: string, price: number) {
     if (now - (lastFormingBroadcastMs.get(sym) ?? 0) >= 1_000) {
       lastFormingBroadcastMs.set(sym, now);
       const cur5m = inProgressBar5m.get(sym)!;
-      _broadcast({ type: "bar", resolution: "5", bar: { symbol: sym, time: cur5m.timeSec, open: cur5m.open, high: cur5m.high, low: cur5m.low, close: cur5m.close, volume: cur5m.volume, complete: false } });
+      _broadcast({ type: "bar", resolution: "5",  bar: { symbol: sym, time: cur5m.timeSec, open: cur5m.open, high: cur5m.high, low: cur5m.low, close: cur5m.close, volume: cur5m.volume, complete: false } });
       const cur1m = inProgressBar1m.get(sym)!;
-      _broadcast({ type: "bar", resolution: "1", bar: { symbol: sym, time: cur1m.timeSec, open: cur1m.open, high: cur1m.high, low: cur1m.low, close: cur1m.close, volume: cur1m.volume, complete: false } });
+      _broadcast({ type: "bar", resolution: "1",  bar: { symbol: sym, time: cur1m.timeSec, open: cur1m.open, high: cur1m.high, low: cur1m.low, close: cur1m.close, volume: cur1m.volume, complete: false } });
+      const cur60m = inProgressBar60m.get(sym);
+      if (cur60m) {
+        _broadcast({ type: "bar", resolution: "60", bar: { symbol: sym, time: cur60m.timeSec, open: cur60m.open, high: cur60m.high, low: cur60m.low, close: cur60m.close, volume: cur60m.volume, complete: false } });
+      }
     }
   }
 
   // FOOTPRINT-MIDTRADE: check for mid-trade delta divergence on each external tick
-  import("./footprint-engine").then(({ checkMidTradeDivergence }) => { // FOOTPRINT-MIDTRADE:
-    checkMidTradeDivergence(sym, price); // FOOTPRINT-MIDTRADE:
-  }).catch(() => {}); // FOOTPRINT-MIDTRADE:
+  _checkMidTradeDivergence?.(sym, price); // FOOTPRINT-MIDTRADE:
 }
 
 // ── Broadcast hook (set by live-bars.ts after WebSocket server is up) ─────────
@@ -566,6 +661,11 @@ let _broadcast: ((msg: object) => void) | null = null;
 export function setMWBroadcast(fn: (msg: object) => void) {
   _broadcast = fn;
 }
+
+// Pre-resolve footprint engine import so notifyExternalTick never creates a
+// dynamic-import Promise microtask on every MW tick (same pattern as live-bars.ts _fpAddBar).
+let _checkMidTradeDivergence: ((sym: string, price: number) => void) | null = null;
+import("./footprint-engine").then(m => { _checkMidTradeDivergence = (m as any).checkMidTradeDivergence ?? null; }).catch(() => {});
 
 // ── Binary parser ─────────────────────────────────────────────────────────────
 
@@ -586,26 +686,29 @@ function parseBarFile(filePath: string): MinBar[] {
 
   for (let i = 0; i < count; i++) {
     const o = HEADER_SIZE + i * RECORD_SIZE;
-    const seq  = buf.readUInt16BE(o);
-    const open = buf.readFloatBE(o + 2);
-    const high = buf.readFloatBE(o + 6);
-    const low  = buf.readFloatBE(o + 10);
-    const close= buf.readFloatBE(o + 14);
-    const vol  = buf.readFloatBE(o + 18);
+    const open      = buf.readFloatBE(o);
+    const high      = buf.readFloatBE(o + 4);
+    const low       = buf.readFloatBE(o + 8);
+    const close     = buf.readFloatBE(o + 12);
+    const vol       = buf.readFloatBE(o + 16);
+    const minuteOff = buf.readUInt16BE(o + 28);
 
     // Reject NaN/Infinity, zero/negative prices, and corrupt records.
-    // Upper bound: no futures contract should ever exceed $1,000,000.
+    // Lower bound 100: futures prices (ES ~5000, MES ~5000) are never below $100.
     // Ratio guard: high > low*2 means a 100%+ intrabar move — impossible in normal markets.
     if (
       !isFinite(open) || !isFinite(high) || !isFinite(low) || !isFinite(close) ||
-      open <= 0 || high < low || low <= 0 ||
+      open < 100 || high < low || low < 100 ||
       low > open || low > close || high < open || high < close ||
       open > 1e6 || high > 1e6 || low > 1e6 || close > 1e6 ||
       high > low * 2
     ) continue;
 
+    // minuteOff is the minute-of-week offset from the file's epoch timestamp.
+    const timeSec = Math.floor(fileMs / 1000) + minuteOff * 60;
+
     bars.push({
-      timeSec: Math.floor((fileMs + seq * 60_000) / 1000),
+      timeSec,
       open, high, low, close,
       volume: (vol > 0 && vol < 1e9) ? Math.round(vol) : 0,
     });
@@ -641,8 +744,75 @@ function aggregate(minBars: MinBar[], periodMin: number): MinBar[] {
 /** Upsert — overwrites existing rows so corrupt DB data is always replaced */
 async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
   if (!bars.length) return;
-  for (let i = 0; i < bars.length; i += 500) {
-    const values = bars.slice(i, i + 500).map(b => ({
+  // Reject bars with prices outside a safe range — catches corrupt tick-file float32 misreads
+  // (512, 8192, 14336, 47104, etc.) before they reach the DB and distort chart auto-scale.
+  const clean = bars.filter(b => {
+    if (b.low < 1000 || b.high > 100_000) return false;
+    if (b.open <= 0 || b.close <= 0) return false;
+    if (b.high < b.low || b.high < b.open || b.high < b.close) return false;
+    if (b.low > b.open || b.low > b.close) return false;
+    if (b.high <= b.low) return false; // strict — rejects flat dot bars
+    const range = b.high - b.low;
+    if (range / b.close > 0.05) return false; // >5% H-L spread — impossible in normal MES
+    // Reject doji-wick spikes: body <10% of range on a large bar (>1.5% spread).
+    // A bad float32 byte in the MW binary creates an extreme wick while open/close stay near real price.
+    if (range / b.close > 0.015 && Math.abs(b.open - b.close) / range < 0.10) return false;
+    // Reject extreme isolated wick extensions — a bad float32 byte that affects only high or low.
+    // Thresholds: 1m=0.9%, 5m=1.2%, 60m=2.5% of close price (e.g., 63 / 84 / 175 pts at 7000).
+    const maxWickPct = resolution === "1" ? 0.009 : resolution === "5" ? 0.012 : 0.025;
+    const lowerWick = Math.min(b.open, b.close) - b.low;
+    const upperWick = b.high - Math.max(b.open, b.close);
+    if (lowerWick / b.close > maxWickPct || upperWick / b.close > maxWickPct) return false;
+    return true;
+  });
+  if (!clean.length) return;
+  // Phantom-bar detection (same logic as client-side baseCandles second pass).
+  // Catches corrupt bars where the bar's price level is wrong but body ratio is large
+  // (so the doji-wick filter above misses it). Requires neighbor context, so must run
+  // after the per-bar filter and after sorting by time.
+  clean.sort((a, b) => a.timeSec - b.timeSec);
+  const noPhantom: MinBar[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    if (i > 0 && i < clean.length - 1) {
+      const pc = clean[i - 1].close, no = clean[i + 1].open;
+      const surrounding = (pc + no) / 2;
+      const mid = (clean[i].open + clean[i].close) / 2;
+      if (surrounding > 0 && Math.abs(mid - surrounding) / surrounding > 0.015) {
+        const dEnd = Math.abs(no - clean[i].close) / clean[i].close;
+        const isClosePhantom = dEnd > 0.005;
+        const gapDir = clean[i].open - pc;
+        const barDir = clean[i].close - clean[i].open;
+        const isOpenPhantom = Math.abs(gapDir) / pc > 0.01 && Math.sign(barDir) !== Math.sign(gapDir);
+        if (isClosePhantom || isOpenPhantom) continue;
+      }
+    }
+    noPhantom.push(clean[i]);
+  }
+  if (!noPhantom.length) return;
+  // Body-anomaly detection: rejects bars whose mid-price deviates >2.5% from
+  // a trimmed mean of ±10 neighbors. Catches the ~512-min recurring corrupt bars
+  // that the phantom filter misses because their immediate neighbors are normal.
+  const bodyClean: MinBar[] = [];
+  for (let i = 0; i < noPhantom.length; i++) {
+    const mid = (noPhantom[i].open + noPhantom[i].close) / 2;
+    const lo = Math.max(0, i - 10), hi = Math.min(noPhantom.length, i + 11);
+    const nbMids = noPhantom.slice(lo, hi)
+      .filter((_, j) => lo + j !== i)
+      .map(n => (n.open + n.close) / 2)
+      .sort((a, b) => a - b);
+    if (nbMids.length >= 4) {
+      const trim = Math.floor(nbMids.length * 0.2);
+      const trimmed = nbMids.slice(trim, nbMids.length - trim);
+      const mean = trimmed.reduce((s, v) => s + v, 0) / trimmed.length;
+      if (Math.abs(mid - mean) / mean > 0.025) continue;
+    }
+    bodyClean.push(noPhantom[i]);
+  }
+  const bodySkipped = noPhantom.length - bodyClean.length;
+  if (bodySkipped > 0) console.log(`[mw-reader] bulkUpsert: rejected ${bodySkipped} body-anomaly bars for ${symbol} res=${resolution}`);
+  if (!bodyClean.length) return;
+  for (let i = 0; i < bodyClean.length; i += 500) {
+    const values = bodyClean.slice(i, i + 500).map(b => ({
       symbol, resolution,
       timestamp: b.timeSec,
       open:   b.open,
@@ -663,6 +833,10 @@ async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
           volume: sql`EXCLUDED.volume`,
         },
       });
+    // Yield to the macrotask queue between batches so HTTP requests are not starved
+    // during bulk startup loads (better-sqlite3 is synchronous — without this yield
+    // the event loop is blocked and the server becomes unresponsive until loading finishes).
+    await new Promise(r => setImmediate(r));
   }
 }
 
@@ -674,6 +848,13 @@ function getBarFiles(instrDir: string): string[] {
   try {
     return fs.readdirSync(instrDir)
       .filter(f => f.endsWith(".bar_data1"))
+      .filter(f => {
+        // Skip sparse weekly-summary files (< 10 000 bytes ≈ < 300 records).
+        // MESM6 Jul–Nov 2025 files had only 3–370 records/week; those sparse bars create
+        // false FVG detections in detectMilkZones (consecutive bars days apart = huge "imbalance").
+        // Dense files (Dec 2025+) are 50k–200k bytes. Tick data covers Sep 2025+ gap.
+        try { return fs.statSync(path.join(instrDir, f)).size >= 10_000; } catch { return false; }
+      })
       .sort()
       .map(f => path.join(instrDir, f));
   } catch {
@@ -802,7 +983,14 @@ export async function reloadAll() {
 
 // ── Public setup function ─────────────────────────────────────────────────────
 
+let _mwReaderStarted = false;
+
 export function setupMWReader(_httpServer: HttpServer, _app: Express) {
+  if (_mwReaderStarted) {
+    console.log("[mw-reader] Already started — skipping duplicate init");
+    return;
+  }
+  _mwReaderStarted = true;
   console.log("[mw-reader] Starting — data root:", MW_DATA_ROOT);
 
   (async () => {
@@ -845,14 +1033,16 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
       }
       if (seedBar) {
         const nowSec = Math.floor(Date.now() / 1000);
-        const bucket1m = Math.floor(nowSec / 60) * 60;
-        const bucket5m = Math.floor(nowSec / 300) * 300;
+        const bucket1m  = Math.floor(nowSec / 60)   * 60;
+        const bucket5m  = Math.floor(nowSec / 300)  * 300;
+        const bucket60m = Math.floor(nowSec / 3600) * 3600;
         // CANDLE FIX: only use seed bar close as open when bar is fresh; stale bar → let first tick self-seed
         const seedAgeMs = Date.now() - (seedBar.timeSec + 300) * 1000;
         if (seedAgeMs < 300_000) {
           // CANDLE FIX: bar just completed — safe to chain its close as the next bar's open
-          inProgressBar1m.set(sym, { timeSec: bucket1m, open: seedBar.close, high: seedBar.close, low: seedBar.close, close: seedBar.close, volume: 0 });
-          inProgressBar5m.set(sym, { timeSec: bucket5m, open: seedBar.close, high: seedBar.close, low: seedBar.close, close: seedBar.close, volume: 0 });
+          inProgressBar1m.set(sym,  { timeSec: bucket1m,  open: seedBar.close, high: seedBar.close, low: seedBar.close, close: seedBar.close, volume: 0 });
+          inProgressBar5m.set(sym,  { timeSec: bucket5m,  open: seedBar.close, high: seedBar.close, low: seedBar.close, close: seedBar.close, volume: 0 });
+          inProgressBar60m.set(sym, { timeSec: bucket60m, open: seedBar.close, high: seedBar.close, low: seedBar.close, close: seedBar.close, volume: 0 });
         } else {
           // CANDLE FIX: seed bar is stale — skip inProgressBar init so first tick self-seeds open+close from same price
           console.log(`[mw-reader] ${sym} seed bar is stale (${Math.round(seedAgeMs/60000)}m old) — skipping in-progress bar init. First tick will self-seed.`);
@@ -902,9 +1092,11 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
               console.warn(`[mw-reader] Cold-start tick price ${tickPrice.toFixed(2)} rejected (last close ${lastClose?.toFixed(2)}, ratio ${(tickPrice / lastClose!).toFixed(3)}) — keeping bar close as seed`);
             } else {
               // Open = last completed bar's close (candle continuity). Tick price = current close.
-              const open = lastClose ?? tickPrice;
-              inProgressBar1m.set(sym, { timeSec: bucket1m, open, high: Math.max(open, tickPrice), low: Math.min(open, tickPrice), close: tickPrice, volume: 0 });
-              inProgressBar5m.set(sym, { timeSec: bucket5m, open, high: Math.max(open, tickPrice), low: Math.min(open, tickPrice), close: tickPrice, volume: 0 });
+              const open       = lastClose ?? tickPrice;
+              const bucket60mT = Math.floor(nowSec / 3600) * 3600;
+              inProgressBar1m.set(sym,  { timeSec: bucket1m,   open, high: Math.max(open, tickPrice), low: Math.min(open, tickPrice), close: tickPrice, volume: 0 });
+              inProgressBar5m.set(sym,  { timeSec: bucket5m,   open, high: Math.max(open, tickPrice), low: Math.min(open, tickPrice), close: tickPrice, volume: 0 });
+              inProgressBar60m.set(sym, { timeSec: bucket60mT, open, high: Math.max(open, tickPrice), low: Math.min(open, tickPrice), close: tickPrice, volume: 0 });
               lastTickPrice.set(sym, tickPrice);
               console.log(`[mw-reader] Refined ${sym} seed to tick price: ${tickPrice.toFixed(2)} (open=${open.toFixed(2)}, file age: ${ageMin.toFixed(0)}m)`);
             }
@@ -938,10 +1130,13 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         console.warn(`[mw-reader] fs.watch unavailable — using 1s poll fallback only`);
       }
 
-      // 16ms fallback poll — catches any ticks that fs.watch may have missed
+      // 100ms fallback poll — catches ticks fs.watch may have missed.
+      // 16ms (60fps) caused 60 fs.statSync/sec saturating the Node event loop.
+      // 100ms (10fps) is imperceptible latency for a disk-file fallback while
+      // leaving room for TickRelay WS messages to be processed without delay.
       setInterval(() => {
         try { fallbackTickPoll(symbol, instrDir); } catch { /* silent */ }
-      }, 16);
+      }, 100);
 
       // 5s tick-file rescan — detects when MW creates a NEW tick file (new hour / new session).
       // The fallback poll only checks the currently tracked file; this catches rollovers.
@@ -967,16 +1162,29 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         }
       }, 5_000);
 
-      // 16ms heartbeat (~60fps) — re-runs applyTick with the last known price.
-      // Suppressed when TickRelay WebSocket is active (notifyExternalTick was called
-      // within the last 5 seconds) to prevent stale disk prices overriding live ticks.
+      // 16ms tick-only heartbeat (~60fps) — keeps the chart Y-axis label smooth in disk mode.
+      // ONLY broadcasts the lightweight {type:"tick"} message — no bar OHLCV.
+      // Suppressed when TickRelay is active (notifyExternalTick handles all broadcasts then).
+      // Sending full bar messages at 60fps was wasteful: the client throttles bar state
+      // updates to 2s anyway, so 118 of 120 bar sends per second were silently dropped.
+      setInterval(() => {
+        const sym = symbol.toUpperCase();
+        const p   = lastTickPrice.get(sym);
+        if (p === undefined) return;
+        if (Date.now() - (lastExternalTickMs.get(sym) ?? 0) < 5_000) return;
+        if (_broadcast) _broadcast({ type: "tick", symbol: sym, price: p });
+      }, 16);
+
+      // 1s bar-state heartbeat — updates in-progress OHLCV bars and broadcasts them.
+      // 1s cadence matches notifyExternalTick's forming-bar throttle so disk mode and
+      // TickRelay mode behave consistently for the React signal-computation chain.
       setInterval(() => {
         const sym = symbol.toUpperCase();
         const p   = lastTickPrice.get(sym);
         if (p === undefined) return;
         if (Date.now() - (lastExternalTickMs.get(sym) ?? 0) < 5_000) return;
         try { applyTick(sym, p); } catch { /* silent */ }
-      }, 16);
+      }, 1_000);
     }
 
     // Feed staleness monitor — checks every 15 s and broadcasts status changes.

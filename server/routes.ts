@@ -1,16 +1,19 @@
 import type { Express } from "express";
-import { createServer, type Server } from "http";
+import type { Server } from "http";
 import fs from "fs";
 import path from "path";
 import Anthropic from "@anthropic-ai/sdk";
+import { cacheGet, cacheSet, cacheInvalidate, cacheFlushAll, TTL } from "./cache";
 import YahooFinance from "yahoo-finance2";
 import { db } from "./db";
 import { cachedCandles, downloadStatus, newsArticles, appSettings, signalHistory, discordMessages, discordSignals, tradeJournal } from "@shared/schema";
 import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
+import { reconnectMWStudies } from "./live-bars";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus } from "./live-bars";
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
-import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, setAutoTrade, getAutoTrade, deepBackReadAll, reparseAllZones } from "./discord-reader";
+import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, deepBackReadAll, reparseAllZones } from "./discord-reader";
+import { tradeSettings, pushTokens, getCurrentTrade, setCurrentTrade, clearCurrentTrade } from "./trade-state";
 import { parseZonesFromMessage } from "./discord-zone-parser";
 import { learner } from "./discord-learner";
 
@@ -128,6 +131,12 @@ const POPULAR_SYMBOLS = {
   ],
 };
 
+// Reuse a single Intl.DateTimeFormat instance across all isRTH calls — constructing
+// it inline per candle is expensive when processing thousands of historical bars.
+const _etFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false,
+});
+
 /**
  * Determine if a UTC timestamp is within Regular Trading Hours (RTH) for US markets.
  * RTH: 9:30 AM – 4:00 PM ET  |  ETH: 6:00 PM – 9:30 AM ET
@@ -137,14 +146,13 @@ function isRTH(timestampSec: number): boolean {
   const d = new Date(timestampSec * 1000);
   const dayOfWeek = d.getUTCDay();
   if (dayOfWeek === 0 || dayOfWeek === 6) return false;
-  // Convert to ET using Intl — handles EDT/EST automatically
-  const etParts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false,
-  }).formatToParts(d);
-  const etH = parseInt(etParts.find(p => p.type === "hour")?.value ?? "0");
-  const etM = parseInt(etParts.find(p => p.type === "minute")?.value ?? "0");
-  const etMins = etH * 60 + etM;
-  return etMins >= 9 * 60 + 30 && etMins < 16 * 60; // 9:30 AM – 4:00 PM ET
+  const etParts = _etFmt.formatToParts(d);
+  let etH = 0, etM = 0;
+  for (const p of etParts) {
+    if (p.type === "hour")   etH = parseInt(p.value);
+    else if (p.type === "minute") etM = parseInt(p.value);
+  }
+  return etH * 60 + etM >= 9 * 60 + 30 && etH * 60 + etM < 16 * 60; // 9:30 AM – 4:00 PM ET
 }
 
 function mapQuotes(quotes: any[]): any[] {
@@ -235,14 +243,30 @@ export async function registerRoutes(
     res.json(results);
   });
 
-  // Force-reload all MW bar files from disk into the DB (call after server restart or MW data update)
+  // Force-reload all MW bar files from disk into the DB.
+  // Blocks until reload completes (same as PC) so data is guaranteed fresh when the
+  // client's query invalidation refetches. Hard-capped at 45s so the spinner always stops.
   app.post("/api/admin/reload-mw", async (_req, res) => {
+    // 1. Re-read MW bar/tick files from disk → upsert into DB.
     try {
-      await reloadAll();
-      res.json({ ok: true, message: "MW data reloaded" });
+      const TIMEOUT_MS = 45_000;
+      const deadline = new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), TIMEOUT_MS)
+      );
+      await Promise.race([reloadAll(), deadline]);
     } catch (err: any) {
-      res.status(500).json({ ok: false, error: err.message });
+      if (err.message !== "timeout") {
+        console.error("[reload-mw] reload error:", err.message);
+      }
     }
+    cacheFlushAll(); // flush AFTER reload so the client's refetch gets fresh DB data
+
+    // 2. Terminate connected MW study WS connections.
+    //    Studies reconnect automatically and re-send a full bulk_bars dump on reconnect,
+    //    which gives the browser the exact data MW is currently showing.
+    reconnectMWStudies();
+
+    res.json({ ok: true, message: "MW data reloaded" });
   });
 
   // Live candles for stocks/ETFs from MarketData.app — called every 5s by the client
@@ -585,10 +609,14 @@ export async function registerRoutes(
   app.get("/api/data/candles/:symbol/:resolution", async (req, res) => {
     const { symbol, resolution } = req.params;
     const { from, to } = req.query;
+    const sym = symbol.toUpperCase();
+    const cacheKey = `${sym}:candles:${resolution}:${from ?? ""}:${to ?? ""}`;
+    const cached = cacheGet<object>(cacheKey);
+    if (cached) { res.json(cached); return; }
     try {
       let query = db.select().from(cachedCandles)
         .where(and(
-          eq(cachedCandles.symbol, symbol.toUpperCase()),
+          eq(cachedCandles.symbol, sym),
           eq(cachedCandles.resolution, resolution),
           ...(from ? [gte(cachedCandles.timestamp, Number(from))] : []),
           ...(to ? [lte(cachedCandles.timestamp, Number(to))] : []),
@@ -605,7 +633,9 @@ export async function registerRoutes(
         volume: r.volume,
         rth: isRTH(r.timestamp),
       }));
-      res.json({ symbol: symbol.toUpperCase(), resolution, candles });
+      const result = { symbol: sym, resolution, candles };
+      cacheSet(cacheKey, result, TTL.candles);
+      res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -613,6 +643,10 @@ export async function registerRoutes(
 
   app.get("/api/data/daily-summary/:symbol", async (req, res) => {
     const { symbol } = req.params;
+    const sym = symbol.toUpperCase();
+    const cacheKey = `${sym}:daily-summary`;
+    const cached = cacheGet<object>(cacheKey);
+    if (cached) { res.json(cached); return; }
     try {
       const rows = db.$client.prepare(`
         SELECT
@@ -627,8 +661,10 @@ export async function registerRoutes(
         GROUP BY DATE(datetime(timestamp, 'unixepoch'))
         ORDER BY date DESC
         LIMIT 2000
-      `).all(symbol.toUpperCase());
-      res.json({ symbol: symbol.toUpperCase(), days: rows });
+      `).all(sym);
+      const result = { symbol: sym, days: rows };
+      cacheSet(cacheKey, result, TTL.days);
+      res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -641,10 +677,36 @@ export async function registerRoutes(
     const fromN = req.query.from ? Number(req.query.from) : 0;
     const toN   = req.query.to   ? Number(req.query.to)   : Infinity;
 
+    const cacheKey = `${sym}:continuous:${interval}:${fromN}:${isFinite(toN) ? Math.round(toN / 3600) : "inf"}`;
+    const cached = cacheGet<object>(cacheKey);
+    if (cached) { res.json(cached); return; }
+
+    // Max H-L spread (fraction of close) before a bar is treated as a corrupt spike
+    const spikeThreshold = interval === "1m" ? 0.005 : interval === "5m" ? 0.010 : interval === "15m" ? 0.015 : 0.025;
+    function isSpikeBar(o: number, h: number, l: number, c: number): boolean {
+      // Malformed OHLCV (impossible values)
+      if (h < l || o > h || o < l || c > h || c < l || c <= 0) return true;
+      const range = h - l;
+      // Large absolute range
+      if (range / c > spikeThreshold) return true;
+      // Gap-bar artifact: O≈H and L≈C (bearish session gap) or O≈L and H≈C (bullish session gap).
+      // These bars have O=H and L=C because they span an overnight gap — they appear as
+      // tall full-body bars throughout the chart and corrupt Lowest(low,20).
+      if (range / c > 0.001) {
+        if ((Math.abs(o - h) < 0.5 && Math.abs(l - c) < 0.5) ||
+            (Math.abs(o - l) < 0.5 && Math.abs(h - c) < 0.5)) return true;
+      }
+      // Doji-spike: tiny body but large wick
+      const body = Math.abs(c - o);
+      if (range > 0 && body / range < 0.05 && range / c > 0.002) return true;
+      return false;
+    }
+
     // Helper: convert MinBar[] to the candle shape the client expects
     function memBarsToCandles(bars: { timeSec: number; open: number; high: number; low: number; close: number; volume: number }[]) {
       return bars
         .filter(b => (!fromN || b.timeSec >= fromN) && (!isFinite(toN) || b.timeSec <= toN))
+        .filter(b => !isSpikeBar(b.open, b.high, b.low, b.close))
         .map(b => ({ time: b.timeSec, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, rth: isRTH(b.timeSec) }));
     }
 
@@ -668,8 +730,12 @@ export async function registerRoutes(
       }
 
       if (rows.length > 0) {
-        const candles = rows.map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) }));
-        res.json({ symbol: sym, interval, candles, source: "cached", resolution: usedRes });
+        const candles = rows
+          .filter(r => !isSpikeBar(r.open, r.high, r.low, r.close))
+          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) }));
+        const result = { symbol: sym, interval, candles, source: "cached", resolution: usedRes };
+        cacheSet(cacheKey, result, TTL.continuous);
+        res.json(result);
         return;
       }
 
@@ -1670,17 +1736,41 @@ export async function registerRoutes(
 
   // ── Auto Trade routes ─────────────────────────────────────────────────────
 
-  // In-memory auto-trade settings (auto-trade is ALWAYS off on server restart)
-  const autoTradeSettings: {
-    enabled: boolean;
-    contracts: number;
-    riskLevels: string[];
-    intervals: string[];
-  } = { enabled: false, contracts: 1, riskLevels: ["safe"], intervals: ["5m"] };
-
   // GET /api/trade/status — is AutoTrader Java study connected?
   app.get("/api/trade/status", (_req, res) => {
     res.json({ connected: isOrderCommandSocketOpen() });
+  });
+
+  // GET /api/trade/current — returns the active trade (with live price auto-status) or null
+  app.get("/api/trade/current", (_req, res) => {
+    let trade = getCurrentTrade();
+    if (trade && trade.status === 'open') {
+      const livePrice = getLastTickPrice(trade.symbol);
+      if (livePrice != null && livePrice > 0) {
+        const isLong = trade.direction === 'Long';
+        let newStatus: 'open' | 'tp1_hit' | 'tp2_hit' | 'sl_hit' = trade.status;
+        if (isLong) {
+          if (livePrice >= trade.tp2)      newStatus = 'tp2_hit';
+          else if (livePrice >= trade.tp1) newStatus = 'tp1_hit';
+          else if (livePrice <= trade.sl)  newStatus = 'sl_hit';
+        } else {
+          if (livePrice <= trade.tp2)      newStatus = 'tp2_hit';
+          else if (livePrice <= trade.tp1) newStatus = 'tp1_hit';
+          else if (livePrice >= trade.sl)  newStatus = 'sl_hit';
+        }
+        if (newStatus !== trade.status) {
+          setCurrentTrade({ ...trade, status: newStatus });
+          trade = getCurrentTrade();
+        }
+      }
+    }
+    res.json({ trade });
+  });
+
+  // POST /api/trade/current/clear — clears the active trade
+  app.post("/api/trade/current/clear", (_req, res) => {
+    clearCurrentTrade();
+    res.json({ ok: true });
   });
 
   app.get("/api/mw/sync-status", (_req, res) => {
@@ -1689,16 +1779,32 @@ export async function registerRoutes(
 
   // GET /api/trade/settings — current auto-trade config
   app.get("/api/trade/settings", (_req, res) => {
-    res.json(autoTradeSettings);
+    res.json(tradeSettings);
   });
 
-  // POST /api/trade/settings — update config (note: enabled flag is client-side only, not saved)
+  // POST /api/trade/settings — update full config (persisted in-memory until server restart)
   app.post("/api/trade/settings", (req, res) => {
-    const { contracts, riskLevels, intervals } = req.body as Partial<typeof autoTradeSettings>;
-    if (typeof contracts === "number" && contracts >= 1) autoTradeSettings.contracts = Math.floor(contracts);
-    if (Array.isArray(riskLevels)) autoTradeSettings.riskLevels = riskLevels;
-    if (Array.isArray(intervals)) autoTradeSettings.intervals = intervals;
-    res.json({ ok: true, settings: autoTradeSettings });
+    const body = req.body as Partial<typeof tradeSettings>;
+    if (typeof body.enabled === "boolean") tradeSettings.enabled = body.enabled;
+    if (typeof body.contracts === "number" && body.contracts >= 1) tradeSettings.contracts = Math.floor(body.contracts);
+    if (typeof body.tp1Only === "boolean") tradeSettings.tp1Only = body.tp1Only;
+    if (body.direction === "both" || body.direction === "long" || body.direction === "short") tradeSettings.direction = body.direction;
+    if (body.contractType === "MES" || body.contractType === "ES") tradeSettings.contractType = body.contractType;
+    if (Array.isArray(body.riskLevels)) tradeSettings.riskLevels = body.riskLevels;
+    if (Array.isArray(body.intervals)) tradeSettings.intervals = body.intervals;
+    if (['current','tight','standard','wide'].includes(body.exitStrategy as string)) tradeSettings.exitStrategy = body.exitStrategy as typeof tradeSettings.exitStrategy;
+    res.json({ ok: true, settings: tradeSettings });
+  });
+
+  // POST /api/push-token — register an Expo push token from the mobile app
+  app.post("/api/push-token", (req, res) => {
+    const { token } = req.body as { token?: string; platform?: string };
+    if (typeof token === "string" && token.startsWith("ExponentPushToken[")) {
+      pushTokens.add(token);
+      res.json({ ok: true, registered: pushTokens.size });
+    } else {
+      res.status(400).json({ error: "Invalid push token format" });
+    }
   });
 
   // POST /api/trade/reset-flag — unstick tradeInProgress on the Java side
@@ -1736,7 +1842,7 @@ export async function registerRoutes(
       tp1: Number(tp1),
       tp2: Number(tp2),
       sl: Number(sl),
-      contracts: Math.max(1, Math.floor(Number(contracts ?? autoTradeSettings.contracts))),
+      contracts: Math.max(1, Math.floor(Number(contracts ?? tradeSettings.contracts))),
       tp1Only: tp1Only === true,
       useTrailer: useTrailer === true,
       trailingOffset: Number(trailingOffset ?? 2),
@@ -1745,6 +1851,20 @@ export async function registerRoutes(
       res.status(503).json({ error: "AutoTrader study not connected. Load it on a chart in MotiveWave." });
       return;
     }
+    setCurrentTrade({
+      symbol: symbol ?? "MES",
+      direction: direction as 'Long' | 'Short',
+      interval,
+      riskLevel,
+      entry: Number(price),
+      tp1: Number(tp1),
+      tp2: Number(tp2),
+      sl: Number(sl),
+      contracts: Math.max(1, Math.floor(Number(contracts ?? tradeSettings.contracts))),
+      tp1Only: tp1Only === true,
+      firedAt: Math.floor(Date.now() / 1000),
+      status: 'open',
+    });
     res.json({ ok: true });
   });
 
@@ -1889,14 +2009,14 @@ export async function registerRoutes(
       res.status(400).json({ error: "enabled (boolean) required" });
       return;
     }
-    setAutoTrade(enabled);
+    tradeSettings.enabled = enabled;
     console.log(`[discord-reader] auto-trade ${enabled ? "ENABLED" : "DISABLED"}`);
     res.json({ ok: true, autoTrade: enabled });
   });
 
   // GET /api/discord-reader/auto-trade — current status
   app.get("/api/discord-reader/auto-trade", (_req, res) => {
-    res.json({ autoTrade: getAutoTrade() });
+    res.json({ autoTrade: tradeSettings.enabled });
   });
 
   // GET /api/discord-reader/message-count — total messages + per-channel breakdown
@@ -1986,9 +2106,15 @@ export async function registerRoutes(
 
   // Tables are created in db.ts on startup — no need to recreate here
 
+  // Strip contract codes so "MES1!", "MESM6", "MES" all normalize to "MES".
+  // Removes non-letter chars, then strips a trailing month-code letter (H/M/U/Z).
+  function normalizeSignalSymbol(raw: string): string {
+    return raw.replace(/[^A-Za-z]/g, '').replace(/[HMUZ]$/i, '').toUpperCase();
+  }
+
   // GET /api/signals/history/:symbol/:interval — load persisted signal locks
   app.get("/api/signals/history/:symbol/:interval", async (req, res) => {
-    const sym = req.params.symbol.toUpperCase();
+    const sym = normalizeSignalSymbol(req.params.symbol);
     const iv  = req.params.interval;
     try {
       const rows = await db.select().from(signalHistory)
@@ -2015,7 +2141,7 @@ export async function registerRoutes(
     }
     try {
       const values = signals.map(s => ({
-        symbol:           s.symbol.toUpperCase(),
+        symbol:           normalizeSignalSymbol(s.symbol),
         interval:         s.interval,
         timestamp:        s.timestamp,
         direction:        s.direction,
@@ -2214,6 +2340,64 @@ Critical rules:
     if (!content) return res.status(400).json({ ok: false, error: "Missing content" });
     const result = strategyGuard.authorizedUpdate(id, content);
     res.json(result);
+  });
+
+  // ── Signal label routes (ML training data from user feedback) ────────────────
+  // POST /api/signals/label — save user feedback on a single signal
+  app.post("/api/signals/label", (req, res) => {
+    const { key, time, direction, riskLevel, outcome, isBad, reason, note } = req.body as {
+      key: string; time: number; direction: string; riskLevel: string;
+      outcome?: string; isBad?: boolean; reason?: string; note?: string;
+    };
+    if (!key || !time || !direction || !riskLevel) {
+      res.status(400).json({ error: "Missing required fields" }); return;
+    }
+    try {
+      db.$client.prepare(`
+        INSERT OR REPLACE INTO signal_labels
+          (signal_key, signal_time, direction, risk_level, outcome, is_bad, reason, note, labeled_at)
+        VALUES (?,?,?,?,?,?,?,?,datetime('now'))
+      `).run(key, time, direction, riskLevel, outcome ?? 'Open', isBad ? 1 : 0, reason ?? null, note ?? null);
+      res.json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/signals/labels — return all saved labels (for ML training)
+  app.get("/api/signals/labels", (_req, res) => {
+    try {
+      const rows = db.$client.prepare(
+        `SELECT * FROM signal_labels ORDER BY labeled_at DESC`
+      ).all();
+      res.json({ labels: rows });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/signals/win-rates — data-driven win rates by (riskLevel, direction) from labeled signals
+  app.get("/api/signals/win-rates", (_req, res) => {
+    try {
+      const rows = db.$client.prepare(`
+        SELECT risk_level, direction,
+               COUNT(*) as total,
+               SUM(CASE WHEN outcome IN ('TP1','TP2','Win') AND is_bad=0 THEN 1 ELSE 0 END) as wins
+        FROM signal_labels
+        WHERE outcome != 'Open'
+        GROUP BY risk_level, direction
+      `).all() as { risk_level: string; direction: string; total: number; wins: number }[];
+      const winRates: Record<string, { winRate: number; sampleCount: number }> = {};
+      for (const r of rows) {
+        winRates[`${r.risk_level}:${r.direction}`] = {
+          winRate: r.total > 0 ? r.wins / r.total : 0,
+          sampleCount: r.total,
+        };
+      }
+      res.json({ winRates });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // ── Learning engine routes ─────────────────────────────────────────────────
@@ -2499,6 +2683,25 @@ Critical rules:
       res.status(500).json({ error: err.message }); // FOOTPRINT-STRATEGY:
     } // FOOTPRINT-STRATEGY:
   }); // FOOTPRINT-STRATEGY:
+
+  // GET /api/mc-calibration — return exit_strategy_calibration.json for the MC tab
+  app.get("/api/mc-calibration", (_req, res) => {
+    const candidates = [
+      path.join(process.cwd(), "exit_strategy_calibration.json"),
+      path.join(__dirname, "..", "exit_strategy_calibration.json"),
+      path.join(__dirname, "exit_strategy_calibration.json"),
+    ];
+    const filePath = candidates.find(p => fs.existsSync(p));
+    if (!filePath) {
+      return res.json(null);
+    }
+    try {
+      const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: "Failed to parse calibration: " + e.message });
+    }
+  });
 
   return httpServer;
 }

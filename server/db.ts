@@ -191,6 +191,22 @@ sqlite.exec(`
   );
 `); // SELF-LEARNING:
 
+// SIGNAL-LABELS: persistent user feedback on individual signals (ML training data)
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS signal_labels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_key  TEXT NOT NULL UNIQUE,
+    signal_time INTEGER NOT NULL,
+    direction   TEXT NOT NULL,
+    risk_level  TEXT NOT NULL,
+    outcome     TEXT NOT NULL DEFAULT 'Open',
+    is_bad      INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT,
+    note        TEXT,
+    labeled_at  TEXT DEFAULT (datetime('now'))
+  );
+`); // SIGNAL-LABELS:
+
 // STORAGE FIX: Do NOT wipe cached_candles on startup.
 // MW's persistBulk/persistBar use onConflictDoUpdate — they overwrite individual rows when
 // MW re-syncs, so historical Polygon-downloaded data is never lost across server restarts.
