@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { normalizeSymbol } from "@shared/symbol";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CandlestickChart,
@@ -1004,6 +1005,20 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return () => window.clearInterval(id);
   }, []);
 
+  // On mount: sync autoTradeEnabled from server so the PC reflects the last-known state
+  // (survives browser refresh, new tab, or PC restart mid-session).
+  useEffect(() => {
+    fetch("/api/trade/settings")
+      .then(r => r.ok ? r.json() : null)
+      .then((d: { enabled?: boolean } | null) => {
+        if (d && typeof d.enabled === "boolean") {
+          setAutoTradeEnabled(d.enabled);
+          autoTradeEnabledRef.current = d.enabled;
+        }
+      })
+      .catch(() => {});
+  }, []); // mount only
+
   // Fetch data-driven win rates for ML confidence scores (loads once, updates signalWinRates)
   useEffect(() => {
     fetch("/api/signals/win-rates")
@@ -1307,9 +1322,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           // Bypasses React state entirely — calls series.update() directly so
           // the Y-axis label and candle close update within one animation frame.
           if (msg.type === "tick") {
-            const tickSym = (msg.symbol as string)?.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F", "");
-            const sel     = selectedSymbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F", "");
-            if (tickSym && sel && tickSym.startsWith(sel.substring(0, 2))) {
+            const tickSym = normalizeSymbol(msg.symbol as string);
+            const sel     = normalizeSymbol(selectedSymbol);
+            if (tickSym && sel && tickSym === sel) {
               const p = msg.price as number;
               if (typeof p === "number" && isFinite(p) && p > 0) {
                 // Track last tick time so HTTP poll doesn't overwrite live prices
@@ -1351,9 +1366,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             return;
           }
           if (msg.type === "feedStatus") {
-            const sym = (msg.symbol as string)?.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F","");
-            const sel = selectedSymbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F","");
-            if (sym && sel && sym.startsWith(sel.substring(0, 2))) {
+            const sym = normalizeSymbol(msg.symbol as string);
+            const sel = normalizeSymbol(selectedSymbol);
+            if (sym && sel && sym === sel) {
               setMwFeedStale(msg.status as "live" | "stale" | "unknown");
             }
             return;
@@ -1380,9 +1395,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             // Before first manual Refresh: gate 10s to avoid double-refetch on initial load.
             // Skip this gate during post-reload window — we WANT the bulk_bars data_updated.
             if (!isPostReload && Date.now() - lastRefreshMsRef.current < 10_000) return;
-            const updatedSym = (msg.symbol as string)?.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F","");
-            const selSym = selectedSymbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F","");
-            if (updatedSym && selSym && updatedSym.startsWith(selSym.substring(0, 2))) {
+            const updatedSym = normalizeSymbol(msg.symbol as string);
+            const selSym = normalizeSymbol(selectedSymbol);
+            if (updatedSym && selSym && updatedSym === selSym) {
               queryClient.invalidateQueries({ queryKey: ["/api/data/cached-continuous"] });
               queryClient.invalidateQueries({ queryKey: ["/api/data/cached-days", selectedSymbol] });
             }
@@ -1439,6 +1454,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             autoTradeToastTimer.current = setTimeout(() => setAutoTradeToast(null), 5000);
             return;
           }
+          if (msg.type === "auto_trade_state") {
+            // Another client (e.g. iPhone) toggled auto-trade — mirror the authoritative state.
+            if (typeof msg.enabled === "boolean") {
+              setAutoTradeEnabled(msg.enabled);
+              autoTradeEnabledRef.current = msg.enabled;
+            }
+          }
           if (msg.type === "discord_message") {
             if (window.location.pathname !== "/discord") setDiscordUnread(n => n + 1);
             return;
@@ -1468,9 +1490,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           if (msg.type !== "bar") return;
           const raw = msg.bar;
           // Only merge bars for the currently selected symbol (e.g. MESM6 → MES, MES=F → MES)
-          const sym = (raw.symbol as string)?.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F","");
-          const sel = selectedSymbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F","");
-          if (!sym || !sel || !sym.startsWith(sel.substring(0,2))) return;
+          const sym = normalizeSymbol(raw.symbol as string);
+          const sel = normalizeSymbol(selectedSymbol);
+          if (!sym || !sel || sym !== sel) return;
           // Filter by resolution: only apply bars that match the visible interval
           // 1m chart → accept resolution "1"; 5m/15m → accept resolution "5" or "15"; 60m → accept "60"
           const iv = intervalRef.current;
@@ -1588,7 +1610,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
   const sortedDays = useMemo(() => {
     if (!cachedDaysData?.days?.length) return [];
-    return [...cachedDaysData.days].sort((a, b) => a.date.localeCompare(b.date));
+    const todayStr = new Date().toISOString().split("T")[0];
+    return [...cachedDaysData.days]
+      .filter(d => d.date <= todayStr)              // drop corrupt future-dated days
+      .sort((a, b) => a.date.localeCompare(b.date));
   }, [cachedDaysData]);
 
   const hasCachedData = sortedDays.length > 0;
@@ -1629,7 +1654,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // day list, causing the query key to cascade-change the moment today's date is added.
   const stableToTs = useMemo(() => Math.floor(Date.now() / 1000) + 86400, []);
   const fromTs = useMemo(() => windowedDays.length ? dateToTs(windowedDays[0].date, 0) : fallbackFromTs, [windowedDays, fallbackFromTs]);
-  const toTs   = stableToTs;
+  const toTs   = useMemo(() => {
+    const nowTs = Math.floor(Date.now() / 1000) + 3600;
+    return Math.min(stableToTs, nowTs); // never request bars dated in the future
+  }, [stableToTs]);
 
   const fetchInterval = interval === "60m" ? "60m" : interval === "1m" ? "1m" : "5m";
 
@@ -1943,8 +1971,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     const MAX_PRICE = 9e13;
     // MIN_PRICE rejects corrupt near-zero values (e.g. 2e-19) that pass "> 0" but destroy Y-scale
     const MIN_PRICE = 1;
+    const MAX_TS = Math.floor(Date.now() / 1000) + 36 * 3600; // reject future-dated corrupt bars
     const sorted = (candleData?.candles ?? [])
       .filter(c => {
+        if (c.time <= 1262304000 || c.time > MAX_TS) return false; // corrupt timestamp
         if (!isFinite(c.open) || !isFinite(c.high) || !isFinite(c.low) || !isFinite(c.close)) return false;
         if (c.open < MIN_PRICE || c.high < MIN_PRICE || c.low < MIN_PRICE || c.close < MIN_PRICE) return false;
         if (c.open >= MAX_PRICE || c.high >= MAX_PRICE || c.low >= MAX_PRICE || c.close >= MAX_PRICE) return false;
@@ -4398,7 +4428,16 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                   {autoTradeEnabled ? "AUTO TRADE ON — ORDERS WILL BE PLACED" : "Auto trade disabled"}
                 </span>
                 <button
-                  onClick={() => setAutoTradeEnabled(v => !v)}
+                  onClick={() => {
+                    const next = !autoTradeEnabled;
+                    setAutoTradeEnabled(next);
+                    // Sync to server so iPhone mirrors state via auto_trade_state WS push
+                    fetch("/api/trade/settings", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ enabled: next }),
+                    }).catch(() => {});
+                  }}
                   style={{
                     padding: "4px 12px", borderRadius: 4, fontSize: 11, cursor: "pointer",
                     fontFamily: "'Trebuchet MS', monospace", fontWeight: 700,

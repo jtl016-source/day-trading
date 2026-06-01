@@ -75,6 +75,7 @@ function drawZoneBands() {
   if (zoneCanvas.height !== h) zoneCanvas.height = h;
   ctx.clearRect(0, 0, w, h);
   if (!zonesVisible || !currentZones.length) return;
+  var ts = chart.timeScale();
   for (var i = 0; i < currentZones.length; i++) {
     try {
       var z = currentZones[i];
@@ -85,22 +86,34 @@ function drawZoneBands() {
       var top = Math.min(ty, by);
       var bh = Math.abs(by - ty);
       if (bh < 1) bh = 1;
-      // Full width — no x time clipping, matches PC screenshot
+      // Respect fromTime/toTime so zones from prior sessions don't bleed into today.
+      // Fall back to full chart width only when no time bounds are set.
+      var xLeft = 0, xRight = w;
+      if (z.fromTime) {
+        var xL = ts.timeToCoordinate(z.fromTime);
+        if (xL !== null) xLeft = Math.max(0, xL);
+      }
+      if (z.toTime) {
+        var xR = ts.timeToCoordinate(z.toTime);
+        if (xR !== null) xRight = Math.min(w, xR);
+      }
+      if (xRight <= xLeft) continue;
+      var zw = xRight - xLeft;
       ctx.fillStyle = withAlpha(color, 0.15);
-      ctx.fillRect(0, top, w, bh);
+      ctx.fillRect(xLeft, top, zw, bh);
       ctx.strokeStyle = withAlpha(color, 0.85);
       ctx.lineWidth = 1.5; ctx.setLineDash([]);
-      ctx.beginPath(); ctx.moveTo(0, ty); ctx.lineTo(w, ty); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(xLeft, ty); ctx.lineTo(xRight, ty); ctx.stroke();
       ctx.strokeStyle = withAlpha(color, 0.5);
       ctx.lineWidth = 1; ctx.setLineDash([4,3]);
-      ctx.beginPath(); ctx.moveTo(0, by); ctx.lineTo(w, by); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(xLeft, by); ctx.lineTo(xRight, by); ctx.stroke();
       ctx.setLineDash([]);
-      // Zone label on right edge
+      // Zone label on right edge of the zone (not the chart edge)
       if (z.label) {
         ctx.font = 'bold 9px -apple-system,sans-serif';
         ctx.fillStyle = withAlpha(color, 0.9);
         ctx.textAlign = 'right';
-        ctx.fillText(z.label, w - 4, ty - 3);
+        ctx.fillText(z.label, xRight - 4, ty - 3);
         ctx.textAlign = 'left';
       }
     } catch(ze) {}
@@ -118,11 +131,18 @@ function drawFootprint() {
   var ts = chart.timeScale();
   var keys = Object.keys(fpDataMap);
   if (!keys.length) return;
-  var t0 = parseInt(keys[0]);
-  var x0 = ts.timeToCoordinate(t0);
-  var x1 = ts.timeToCoordinate(t0 + fpBarSec);
-  if (x0 === null || x1 === null) return;
-  var barPx = Math.abs(x1 - x0);
+  // Find bar pixel width from the first TWO consecutive on-screen candles.
+  // Using keys[0] breaks when that candle scrolls off-screen (timeToCoordinate
+  // returns null) — the footprint layer goes entirely blank. Scan until we find
+  // two adjacent visible candles to compute an accurate barPx.
+  var barPx = 0;
+  for (var bi = 0; bi < keys.length - 1; bi++) {
+    var ta = parseInt(keys[bi]);
+    var tb = parseInt(keys[bi + 1]);
+    var xa = ts.timeToCoordinate(ta);
+    var xb = ts.timeToCoordinate(tb);
+    if (xa !== null && xb !== null) { barPx = Math.abs(xb - xa); break; }
+  }
   if (barPx < 18) return;
   var halfW = Math.max(4, Math.floor(barPx / 2) - 1);
   for (var ki = 0; ki < keys.length; ki++) {
@@ -436,6 +456,11 @@ window.prependChartData = function(olderCandles, olderVec1m, olderVec5m, olderVe
   try {
     if (!olderCandles || !olderCandles.length) return;
 
+    // Save the current visible logical range BEFORE setData() so we can restore it.
+    // Without this, lightweight-charts auto-zooms to fit all history after every chunk,
+    // making the chart jump to show tiny candles spanning years.
+    var savedRange = chart ? chart.timeScale().getVisibleLogicalRange() : null;
+
     // Combine older candles with current stored candles (both use real timestamps)
     var allReal = olderCandles.concat(storedCandles);
     storedCandles = allReal;
@@ -461,6 +486,17 @@ window.prependChartData = function(olderCandles, olderVec1m, olderVec5m, olderVe
     }
     candleSeries.setData(remapped);
 
+    // Restore the range the user was viewing before the chunk was prepended.
+    // Shift the range left by the number of newly added bars so the same candles
+    // stay visible (older bars were inserted at the front, shifting all indices right).
+    if (savedRange && chart) {
+      var addedBars = olderCandles.length;
+      chart.timeScale().setVisibleLogicalRange({
+        from: savedRange.from + addedBars,
+        to:   savedRange.to   + addedBars,
+      });
+    }
+
     // Update all vector series
     var vecArrays = {'1m':olderVec1m||[],'5m':olderVec5m||[],'15m':olderVec15m||[],'60m':olderVec60m||[]};
     var tfs = ['1m','5m','15m','60m'];
@@ -468,7 +504,6 @@ window.prependChartData = function(olderCandles, olderVec1m, olderVec5m, olderVe
       vecSeries[tfs[j]].setData(vecArrays[tfs[j]]);
     }
 
-    // Keep view at the right edge
     requestAnimationFrame(function() { drawYellowBox(); drawZoneBands(); });
   } catch(ex) {}
 };
@@ -591,8 +626,11 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
           var p = msg.price;
           // Bucket the tick to the display interval so a new candle appears the
           // instant the interval rolls over, without waiting for the next bar msg.
-          var tickMs = msg.time || Date.now();
-          var bucketSec = Math.floor(tickMs / 1000 / liveDisplaySec) * liveDisplaySec;
+          // msg.time may be Unix seconds (MotiveWave) or milliseconds (browser Date.now).
+          // Normalise to seconds before bucketing — values < 1e10 are already seconds.
+          var tickRaw = msg.time || Date.now();
+          var tickSec = tickRaw > 1e10 ? Math.floor(tickRaw / 1000) : tickRaw;
+          var bucketSec = Math.floor(tickSec / liveDisplaySec) * liveDisplaySec;
           if (!liveLastBar || bucketSec > liveLastBar.time) {
             liveLastBar = { time: bucketSec, open: p, high: p, low: p, close: p, volume: 0 };
           } else {
@@ -638,11 +676,20 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
             if (!found) storedCandles.push(stored);
             // Tell React Native so it can refresh signals from the server
             try { window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'bar_complete', time: dispBucket })); } catch(pe) {}
+          // Also post a signal_new so the RN layer refetches immediately without waiting
+          // for the server broadcast (belt-and-suspenders: server also broadcasts signal_new
+          // when PC persists new signals, but bar_complete is the reliable local trigger).
           }
 
           var barUp = liveLastBar.close >= liveLastBar.open;
           candleSeries.update({ time: liveLastBar.time, open: liveLastBar.open, high: liveLastBar.high, low: liveLastBar.low, close: liveLastBar.close,
             color: barUp ? '#26c87a' : '#ef5350', borderColor: barUp ? '#26c87a' : '#ef5350', wickColor: barUp ? '#26c87a' : '#ef5350' });
+
+        // ── SERVER PUSH MESSAGES ───────────────────────────────────────────────
+        // Forward signal_new and auto_trade_state to React Native so it can
+        // refetch signals or update the auto-trade indicator without polling.
+        } else if (msg.type === 'signal_new' || msg.type === 'auto_trade_state') {
+          try { window.ReactNativeWebView.postMessage(JSON.stringify(msg)); } catch(pe) {}
         }
       } catch(ex) {}
     };
@@ -672,10 +719,15 @@ if (document.readyState === 'loading') {
 
 function aggToInterval(bars: any[], intervalMin: number): any[] {
   if (intervalMin <= 1) return bars;
+  // Use a 30-minute offset for 60m buckets so the RTH open bar (9:30 AM ET = 13:30 UTC)
+  // starts its own bucket instead of falling into the 13:00 UTC bucket.
+  // This matches trading-utils.ts get60mBucket() and the PC chart behavior.
+  const intervalSec = intervalMin * 60;
+  const OFFSET = intervalMin === 60 ? 30 * 60 : 0;
   const out: any[] = [];
   let bucket: any = null;
   for (const b of bars) {
-    const bt = Math.floor(b.time / (intervalMin * 60)) * (intervalMin * 60);
+    const bt = Math.floor((b.time - OFFSET) / intervalSec) * intervalSec + OFFSET;
     if (!bucket || bucket.time !== bt) {
       if (bucket) out.push(bucket);
       bucket = { time: bt, open: b.open, high: b.high, low: b.low, close: b.close, volume: (b.volume || 0) };
@@ -753,23 +805,16 @@ function dedupByTime(arr: any[]): any[] {
   return arr.filter(b => { if (seen.has(b.time)) return false; seen.add(b.time); return true; });
 }
 
-// ── Signal detection — full port of SignalsPanel.tsx computeSignals ────────────
-// Three strategies: Vector (tabletop + side entry) + Footprint (proxy) + Milk Zone (graduated)
-// Risk tiers: safeplus ≥8pts, safe ≥4pts, risky ≥3pts, riskiest ≥1pt
-const COOLDOWN_BARS = 10;   // RTH bars between same-direction signals
-const ETH_COOLDOWN  = 20;   // ETH bars between same-direction signals
-const TP_FIXED_1    = 10.0;
-const TP_FIXED_2    = 20.0;
-const SL_FIXED      = 5.0;
 
-// ── Inline proxy footprint types ──────────────────────────────────────────────
+
+
+// ── Proxy footprint builder — used by session-zone and footprint overlay rendering ──
+// (Not used by signal computation — signals come from /api/signals/history)
 interface FpPriceLevel { price: number; bidVol: number; askVol: number; delta: number; imbalance: 'buy'|'sell'|'none' }
 interface FpCluster    { direction: 'buy'|'sell'; levelCount: number; stacked: boolean }
 interface FpCandle     { time: number; levels: FpPriceLevel[]; totalBidVol: number; totalAskVol: number; candleDelta: number; poc: number; high: number; low: number; imbalances: FpCluster[] }
+const FP_THRESH = 1.5;
 
-const FP_THRESH = 1.5; // proxy-mode imbalance threshold
-
-// Port of buildProxyFootprintCandle from footprint-analysis.ts
 function buildProxyFp(c: any): FpCandle {
   const vol = c.volume ?? 100;
   const isUp = c.close >= c.open;
@@ -779,12 +824,10 @@ function buildProxyFp(c: any): FpCandle {
   const prices: number[] = [];
   for (let p = wLow; p <= wHigh; p++) prices.push(p);
   if (!prices.length) prices.push(Math.round(c.low));
-
   const bodyTicks = Math.max(1, prices.filter(p => p >= bodyBot - 0.5 && p <= bodyTop + 0.5).length);
   const wickTicks = Math.max(1, prices.length - bodyTicks);
   const vBody = (vol * 0.70) / bodyTicks;
   const vWick = (vol * 0.30) / wickTicks;
-
   const levels: FpPriceLevel[] = [];
   let poc = prices[0], maxVol = 0;
   for (const price of prices) {
@@ -801,13 +844,12 @@ function buildProxyFp(c: any): FpCandle {
     } else {
       if (isUp) { bid = lv * 0.70; ask = lv * 0.30; } else { ask = lv * 0.60; bid = lv * 0.40; }
     }
-    const buyR  = bid > 0 ? ask / bid : ask > 0 ? 999 : 1;
+    const buyR = bid > 0 ? ask / bid : ask > 0 ? 999 : 1;
     const sellR = ask > 0 ? bid / ask : bid > 0 ? 999 : 1;
     const imbalance: 'buy'|'sell'|'none' = buyR >= FP_THRESH ? 'buy' : sellR >= FP_THRESH ? 'sell' : 'none';
     levels.push({ price, bidVol: bid, askVol: ask, delta: ask - bid, imbalance });
     if (bid + ask > maxVol) { maxVol = bid + ask; poc = price; }
   }
-
   const imbalances: FpCluster[] = [];
   let csIdx = -1, csDir: 'buy'|'sell'|null = null;
   const flushCluster = (end: number) => {
@@ -818,41 +860,44 @@ function buildProxyFp(c: any): FpCandle {
   for (let i = 0; i < levels.length; i++) {
     const lev = levels[i];
     if (lev.imbalance !== 'none') {
-      if (lev.imbalance === csDir) { /* extend cluster */ }
-      else { flushCluster(i); csIdx = i; csDir = lev.imbalance; }
+      if (lev.imbalance === csDir) {} else { flushCluster(i); csIdx = i; csDir = lev.imbalance; }
     } else flushCluster(i);
   }
   flushCluster(levels.length);
-
   const totalBidVol = levels.reduce((s, l) => s + l.bidVol, 0);
   const totalAskVol = levels.reduce((s, l) => s + l.askVol, 0);
-  return { time: c.time, levels, totalBidVol, totalAskVol,
-           candleDelta: totalAskVol - totalBidVol, poc, high: c.high, low: c.low, imbalances };
+  return { time: c.time, levels, totalBidVol, totalAskVol, candleDelta: totalAskVol - totalBidVol, poc, high: c.high, low: c.low, imbalances };
 }
-
-// Always proxy mode on mobile — no veto, confirmed=false, partial = deltaAgrees
-function analyzeFp(fp: FpCandle, dir: 'Long'|'Short'): { partial: boolean; vetoed: false; isProxyData: true } {
-  const deltaAgrees = dir === 'Long' ? fp.candleDelta > 0 : fp.candleDelta < 0;
-  return { partial: deltaAgrees, vetoed: false, isProxyData: true };
-}
-
-// Exit strategy profiles — mirrors PC SignalsPanel.tsx EXIT_VIEW_PROFILES (RTH tiers)
-const EXIT_STRAT: Record<string, Record<string, { tp1: number; tp2: number; sl: number }>> = {
-  tight:    {
-    safeplus: { tp1: 14.0, tp2: 28.0, sl:  3.5 }, safe:     { tp1: 12.5, tp2: 25.0, sl:  4.0 },
-    risky:    { tp1:  9.0, tp2: 20.0, sl:  5.5 }, riskiest: { tp1:  7.0, tp2: 16.0, sl:  8.0 },
-  },
-  standard: {
-    safeplus: { tp1: 12.0, tp2: 22.0, sl:  4.0 }, safe:     { tp1: 10.0, tp2: 20.0, sl:  5.0 },
-    risky:    { tp1:  7.5, tp2: 17.0, sl:  6.5 }, riskiest: { tp1:  5.5, tp2: 13.0, sl:  9.0 },
-  },
-  wide:     {
-    safeplus: { tp1: 18.0, tp2: 35.0, sl:  8.0 }, safe:     { tp1: 16.0, tp2: 30.0, sl: 10.0 },
-    risky:    { tp1: 12.0, tp2: 25.0, sl: 12.0 }, riskiest: { tp1: 10.0, tp2: 20.0, sl: 15.0 },
-  },
-};
 
 export type OutcomeResult = { outcome: 'Win' | 'Loss' | 'Open'; tpHit: 1 | 2 | null; points: number | null };
+
+// ── Signal mapping helper — converts a DB row (from /api/signals/history) to MobileSignal.
+// Used in both the initial load and the bar_complete refetch path to stay consistent.
+function mapDbSignal(s: any): MobileSignal {
+  const isLong = s.direction === 'Long';
+  const isTp2  = s.outcome === 'win_tp2'  || s.outcome === 'tp2';
+  const isTp1  = s.outcome === 'win_tp1'  || s.outcome === 'win_trailer' || s.outcome === 'tp1';
+  const isLoss = s.outcome === 'loss'     || s.outcome === 'sl';
+  const pts    = isTp2  ? (isLong ? s.tp2 - s.entry : s.entry - s.tp2)
+               : isTp1  ? (isLong ? s.tp1 - s.entry : s.entry - s.tp1)
+               : isLoss ? (isLong ? s.sl  - s.entry : s.entry - s.sl)
+               : null;
+  return {
+    time:         s.timestamp,
+    direction:    s.direction,
+    riskLevel:    s.riskLevel,
+    price:        s.entry,
+    tp1:          s.tp1,
+    tp2:          s.tp2,
+    sl:           s.sl,
+    outcome:      (isTp2 || isTp1) ? 'Win' : isLoss ? 'Loss' : 'Open',
+    tpHit:        isTp2 ? 2 : isTp1 ? 1 : null,
+    points:       pts !== null ? +pts.toFixed(2) : null,
+    rth:          isRTH(s.timestamp),
+    exitOutcomes: {},
+    strategies:   { fp: false, milk: false, vec: false, milkPts: 0 },
+  } as MobileSignal;
+}
 
 export interface MobileSignal {
   time: number;
@@ -872,193 +917,24 @@ export interface MobileSignal {
   strategies: { fp: boolean; milk: boolean; vec: boolean; milkPts: number };
 }
 
-function isBullZone(z: any): boolean {
-  // Label-text is the primary classifier — matches PC market.tsx isBullZone()
-  const lbl = ((z.label || z.label_raw || '') as string).toLowerCase();
-  if (/sell|resist|ceiling|supply|bear|short/.test(lbl)) return false;
-  if (/buy|demand|floor|support|bull|long/.test(lbl))    return true;
-  // Fall back to color
-  const c = (z.fillColor || z.color || '').toLowerCase().trim();
-  if (c === '#22c55e' || c === '#3b82f6' || c === '#14b8a6') return true;
-  const m = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  if (m) { const r = +m[1], g = +m[2], b = +m[3]; return g > r || (b > r && b > g); }
-  return false;
-}
-
-function computeOutcome(
-  sorted: any[], sigIdx: number,
-  tp1: number, tp2: number, sl: number, isLong: boolean, sigPrice: number,
-): { outcome: 'Win' | 'Loss' | 'Open'; tpHit: 1 | 2 | null; points: number | null } {
-  for (let j = sigIdx + 1; j < sorted.length; j++) {
-    const f = sorted[j];
-    if (isLong) {
-      if (f.high >= tp2) return { outcome: 'Win',  tpHit: 2,    points: +(tp2 - sigPrice).toFixed(2) };
-      if (f.high >= tp1) return { outcome: 'Win',  tpHit: 1,    points: +(tp1 - sigPrice).toFixed(2) };
-      if (f.low  <= sl)  return { outcome: 'Loss', tpHit: null, points: +(sl  - sigPrice).toFixed(2) };
-    } else {
-      if (f.low  <= tp2) return { outcome: 'Win',  tpHit: 2,    points: +(sigPrice - tp2).toFixed(2) };
-      if (f.low  <= tp1) return { outcome: 'Win',  tpHit: 1,    points: +(sigPrice - tp1).toFixed(2) };
-      if (f.high >= sl)  return { outcome: 'Loss', tpHit: null, points: +(sigPrice - sl ).toFixed(2) };
-    }
-  }
-  return { outcome: 'Open', tpHit: null, points: null };
-}
-
-function computeSignals(candles: any[], vecMap: Map<number, number>, milkZones: any[]): MobileSignal[] {
-  if (candles.length < 22) return [];
-  const sorted = [...candles].sort((a: any, b: any) => a.time - b.time);
-  const results: MobileSignal[] = [];
-  let lastLongBar = -COOLDOWN_BARS, lastLongEthBar = -ETH_COOLDOWN;
-  let lastShortBar = -COOLDOWN_BARS, lastShortEthBar = -ETH_COOLDOWN;
-
-  // Pre-build proxy footprint for all bars
-  const fpByTime = new Map<number, FpCandle>();
-  for (const c of sorted) fpByTime.set(c.time, buildProxyFp(c));
-
-  for (let i = 1; i < sorted.length; i++) {
-    const c = sorted[i];
-    // Skip the forming bar — its close oscillates with live ticks, causing signals
-    // to flicker. Only completed bars (complete !== false) produce permanent signals.
-    if ((c as any).complete === false) continue;
-    const lb = vecMap.get(c.time);
-    if (lb == null) continue;
-
-    const d = new Date(c.time * 1000);
-    const dow = d.getUTCDay();
-    const utcH = d.getUTCHours();
-    const minsUtc = utcH * 60 + d.getUTCMinutes();
-
-    // Skip CME settlement/market break (4:30–6pm ET) — DST-aware, matches PC isMarketBreak()
-    if (dow >= 1 && dow <= 5) {
-      const etStr = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
-      const etParts = etStr.split(':').map(Number);
-      const etMins = etParts[0] * 60 + etParts[1];
-      if (etMins >= 16 * 60 + 30 && etMins < 18 * 60) continue;
-    }
-
-    const rthFlag      = dow >= 1 && dow <= 5 && minsUtc >= 13 * 60 + 30 && minsUtc < 20 * 60;
-    const isRthForMilk = rthFlag;
-
-    // Graduated milk zone scoring (milkPtsL/S = best zone pts found)
-    let milkBullOk = false, milkBearOk = false;
-    let milkPtsL = 0, milkPtsS = 0;
-    if (isRthForMilk && milkZones.length) {
-      for (const z of milkZones) {
-        if (!(z.fromTime ?? 0) || c.time < z.fromTime || (z.toTime != null && c.time > z.toTime)) continue;
-        const bull = isBullZone(z);
-        if (bull) {
-          if (c.low <= z.topPrice + 0.5) {
-            const below = z.bottomPrice - c.close;
-            const pts = below <= 0.5 ? 3 : below <= 1.5 ? 1 : 0;
-            if (pts > milkPtsL) { milkPtsL = pts; if (pts > 0) milkBullOk = true; }
-          }
-        } else {
-          if (c.high >= z.bottomPrice - 0.5) {
-            const above = c.close - z.topPrice;
-            const pts = above <= 0.5 ? 3 : above <= 1.5 ? 1 : 0;
-            if (pts > milkPtsS) { milkPtsS = pts; if (pts > 0) milkBearOk = true; }
-          }
-        }
-      }
-    }
-
-    const fpCandle = fpByTime.get(c.time)!;
-    const prevBarLb  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
-    const prevBarLb2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
-
-    // ── Long ──────────────────────────────────────────────────────────────────
-    if (c.close > lb) {
-      const fpR = analyzeFp(fpCandle, 'Long');
-      if (!fpR.vetoed) {
-        // Vector Strategy: side-entry or tabletop retest
-        const sideEntry    = prevBarLb != null && sorted[i - 1].close <= prevBarLb && c.close > lb;
-        const tabletopTest = prevBarLb != null && prevBarLb2 != null
-          && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
-          && c.close > lb && c.close >= c.open;
-        const vecTestedL = sideEntry || tabletopTest;
-
-        // Footprint Strategy: proxy always partial (max 2pts), never strong (never 4pts)
-        const fpFires = fpR.partial; // deltaAgrees
-        const fpPts   = fpFires ? 2 : 0;
-        const totalPts = fpPts + milkPtsL + (vecTestedL ? 2 : 0);
-
-        if (totalPts >= 1) {
-          const level: MobileSignal['riskLevel'] =
-            totalPts >= 8 ? 'safeplus' : totalPts >= 4 ? 'safe' : totalPts >= 3 ? 'risky' : 'riskiest';
-          if (!(rthFlag && utcH >= 20 && level !== 'safe' && level !== 'safeplus')) {
-            const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-            const lastBar = rthFlag ? lastLongBar : lastLongEthBar;
-            if (i - lastBar >= cd) {
-              if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
-              const entry = c.close;
-              const tp1 = entry + TP_FIXED_1, tp2 = entry + TP_FIXED_2, sl = entry - SL_FIXED;
-              const { outcome, tpHit, points } = computeOutcome(sorted, i, tp1, tp2, sl, true, entry);
-              const exitOutcomes: MobileSignal['exitOutcomes'] = {};
-              for (const [stratKey, tiers] of Object.entries(EXIT_STRAT)) {
-                const e = tiers[level] ?? tiers['safe'];
-                const etp1 = entry + e.tp1, etp2 = entry + e.tp2, esl = entry - e.sl;
-                exitOutcomes[stratKey] = { ...computeOutcome(sorted, i, etp1, etp2, esl, true, entry), tp1: etp1, tp2: etp2, sl: esl };
-              }
-              results.push({ time: c.time, direction: 'Long', price: entry, tp1, tp2, sl,
-                riskLevel: level, outcome, tpHit, points, rth: rthFlag, exitOutcomes,
-                strategies: { fp: fpFires, milk: milkPtsL > 0, vec: vecTestedL, milkPts: milkPtsL } });
-            }
-          }
-        }
-      }
-    }
-
-    // ── Short ─────────────────────────────────────────────────────────────────
-    if (c.close < lb) {
-      const fpR = analyzeFp(fpCandle, 'Short');
-      if (!fpR.vetoed) {
-        const sideEntry    = prevBarLb != null && sorted[i - 1].close >= prevBarLb && c.close < lb;
-        const tabletopTest = prevBarLb != null && prevBarLb2 != null
-          && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
-          && c.close < lb && c.close <= c.open;
-        const vecTestedS = sideEntry || tabletopTest;
-
-        const fpFires = fpR.partial;
-        const fpPts   = fpFires ? 2 : 0;
-        const totalPts = fpPts + milkPtsS + (vecTestedS ? 2 : 0);
-
-        if (totalPts >= 1) {
-          const level: MobileSignal['riskLevel'] =
-            totalPts >= 8 ? 'safeplus' : totalPts >= 4 ? 'safe' : totalPts >= 3 ? 'risky' : 'riskiest';
-          if (!(rthFlag && utcH >= 20 && level !== 'safe' && level !== 'safeplus')) {
-            const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-            const lastBar = rthFlag ? lastShortBar : lastShortEthBar;
-            if (i - lastBar >= cd) {
-              if (rthFlag) lastShortBar = i; else lastShortEthBar = i;
-              const entry = c.close;
-              const tp1 = entry - TP_FIXED_1, tp2 = entry - TP_FIXED_2, sl = entry + SL_FIXED;
-              const { outcome, tpHit, points } = computeOutcome(sorted, i, tp1, tp2, sl, false, entry);
-              const exitOutcomes: MobileSignal['exitOutcomes'] = {};
-              for (const [stratKey, tiers] of Object.entries(EXIT_STRAT)) {
-                const e = tiers[level] ?? tiers['safe'];
-                const etp1 = entry - e.tp1, etp2 = entry - e.tp2, esl = entry + e.sl;
-                exitOutcomes[stratKey] = { ...computeOutcome(sorted, i, etp1, etp2, esl, false, entry), tp1: etp1, tp2: etp2, sl: esl };
-              }
-              results.push({ time: c.time, direction: 'Short', price: entry, tp1, tp2, sl,
-                riskLevel: level, outcome, tpHit, points, rth: rthFlag, exitOutcomes,
-                strategies: { fp: fpFires, milk: milkPtsS > 0, vec: vecTestedS, milkPts: milkPtsS } });
-            }
-          }
-        }
-      }
-    }
-  }
-  return results;
-}
 
 // ── Yellow Box pivot levels from yesterday's RTH session ──────────────────────
 
+// DST-safe RTH check — matches trading-utils.ts isRTH() exactly.
+// Old version used hardcoded UTC offsets which broke in winter (EST=UTC-5 vs EDT=UTC-4),
+// causing RTH to end at 3 PM ET instead of 4 PM ET from November through March.
+const _nyRthFmt = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+});
 function isRTH(ts: number): boolean {
-  const d = new Date(ts * 1000);
-  const dow = d.getUTCDay();
-  if (dow === 0 || dow === 6) return false;
-  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return mins >= 13 * 60 + 30 && mins < 20 * 60;
+  const parts = _nyRthFmt.formatToParts(new Date(ts * 1000));
+  const day  = parts.find(p => p.type === 'weekday')?.value ?? '';
+  const hour = parseInt(parts.find(p => p.type === 'hour')?.value  ?? '0');
+  const min  = parseInt(parts.find(p => p.type === 'minute')?.value ?? '0');
+  if (day === 'Sat' || day === 'Sun') return false;
+  const etMins = hour * 60 + min;
+  return etMins >= 9 * 60 + 30 && etMins < 16 * 60;
 }
 
 function computeYellowBoxLevels(rawBars: any[]): {
@@ -1228,7 +1104,9 @@ interface ChartViewProps {
 export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewProps) {
   const { instrument, timeframe, apiBaseUrl, strategies, zones } = useApp();
   const webViewRef = useRef<WebView>(null);
-  const [chartReady, setChartReady] = useState(false);
+  const [chartReady,   setChartReady]   = useState(false);
+  // Mirrors the PC's autoTradeEnabled state — read-only on iPhone (display only, no execution).
+  const [autoTradeOn, setAutoTradeOn] = useState(false);
   const [lwScript, setLwScript] = useState<string | null>(null);
   const [lwError, setLwError] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -1383,33 +1261,7 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
             const cutoff = Math.floor(Date.now() / 1000) - 90 * 86400;
             signals = (sd.signals ?? [])
               .filter((s: any) => s.timestamp >= cutoff)
-              .map((s: any) => {
-                const isLong = s.direction === 'Long';
-                // DB stores outcomes as 'win_tp2'/'win_tp1'/'win_trailer'/'loss' (PC format)
-                const isTp2  = s.outcome === 'win_tp2'  || s.outcome === 'tp2';
-                const isTp1  = s.outcome === 'win_tp1'  || s.outcome === 'win_trailer' || s.outcome === 'tp1';
-                const isLoss = s.outcome === 'loss'     || s.outcome === 'sl';
-                const pts = isTp2  ? (isLong ? s.tp2 - s.entry : s.entry - s.tp2)
-                          : isTp1  ? (isLong ? s.tp1 - s.entry : s.entry - s.tp1)
-                          : isLoss ? (isLong ? s.sl  - s.entry : s.entry - s.sl)
-                          : null;
-                const oc: MobileSignal['outcome'] = (isTp2 || isTp1) ? 'Win' : isLoss ? 'Loss' : 'Open';
-                return {
-                  time:         s.timestamp,
-                  direction:    s.direction,
-                  riskLevel:    s.riskLevel,
-                  price:        s.entry,
-                  tp1:          s.tp1,
-                  tp2:          s.tp2,
-                  sl:           s.sl,
-                  outcome:      oc,
-                  tpHit:        isTp2 ? 2 : isTp1 ? 1 : null,
-                  points:       pts !== null ? +pts.toFixed(2) : null,
-                  rth:          isRTH(s.timestamp),
-                  exitOutcomes: {},
-                  strategies:   { fp: false, milk: false, vec: false, milkPts: 0 },
-                } as MobileSignal;
-              });
+              .map(mapDbSignal);
           }
         } catch { /* non-fatal */ }
         if (cancelled) return;
@@ -1641,41 +1493,38 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
                 const cutoff = Math.floor(Date.now() / 1000) - 90 * 86400;
                 const fresh: MobileSignal[] = (sd.signals ?? [])
                   .filter((s: any) => s.timestamp >= cutoff)
-                  .map((s: any) => {
-                    const isLong = s.direction === 'Long';
-                    const isTp2  = s.outcome === 'win_tp2'  || s.outcome === 'tp2';
-                    const isTp1  = s.outcome === 'win_tp1'  || s.outcome === 'win_trailer' || s.outcome === 'tp1';
-                    const isLoss = s.outcome === 'loss'     || s.outcome === 'sl';
-                    const pts = isTp2  ? (isLong ? s.tp2 - s.entry : s.entry - s.tp2)
-                              : isTp1  ? (isLong ? s.tp1 - s.entry : s.entry - s.tp1)
-                              : isLoss ? (isLong ? s.sl  - s.entry : s.entry - s.sl)
-                              : null;
-                    return {
-                      time:         s.timestamp,
-                      direction:    s.direction,
-                      riskLevel:    s.riskLevel,
-                      price:        s.entry,
-                      tp1:          s.tp1,
-                      tp2:          s.tp2,
-                      sl:           s.sl,
-                      outcome:      ((isTp2 || isTp1) ? 'Win' : isLoss ? 'Loss' : 'Open') as MobileSignal['outcome'],
-                      tpHit:        isTp2 ? 2 : isTp1 ? 1 : null,
-                      points:       pts !== null ? +pts.toFixed(2) : null,
-                      rth:          isRTH(s.timestamp),
-                      exitOutcomes: {},
-                      strategies:   { fp: false, milk: false, vec: false, milkPts: 0 },
-                    } as MobileSignal;
-                  });
+                  .map(mapDbSignal);
                 webViewRef.current?.injectJavaScript(
                   `window.setSignals(${JSON.stringify(fresh)});true;`
                 );
                 if (fresh.length) onSignals?.(fresh);
               }).catch(() => {});
+            // ── signal_new: PC just saved new signals — refetch immediately ──────
+            } else if (msg.type === 'signal_new') {
+              fetchWithTimeout(
+                `${apiBaseUrl}/api/signals/history/${encodeURIComponent(sym.toUpperCase())}/${timeframe}`, 6000
+              ).then(async (sr) => {
+                if (!sr.ok) return;
+                const sd = await sr.json();
+                const cutoff = Math.floor(Date.now() / 1000) - 90 * 86400;
+                const fresh: MobileSignal[] = (sd.signals ?? []).filter((s: any) => s.timestamp >= cutoff).map(mapDbSignal);
+                webViewRef.current?.injectJavaScript(`window.setSignals(${JSON.stringify(fresh)});true;`);
+                if (fresh.length) onSignals?.(fresh);
+              }).catch(() => {});
+            // ── auto_trade_state: PC toggled auto-trade — mirror the state here ─
+            } else if (msg.type === 'auto_trade_state') {
+              setAutoTradeOn(msg.enabled === true);
             }
           } catch {}
         }}
         onError={(e) => console.warn('[ChartView] error', e.nativeEvent)}
       />
+      {/* Auto-trade indicator — read-only mirror of the PC's state */}
+      {autoTradeOn && (
+        <View style={styles.autoTradeBadge} pointerEvents="none">
+          <Text style={styles.autoTradeBadgeText}>AUTO TRADE ON</Text>
+        </View>
+      )}
       <Pressable
         style={({ pressed }) => [styles.refreshBtn, pressed && { opacity: 0.6 }]}
         onPress={handleRefresh}
@@ -1699,4 +1548,11 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   refreshIcon: { color: Trading.muted, fontSize: 18, lineHeight: 20 },
+  autoTradeBadge: {
+    position: 'absolute', top: 10, left: 10,
+    backgroundColor: 'rgba(239,83,80,0.18)',
+    borderWidth: 1, borderColor: 'rgba(239,83,80,0.55)',
+    borderRadius: 4, paddingHorizontal: 8, paddingVertical: 3,
+  },
+  autoTradeBadgeText: { color: '#ef5350', fontSize: 10, fontWeight: '700' },
 });

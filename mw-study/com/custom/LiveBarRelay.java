@@ -52,6 +52,9 @@ public class LiveBarRelay extends Study {
   private final TreeMap<Float, long[]> footprintLevels = new TreeMap<>(); // price → [bidVol, askVol]
   private volatile long   footprintBucketMs  = 0;   // current 5-min bucket start (epoch ms)
   private volatile String footprintSymbol    = "";   // symbol of current bucket
+  // Fix 8 diagnostics: warn ONCE if SDK reflection misses the real method name
+  private static final AtomicBoolean warnedNoVol  = new AtomicBoolean(false);
+  private static final AtomicBoolean warnedNoSide = new AtomicBoolean(false);
 
   private final ScheduledExecutorService scheduler =
     Executors.newSingleThreadScheduledExecutor(r -> {
@@ -130,7 +133,9 @@ public class LiveBarRelay extends Study {
 
     // On bucket boundary: flush previous footprint bar then start fresh
     synchronized (footprintLevels) {
-      if (footprintBucketMs != 0 && bucketMs != footprintBucketMs) {
+      boolean bucketRolled  = footprintBucketMs != 0 && bucketMs != footprintBucketMs;
+      boolean symbolChanged = !footprintSymbol.isEmpty() && !symbol.equals(footprintSymbol);
+      if (bucketRolled || symbolChanged) {
         flushFootprintBar(footprintSymbol, footprintBucketMs);
         footprintLevels.clear();
       }
@@ -140,6 +145,10 @@ public class LiveBarRelay extends Study {
       // Extract volume and direction from the Tick object via reflection
       long    vol   = extractLong(tick, "getVolume", "getSize", "getQuantity", "getLastSize");
       boolean isAsk = extractBool(tick, "isAsk", "askTick", "isBuyTick");
+      if (vol == 0 && warnedNoVol.compareAndSet(false, true))
+        System.out.println("[LiveBarRelay] WARNING: no volume method matched on Tick — footprint volume is tick-count only. Fix extractLong() method names.");
+      if (!isAsk && warnedNoSide.compareAndSet(false, true))
+        System.out.println("[LiveBarRelay] WARNING: side method not matched on Tick (defaulting to bid). Fix extractBool() method names if all footprint delta is negative.");
       if (vol <= 0) vol = 1; // treat unknown as 1 contract
 
       long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
@@ -239,12 +248,17 @@ public class LiveBarRelay extends Study {
     int end   = total - 1;
     int start = Math.max(0, end - MAX_HISTORY);
 
-    // Infer resolution from the first consecutive pair of bars
+    // Robust resolution inference: the true bar interval is the SMALLEST positive gap between
+    // consecutive bars. Sampling only the first pair can land on a session/weekend gap and
+    // mis-infer (e.g. tag 1m bars as 60m), after which the server's alignment filter discards
+    // 4 of every 5 genuine bars — leaving huge holes in the chart.
     String resolution = "1";
-    if (start + 1 < end) {
-      long delta = ds.getStartTime(start + 1) - ds.getStartTime(start);
-      resolution = inferResolutionFromDelta(delta);
+    long minDelta = Long.MAX_VALUE;
+    for (int i = start + 1; i < end && i < start + 500; i++) {
+      long d = ds.getStartTime(i) - ds.getStartTime(i - 1);
+      if (d > 0 && d < minDelta) minDelta = d;
     }
+    if (minDelta != Long.MAX_VALUE) resolution = inferResolutionFromDelta(minDelta);
 
     int barCount = end - start;
     System.out.printf("[LiveBarRelay] Dumping history: %d bars (%s) for %s%n",
@@ -321,11 +335,13 @@ public class LiveBarRelay extends Study {
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
   private String inferResolution(DataSeries ds, int index) {
-    if (index > 0) {
-      long delta = ds.getStartTime(index) - ds.getStartTime(index - 1);
-      return inferResolutionFromDelta(delta);
+    long minDelta = Long.MAX_VALUE;
+    int from = Math.max(1, index - 50);
+    for (int i = from; i <= index; i++) {
+      long d = ds.getStartTime(i) - ds.getStartTime(i - 1);
+      if (d > 0 && d < minDelta) minDelta = d;
     }
-    return "1";
+    return minDelta == Long.MAX_VALUE ? "1" : inferResolutionFromDelta(minDelta);
   }
 
   private static String inferResolutionFromDelta(long deltaMs) {
@@ -338,14 +354,26 @@ public class LiveBarRelay extends Study {
 
   // ── WebSocket send ────────────────────────────────────────────────────────────
 
+  private final java.util.concurrent.ConcurrentLinkedQueue<String> sendQueue =
+      new java.util.concurrent.ConcurrentLinkedQueue<>();
+  private static final int MAX_QUEUE = 1000;
+
   private void sendWs(String json) {
     WebSocket w = wsRef.get();
     if (w == null) return;
-    // Drop message if previous send is still in flight (avoids IllegalStateException)
-    if (!pendingSend.get().isDone()) return;
-    CompletableFuture<?> f = w.sendText(json, true).exceptionally(e -> {
-      wsRef.set(null);
-      return null;
+    if (sendQueue.size() >= MAX_QUEUE) sendQueue.poll(); // bound memory: drop OLDEST under pressure
+    sendQueue.offer(json);
+    pump(w);
+  }
+
+  private void pump(WebSocket w) {
+    if (!pendingSend.get().isDone()) return; // a send is in flight; it will re-pump on completion
+    String next = sendQueue.poll();
+    if (next == null) return;
+    CompletableFuture<?> f = w.sendText(next, true).whenComplete((r, e) -> {
+      if (e != null) { wsRef.set(null); return; }
+      WebSocket ww = wsRef.get();
+      if (ww != null) pump(ww);
     });
     pendingSend.set(f);
   }

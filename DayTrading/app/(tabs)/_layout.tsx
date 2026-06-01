@@ -1,5 +1,6 @@
 import { Tabs } from 'expo-router';
 import { IconSymbol } from '@/components/ui/icon-symbol';
+import { Trading } from '@/constants/theme';
 
 export default function TabLayout() {
   return (
@@ -7,19 +8,20 @@ export default function TabLayout() {
       screenOptions={{
         headerShown: false,
         tabBarStyle: {
-          backgroundColor: '#000000',
-          borderTopColor: '#1a1a1a',
+          backgroundColor: Trading.surface,
+          borderTopColor: Trading.border,
           borderTopWidth: 1,
-          height: 58,
-          paddingBottom: 8,
-          paddingTop: 4,
+          height: 62,
+          paddingBottom: 10,
+          paddingTop: 6,
         },
-        tabBarActiveTintColor: '#3d8ef8',
-        tabBarInactiveTintColor: '#444444',
+        tabBarActiveTintColor:   Trading.accent,
+        tabBarInactiveTintColor: Trading.muted,
         tabBarLabelStyle: {
           fontSize: 10,
           fontWeight: '600',
-          letterSpacing: 0.3,
+          letterSpacing: 0.5,
+          marginTop: 1,
         },
       }}
     >
@@ -27,17 +29,17 @@ export default function TabLayout() {
         name="index"
         options={{
           title: 'Signals',
-          tabBarIcon: ({ color }) => (
-            <IconSymbol name="chart.line.uptrend.xyaxis" size={22} color={color} />
+          tabBarIcon: ({ color, size }) => (
+            <IconSymbol name="chart.line.uptrend.xyaxis" size={size ?? 22} color={color} />
           ),
         }}
       />
       <Tabs.Screen
         name="trade"
         options={{
-          title: 'Trade',
-          tabBarIcon: ({ color }) => (
-            <IconSymbol name="arrow.up.arrow.down.circle.fill" size={22} color={color} />
+          title: 'Position',
+          tabBarIcon: ({ color, size }) => (
+            <IconSymbol name="arrow.up.arrow.down.circle.fill" size={size ?? 22} color={color} />
           ),
         }}
       />
@@ -45,8 +47,8 @@ export default function TabLayout() {
         name="journal"
         options={{
           title: 'AutoTrader',
-          tabBarIcon: ({ color }) => (
-            <IconSymbol name="bolt.fill" size={22} color={color} />
+          tabBarIcon: ({ color, size }) => (
+            <IconSymbol name="bolt.fill" size={size ?? 22} color={color} />
           ),
         }}
       />
@@ -54,8 +56,8 @@ export default function TabLayout() {
         name="settings"
         options={{
           title: 'Settings',
-          tabBarIcon: ({ color }) => (
-            <IconSymbol name="gearshape.fill" size={22} color={color} />
+          tabBarIcon: ({ color, size }) => (
+            <IconSymbol name="gearshape.fill" size={size ?? 22} color={color} />
           ),
         }}
       />
@@ -63,8 +65,8 @@ export default function TabLayout() {
         name="explore"
         options={{
           title: 'About',
-          tabBarIcon: ({ color }) => (
-            <IconSymbol name="info.circle.fill" size={22} color={color} />
+          tabBarIcon: ({ color, size }) => (
+            <IconSymbol name="info.circle.fill" size={size ?? 22} color={color} />
           ),
         }}
       />

@@ -13,6 +13,8 @@ import { type Express } from "express";
 import { db } from "./db";
 import { sql } from "drizzle-orm";
 import { cachedCandles } from "@shared/schema";
+import { normalizeSymbol } from "@shared/symbol";
+import { isSaneBarTime } from "@shared/bar-time";
 import { setMWBroadcast, notifyExternalTick, setTickRelayConnected } from "./mw-reader";
 import { cacheInvalidate } from "./cache";
 
@@ -218,26 +220,32 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
         };
 
         if (msg.type === "tick") {
-          const { symbol, price, time } = msg;
+          const { price, time } = msg;
+          const symbol = normalizeSymbol(msg.symbol);
           if (!symbol || typeof price !== "number" || !isFinite(price) || price <= 0) return;
-          broadcast({ type: "tick", symbol: normalizeSym(symbol), price, time: time ?? Date.now() });
+          broadcast({ type: "tick", symbol, price, time: time ?? Date.now() });
           // Keep mw-reader's internal bar state in sync and suppress its disk heartbeat
           notifyExternalTick(symbol, price);
 
         } else if (msg.type === "bar") {
           const bar = msg as LiveBar;
           if (!bar.symbol || !bar.time) return;
-          bar.symbol = normalizeSym(bar.symbol);
-          // Infer resolution if the study didn't include it
-          const res = (msg as any).resolution as string | undefined
-            ?? (bar.time % 3600 === 0 ? "60" : bar.time % 300 === 0 ? "5" : "1");
+          bar.symbol = normalizeSymbol(bar.symbol);
+          // Resolution MUST come from the study (both relays now send it). NEVER guess from the
+          // timestamp: a 1m bar whose start lands on a 5m/60m boundary would be mislabeled,
+          // corrupting higher-TF charts and leaving gaps on the 1m chart.
+          const res = ((msg as any).resolution as string | undefined)?.replace("m", "") ?? "5";
+          if (!(msg as any).resolution) {
+            console.warn(`[mw-feed] bar without resolution for ${bar.symbol} t=${bar.time} — defaulting to 5m (study should always send resolution)`);
+          }
 
           // CATCH-UP CANDLE FIX: validate individual live bars before broadcasting/persisting.
           // A bar with bad OHLC (e.g. h < l, zero prices) would corrupt signals and chart.
           if (bar.high < bar.low || bar.open <= 0 || bar.close <= 0 ||
               !Number.isFinite(bar.open) || !Number.isFinite(bar.high) ||
-              !Number.isFinite(bar.low)  || !Number.isFinite(bar.close)) {
-            console.warn(`[mw-feed] bar: rejected invalid OHLC for ${bar.symbol} t=${bar.time}`);
+              !Number.isFinite(bar.low)  || !Number.isFinite(bar.close) ||
+              !isSaneBarTime(bar.time)) {
+            console.warn(`[mw-feed] bar: rejected invalid OHLC/time for ${bar.symbol} t=${bar.time}`);
             return;
           }
 
@@ -257,7 +265,7 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
         } else if (msg.type === "footprint_bar") { // FOOTPRINT-STRATEGY:
           // Per-price-level bid/ask data from LiveBarRelay footprint accumulator // FOOTPRINT-STRATEGY:
           const fb = msg as any; // FOOTPRINT-STRATEGY:
-          const fbSym = fb.symbol ? normalizeSym(fb.symbol as string) : undefined; // FOOTPRINT-STRATEGY:
+          const fbSym = normalizeSymbol(fb.symbol); // FOOTPRINT-STRATEGY:
           const fbRes = (fb.resolution as string | undefined) ?? "5"; // FOOTPRINT-STRATEGY:
           const fbTime = fb.time as number | undefined; // FOOTPRINT-STRATEGY:
           const fbLevels = fb.levels as Array<{ price: number; b: number; a: number }> | undefined; // FOOTPRINT-STRATEGY:
@@ -269,7 +277,7 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
         } else if (msg.type === "bulk_bars") {
           // History dump from LiveBarRelay — batch upsert into cached_candles
           const bulk = msg as any;
-          const sym  = bulk.symbol ? normalizeSym(bulk.symbol as string) : undefined;
+          const sym  = normalizeSymbol(bulk.symbol) || undefined;
           const rawRes = (bulk.resolution as string | undefined) ?? "1";
           const res = rawRes.replace("m", "");
           const bars = bulk.bars as Array<{ t: number; o: number; h: number; l: number; c: number; v: number }> | undefined;
@@ -288,6 +296,7 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           const intervalSec = parseInt(res, 10) * 60; // e.g. res="5" → 300s
           const validBars = normalizedBars.filter(b => {
             if (!b.t || !b.o || !b.h || !b.l || !b.c) return false;   // missing fields
+            if (!isSaneBarTime(b.t))                  return false;   // future/corrupt-dated
             if (b.h < b.l || b.o <= 0 || b.c <= 0)   return false;   // invalid OHLC
             if (!Number.isFinite(b.o) || !Number.isFinite(b.h) ||
                 !Number.isFinite(b.l) || !Number.isFinite(b.c))       return false; // NaN/Inf
@@ -371,8 +380,9 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
       res.status(400).json({ error: "invalid tick" });
       return;
     }
-    broadcast({ type: "tick", symbol: symbol.toUpperCase(), price, time: time ?? Date.now() });
-    notifyExternalTick(symbol, price);
+    const nsym = normalizeSymbol(symbol);
+    broadcast({ type: "tick", symbol: nsym, price, time: time ?? Date.now() });
+    notifyExternalTick(nsym, price);
     res.json({ ok: true });
   });
 
@@ -433,6 +443,7 @@ export function broadcast(msg: object) {
 }
 
 async function persistBar(bar: LiveBar, resolution = "5") {
+  if (!isSaneBarTime(bar.time)) return; // never persist future/corrupt-dated bars
   if (
     !bar.open || !bar.high || !bar.low || !bar.close ||
     bar.high < bar.low || bar.low < 1000 || bar.high > 100_000 ||
@@ -456,6 +467,8 @@ async function persistBulk(
   resolution: string,
   bars: Array<{ t: number; o: number; h: number; l: number; c: number; v: number }>,
 ) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  bars = bars.filter(b => isSaneBarTime(b.t, nowSec));
   if (!bars.length) return;
   const CHUNK = 500;
   const sym = symbol.toUpperCase();

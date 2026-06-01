@@ -967,3 +967,27 @@ Error: Could not resolve authentication method. Expected either apiKey or authTo
 - Action: `(tabs)/explore.tsx` — replaced default Expo explore screen with About screen: app info card, signal tiers with color dots, strategy descriptions.
 - Note: Custom fonts (Barlow Condensed, DM Sans, JetBrains Mono) NOT installed — spec calls for them but installation requires expo-font setup + font files. Mono font applied via `Fonts.mono` system alias (ui-monospace on iOS). Display headers use system fontWeight '900' which is visually close.
 - Confidence: high
+
+
+**2026-05-29 — PC↔iPhone parity audit: signal dedup, DST fix, auto-trade sync, signal_new push**
+- Observation: `computeSignals()` in `chart-view.tsx` was dead code — never called. iPhone already fetches from `/api/signals/history` (correct path). The dead function was ~300 lines of duplicated signal scoring with stale EXIT_STRAT values (safe.tp1=12.5 vs calibrated 8.5) and proxy-only footprint (2pts max vs PC's 4pts). Left in place, it was a parity risk.
+- Action: Deleted all dead code from `chart-view.tsx`: `computeSignals`, `buildProxyFp`, `analyzeFp`, `EXIT_STRAT`, `computeOutcome`, `isBullZone`, and associated constants/interfaces. Kept `OutcomeResult` and `MobileSignal` (exported, used by index.tsx).
+- Observation: `isRTH()` in `chart-view.tsx` used hardcoded UTC offsets (13:30-20:00 UTC). In winter (EST=UTC-5), this ends RTH at 3:00 PM ET instead of 4:00 PM ET -- signals in the last hour are classified wrong.
+- Action: Replaced with DST-safe version using Intl.DateTimeFormat("America/New_York") -- identical to trading-utils.ts isRTH().
+- Observation: Signal-mapping code (DB row to MobileSignal) was duplicated verbatim in two places (initial load + bar_complete handler).
+- Action: Extracted to mapDbSignal(s: any): MobileSignal helper. Both callers now use it.
+- Observation: iPhone signal sync lagged up to 15 minutes (only refetched on bar_complete WS message).
+- Action: Server POST /api/signals/history now calls broadcast({ type: "signal_new", symbol, interval }) after DB upsert. WebView JS forwards signal_new to React Native. iPhone handles signal_new in onMessage with immediate refetch -- sub-second sync.
+- Observation: autoTradeEnabled on PC lived only in localStorage -- no server state, no iPhone visibility, no way to kill auto-trade remotely.
+- Action: PC toggle now also calls POST /api/trade/settings { enabled } to sync server. Server broadcasts auto_trade_state when enabled changes. PC handles auto_trade_state WS message to stay in sync. iPhone shows read-only "AUTO TRADE ON" badge. PC mount effect reads server state to survive refresh/new tab.
+- Confidence: high
+
+**2026-05-29 — iPhone app redesign: cockpit UI, tier badges, hold-to-arm, hero card**
+- Action: Updated constants/theme.ts — new cockpit palette (bg:#040d12, cool tint), TIER system (safeplus=emerald #10b981, safe=teal #14b8a6, risky=amber, riskiest=red-orange), arm state colors (armOff/armArmed/armLive), direction (long=green/short=red). Kept Colors.light key — collapsible.tsx and use-theme-color.ts require it.
+- Action: New components/tier-badge.tsx — TierBadge + TierChip. Encodes tier as color + glyph (safeplus=diamond, risky=triangle) so tier is never conveyed by color alone.
+- Action: New components/sync-chip.tsx — SyncChip with pulsing dot for SYNCED/NOT SYNCED state.
+- Action: app/(tabs)/journal.tsx redesigned — master arm banner shows OFF/ARMED/LIVE state. Hold-to-arm uses Animated.timing progress fill over 2 seconds (not a one-tap toggle). Fires POST /api/trade/settings only after hold completes. Not connected = button disabled. Pulse beacon only when LIVE. NOT SYNCED banner when enabled but disconnected. All existing settings (contract type, exit mode, direction, risk levels, intervals) preserved.
+- Action: app/(tabs)/index.tsx redesigned — SignalHeroCard at top of signals segment shows most recent signal with tier badge, direction chip, 3-column Stop/Entry/Target (price + pts + $ values), R:R chip, confirmation chips (MilkZone/Vector/Footprint). ScanningCard shown when no signals. Signal feed rows use tier-colored left border instead of flat table. Monospace font for all prices. applyExitProfile, CalendarModal, SignalDetailModal logic unchanged.
+- Action: app/(tabs)/trade.tsx redesigned — TradeCard shows 3-column levels (STOP/ENTRY/TARGET) with pts and $ values. PositionTrack is a horizontal bar with risk/reward fill regions and markers for SL/Entry/TP1/TP2 with filled indicator when hit. All fetch/poll/clear logic unchanged.
+- CRITICAL: buildProxyFp is used by session-zone overlay and footprint rendering — NOT dead code, even though it's also referenced by computeSignals (which IS dead). When removing computeSignals, must keep buildProxyFp + its FpPriceLevel/FpCluster/FpCandle/FP_THRESH types.
+- Confidence: high

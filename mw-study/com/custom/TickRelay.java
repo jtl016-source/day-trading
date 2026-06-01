@@ -134,23 +134,54 @@ public class TickRelay extends Study {
     }
 
     // Always send full bar (server persists completed bars to DB)
+    String resolution = inferResolution(ds, index);
     sendWs(String.format(
-      "{\"type\":\"bar\",\"symbol\":\"%s\",\"time\":%d,\"open\":%.4f,\"high\":%.4f,\"low\":%.4f,\"close\":%.4f,\"volume\":%d,\"complete\":%b}",
-      symbol, timeMs / 1000L, open, high, low, close, volume, complete
+      "{\"type\":\"bar\",\"symbol\":\"%s\",\"resolution\":\"%s\",\"time\":%d,\"open\":%.4f,\"high\":%.4f,\"low\":%.4f,\"close\":%.4f,\"volume\":%d,\"complete\":%b}",
+      symbol, resolution, timeMs / 1000L, open, high, low, close, volume, complete
     ));
+  }
+
+  // ── Resolution inference ────────────────────────────────────────────────────
+  private String inferResolution(DataSeries ds, int index) {
+    long minDelta = Long.MAX_VALUE;
+    int from = Math.max(1, index - 50);
+    for (int i = from; i <= index; i++) {
+      long d = ds.getStartTime(i) - ds.getStartTime(i - 1);
+      if (d > 0 && d < minDelta) minDelta = d;
+    }
+    return minDelta == Long.MAX_VALUE ? "1" : inferResolutionFromDelta(minDelta);
+  }
+
+  private static String inferResolutionFromDelta(long deltaMs) {
+    long minutes = deltaMs / 60_000L;
+    if (minutes >= 50) return "60";
+    if (minutes >= 12) return "15";
+    if (minutes >= 3)  return "5";
+    return "1";
   }
 
   // ── WebSocket send ─────────────────────────────────────────────────────────
 
+  private final java.util.concurrent.ConcurrentLinkedQueue<String> sendQueue =
+      new java.util.concurrent.ConcurrentLinkedQueue<>();
+  private static final int MAX_QUEUE = 1000;
+
   private void sendWs(String json) {
     WebSocket w = wsRef.get();
     if (w == null) return;
-    // Java WebSocket throws IllegalStateException if sendText is called concurrently.
-    // Drop the message if the previous send hasn't completed (on localhost this is rare).
-    if (!pendingSend.get().isDone()) return;
-    CompletableFuture<?> f = w.sendText(json, true).exceptionally(e -> {
-      wsRef.set(null); // mark as disconnected so reconnect timer kicks in
-      return null;
+    if (sendQueue.size() >= MAX_QUEUE) sendQueue.poll(); // bound memory: drop OLDEST under pressure
+    sendQueue.offer(json);
+    pump(w);
+  }
+
+  private void pump(WebSocket w) {
+    if (!pendingSend.get().isDone()) return; // a send is in flight; it will re-pump on completion
+    String next = sendQueue.poll();
+    if (next == null) return;
+    CompletableFuture<?> f = w.sendText(next, true).whenComplete((r, e) -> {
+      if (e != null) { wsRef.set(null); return; }
+      WebSocket ww = wsRef.get();
+      if (ww != null) pump(ww);
     });
     pendingSend.set(f);
   }

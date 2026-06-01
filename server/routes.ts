@@ -7,10 +7,11 @@ import { cacheGet, cacheSet, cacheInvalidate, cacheFlushAll, TTL } from "./cache
 import YahooFinance from "yahoo-finance2";
 import { db } from "./db";
 import { cachedCandles, downloadStatus, newsArticles, appSettings, signalHistory, discordMessages, discordSignals, tradeJournal } from "@shared/schema";
+import { normalizeSymbol } from "@shared/symbol";
 import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
 import { reconnectMWStudies } from "./live-bars";
-import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus } from "./live-bars";
+import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus, broadcast } from "./live-bars";
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, deepBackReadAll, reparseAllZones } from "./discord-reader";
 import { tradeSettings, pushTokens, getCurrentTrade, setCurrentTrade, clearCurrentTrade } from "./trade-state";
@@ -301,7 +302,7 @@ export async function registerRoutes(
 
   // Latest live bar for futures — ?res=1 for 1-min, default 5-min
   app.get("/api/live/bar/:symbol", (req, res) => {
-    const sym = req.params.symbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F", "");
+    const sym = normalizeSymbol(req.params.symbol);
     const resolution = req.query.res === "1" ? "1" : "5";
     const bar = resolution === "1" ? getLatestBar1m(sym) : getLatestBar(sym);
     const price = getLastTickPrice(sym);
@@ -658,10 +659,11 @@ export async function registerRoutes(
           SUM(volume) as volume
         FROM cached_candles
         WHERE symbol = ? AND resolution = '5'
+          AND timestamp BETWEEN 1262304000 AND ?
         GROUP BY DATE(datetime(timestamp, 'unixepoch'))
         ORDER BY date DESC
         LIMIT 2000
-      `).all(sym);
+      `).all(sym, Math.floor(Date.now() / 1000) + 36 * 3600);
       const result = { symbol: sym, days: rows };
       cacheSet(cacheKey, result, TTL.days);
       res.json(result);
@@ -672,10 +674,12 @@ export async function registerRoutes(
 
   app.get("/api/data/cached-continuous/:symbol/:interval", async (req, res) => {
     const { symbol, interval } = req.params;
-    const sym = symbol.toUpperCase();
+    const sym = normalizeSymbol(symbol);
     const resolution = interval === "60m" ? "60" : interval === "1m" ? "1" : "5";
     const fromN = req.query.from ? Number(req.query.from) : 0;
-    const toN   = req.query.to   ? Number(req.query.to)   : Infinity;
+    // Never serve bars dated in the future (corrupt rows) — clamp the upper bound.
+    const maxTs = Math.floor(Date.now() / 1000) + 36 * 3600;
+    const toN   = Math.min(req.query.to ? Number(req.query.to) : Infinity, maxTs);
 
     const cacheKey = `${sym}:continuous:${interval}:${fromN}:${isFinite(toN) ? Math.round(toN / 3600) : "inf"}`;
     const cached = cacheGet<object>(cacheKey);
@@ -1785,6 +1789,7 @@ export async function registerRoutes(
   // POST /api/trade/settings — update full config (persisted in-memory until server restart)
   app.post("/api/trade/settings", (req, res) => {
     const body = req.body as Partial<typeof tradeSettings>;
+    const prevEnabled = tradeSettings.enabled;
     if (typeof body.enabled === "boolean") tradeSettings.enabled = body.enabled;
     if (typeof body.contracts === "number" && body.contracts >= 1) tradeSettings.contracts = Math.floor(body.contracts);
     if (typeof body.tp1Only === "boolean") tradeSettings.tp1Only = body.tp1Only;
@@ -1793,6 +1798,10 @@ export async function registerRoutes(
     if (Array.isArray(body.riskLevels)) tradeSettings.riskLevels = body.riskLevels;
     if (Array.isArray(body.intervals)) tradeSettings.intervals = body.intervals;
     if (['current','tight','standard','wide'].includes(body.exitStrategy as string)) tradeSettings.exitStrategy = body.exitStrategy as typeof tradeSettings.exitStrategy;
+    // Broadcast enabled-state change so all connected clients (iPhone) mirror it immediately
+    if (typeof body.enabled === "boolean" && body.enabled !== prevEnabled) {
+      broadcast({ type: "auto_trade_state", enabled: tradeSettings.enabled });
+    }
     res.json({ ok: true, settings: tradeSettings });
   });
 
@@ -2165,6 +2174,13 @@ export async function registerRoutes(
           updatedAt:        new Date().toISOString(),
         },
       });
+      // Push signal_new to all connected clients so iPhone refetches immediately
+      // instead of waiting for the next bar_complete (up to 15 minutes on a 15m chart).
+      const seen = new Set<string>();
+      for (const v of values) {
+        const key = `${v.symbol}|${v.interval}`;
+        if (!seen.has(key)) { seen.add(key); broadcast({ type: "signal_new", symbol: v.symbol, interval: v.interval }); }
+      }
       res.json({ ok: true, inserted: values.length });
     } catch (err: any) {
       res.status(500).json({ error: err.message });

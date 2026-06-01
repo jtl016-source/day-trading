@@ -8,137 +8,109 @@ import * as ImagePicker from 'expo-image-picker';
 import { useApp, Timeframe, EXIT_PROFILES, type ExitStrategy } from '@/context/app-context';
 import { ChartView, type MobileSignal } from '@/components/chart-view';
 import { StrategyToggle } from '@/components/strategy-toggle';
-import { Trading } from '@/constants/theme';
+import { TierBadge } from '@/components/tier-badge';
+import { Trading, Fonts, TIER, type TierKey } from '@/constants/theme';
 
-type Segment = 'chart' | 'signals';
-type DirFilter  = 'all' | 'long' | 'short';
-type RiskFilter = 'all' | 'safeplus' | 'safe' | 'risky' | 'riskiest';
+type Segment   = 'chart' | 'signals';
+type DirFilter = 'all' | 'long' | 'short';
+type RiskFilter= 'all' | 'safeplus' | 'safe' | 'risky' | 'riskiest';
 const TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '60m'];
+const MES_PER_PT = 5; // $5 per point per MES contract
 
-// ── Color palette ──────────────────────────────────────────────────────────────
-const C = {
-  bg:     '#000000',
-  panel:  '#0d0d0d',
-  border: '#1a1a1a',
-  text:   '#ffffff',
-  muted:  '#888888',
-  dim:    '#555555',
-  accent: '#3d8ef8',
-  up:     '#00e676',
-  down:   '#ff4444',
-};
-
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function fmtDate(ts: number) {
   return new Date(ts * 1000).toLocaleDateString('en-US', {
     month: 'short', day: 'numeric', timeZone: 'America/New_York',
   });
 }
-
 function fmtTime(ts: number) {
   return new Date(ts * 1000).toLocaleTimeString('en-US', {
     hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York',
   });
 }
-
-function rlColor(rl: string) {
-  return rl === 'safeplus' ? '#a78bfa' : rl === 'safe' ? C.up : rl === 'risky' ? '#f59e0b' : C.down;
+function fmtAgo(ts: number): string {
+  const diff = Math.floor(Date.now() / 1000) - ts;
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
+}
+function tierColor(rl: string): string {
+  return TIER[rl as TierKey]?.color ?? Trading.risky;
+}
+function ocColor(oc: string): string {
+  return oc === 'Win' ? Trading.long : oc === 'Loss' ? Trading.short : Trading.muted;
+}
+function ptsToUsd(pts: number, contracts = 1): string {
+  const val = pts * MES_PER_PT * contracts;
+  return `$${Math.abs(val).toFixed(0)}`;
 }
 
-function ocColor(oc: string) {
-  return oc === 'Win' ? C.up : oc === 'Loss' ? C.down : C.muted;
+// 'YYYY-MM-DD' from unix timestamp (ET)
+function toDateKey(ts: number): string {
+  return new Date(ts * 1000).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
 
-// ── Calendar helpers ──────────────────────────────────────────────────────────
-const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+// ── Calendar ──────────────────────────────────────────────────────────────────
+const MONTH_NAMES = ['January','February','March','April','May','June',
+                     'July','August','September','October','November','December'];
 const DOW_LABELS  = ['Su','Mo','Tu','We','Th','Fr','Sa'];
 
-/** 'YYYY-MM-DD' from a unix timestamp (ET timezone) */
-function toDateKey(ts: number): string {
-  const d = new Date(ts * 1000);
-  return d.toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // en-CA = YYYY-MM-DD
-}
-
-/** Grid cells for a month calendar — 6 rows × 7 cols. Cells outside month have day = 0. */
-function buildMonthGrid(year: number, month: number): Array<{ day: number; dateKey: string }> {
+function buildMonthGrid(year: number, month: number) {
   const firstDow = new Date(year, month, 1).getDay();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
   const cells: Array<{ day: number; dateKey: string }> = [];
-  // Leading empty cells
   for (let i = 0; i < firstDow; i++) cells.push({ day: 0, dateKey: '' });
   for (let d = 1; d <= daysInMonth; d++) {
-    const key = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    const key = `${year}-${String(month + 1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     cells.push({ day: d, dateKey: key });
   }
-  // Trailing empty cells to complete the grid
   while (cells.length % 7 !== 0) cells.push({ day: 0, dateKey: '' });
   return cells;
 }
 
-interface CalendarProps {
-  visible: boolean;
-  selectedDate: string | null;    // 'YYYY-MM-DD' or null
-  signalDates: Set<string>;       // dates that have signals
-  onSelect: (dateKey: string | null) => void;
-  onClose: () => void;
-}
-
-function CalendarModal({ visible, selectedDate, signalDates, onSelect, onClose }: CalendarProps) {
+function CalendarModal({ visible, selectedDate, signalDates, onSelect, onClose }:
+  { visible: boolean; selectedDate: string | null; signalDates: Set<string>; onSelect: (k: string | null) => void; onClose: () => void }) {
   const today = new Date();
-  const [viewYear,  setViewYear]  = useState(today.getFullYear());
+  const [viewYear, setViewYear] = useState(today.getFullYear());
   const [viewMonth, setViewMonth] = useState(today.getMonth());
   const todayKey = toDateKey(Math.floor(today.getTime() / 1000));
   const grid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
 
-  function prevMonth() {
-    if (viewMonth === 0) { setViewYear(y => y - 1); setViewMonth(11); }
-    else setViewMonth(m => m - 1);
-  }
-  function nextMonth() {
-    if (viewMonth === 11) { setViewYear(y => y + 1); setViewMonth(0); }
-    else setViewMonth(m => m + 1);
-  }
+  const prevMonth = () => { if (viewMonth === 0) { setViewYear(y => y - 1); setViewMonth(11); } else setViewMonth(m => m - 1); };
+  const nextMonth = () => { if (viewMonth === 11) { setViewYear(y => y + 1); setViewMonth(0);  } else setViewMonth(m => m + 1); };
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable style={cal.backdrop} onPress={onClose}>
         <Pressable style={cal.sheet} onPress={e => e.stopPropagation()}>
-          {/* Header */}
           <View style={cal.header}>
             <Pressable onPress={prevMonth} style={cal.navBtn}><Text style={cal.navArrow}>‹</Text></Pressable>
             <Text style={cal.monthLabel}>{MONTH_NAMES[viewMonth]} {viewYear}</Text>
             <Pressable onPress={nextMonth} style={cal.navBtn}><Text style={cal.navArrow}>›</Text></Pressable>
           </View>
-          {/* DOW labels */}
-          <View style={cal.dowRow}>
-            {DOW_LABELS.map(d => <Text key={d} style={cal.dowLabel}>{d}</Text>)}
-          </View>
-          {/* Day grid */}
+          <View style={cal.dowRow}>{DOW_LABELS.map(d => <Text key={d} style={cal.dowLabel}>{d}</Text>)}</View>
           <View style={cal.grid}>
             {grid.map((cell, i) => {
               if (cell.day === 0) return <View key={i} style={cal.dayCell} />;
-              const isToday    = cell.dateKey === todayKey;
-              const isSel      = cell.dateKey === selectedDate;
-              const hasSignals = signalDates.has(cell.dateKey);
-              const dow = (i % 7);
-              const isWeekend = dow === 0 || dow === 6;
+              const isToday = cell.dateKey === todayKey;
+              const isSel   = cell.dateKey === selectedDate;
+              const hasSig  = signalDates.has(cell.dateKey);
+              const isWknd  = (i % 7 === 0 || i % 7 === 6);
               return (
                 <Pressable key={cell.dateKey} style={[cal.dayCell, isSel && cal.daySel, isToday && !isSel && cal.dayToday]}
                   onPress={() => { onSelect(isSel ? null : cell.dateKey); onClose(); }}>
-                  <Text style={[cal.dayText, isSel && cal.dayTextSel, isWeekend && !isSel && { color: C.muted }, !isSel && isToday && { color: C.accent }]}>
-                    {cell.day}
-                  </Text>
-                  {hasSignals && !isSel && <View style={cal.dot} />}
+                  <Text style={[cal.dayText, isSel && cal.dayTextSel, isWknd && !isSel && { color: Trading.muted }, !isSel && isToday && { color: Trading.accent }]}>{cell.day}</Text>
+                  {hasSig && !isSel && <View style={cal.dot} />}
                 </Pressable>
               );
             })}
           </View>
-          {/* Footer */}
           <View style={cal.footer}>
-            <Pressable style={cal.clearBtn} onPress={() => { onSelect(toDateKey(Math.floor(Date.now() / 1000))); onClose(); }}>
-              <Text style={cal.clearText}>Today Only</Text>
+            <Pressable style={cal.clearBtn} onPress={() => { onSelect(toDateKey(Math.floor(Date.now()/1000))); onClose(); }}>
+              <Text style={cal.clearText}>Today</Text>
             </Pressable>
-            <Pressable style={[cal.clearBtn, { borderColor: C.dim }]} onPress={() => { onSelect(null); onClose(); }}>
-              <Text style={[cal.clearText, { color: C.muted }]}>All Dates</Text>
+            <Pressable style={[cal.clearBtn, { borderColor: Trading.muted + '44' }]} onPress={() => { onSelect(null); onClose(); }}>
+              <Text style={[cal.clearText, { color: Trading.muted }]}>All Dates</Text>
             </Pressable>
           </View>
         </Pressable>
@@ -147,7 +119,7 @@ function CalendarModal({ visible, selectedDate, signalDates, onSelect, onClose }
   );
 }
 
-// ── Apply an exit strategy profile to a signal using pre-computed outcomes ─────
+// ── Apply exit profile ────────────────────────────────────────────────────────
 function applyExitProfile(sig: MobileSignal, strategy: ExitStrategy): MobileSignal {
   if (strategy === 'current') return sig;
   const pre = sig.exitOutcomes[strategy];
@@ -155,124 +127,242 @@ function applyExitProfile(sig: MobileSignal, strategy: ExitStrategy): MobileSign
   return { ...sig, tp1: pre.tp1, tp2: pre.tp2, sl: pre.sl, outcome: pre.outcome, tpHit: pre.tpHit, points: pre.points };
 }
 
-// ── Signal detail bottom sheet ─────────────────────────────────────────────────
-interface SignalDetailProps {
-  sig: MobileSignal;
-  onClose: () => void;
-  onViewOnChart: (time: number) => void;
+// ── Confirmation chips ────────────────────────────────────────────────────────
+function ConfirmChips({ sig, compact = false }: { sig: MobileSignal; compact?: boolean }) {
+  const chips = [
+    { key: 'milk', label: compact ? 'MZ' : 'MilkZone', pts: sig.strategies.milkPts, active: sig.strategies.milk },
+    { key: 'vec',  label: compact ? 'Vec' : 'Vector',   pts: 2,                       active: sig.strategies.vec  },
+    { key: 'fp',   label: compact ? 'FP' : 'Footprint', pts: 2,                       active: sig.strategies.fp   },
+  ];
+  return (
+    <View style={{ flexDirection: 'row', gap: 4 }}>
+      {chips.map(c => (
+        <View key={c.key} style={[cc.chip,
+          c.active ? { borderColor: Trading.safe + '60', backgroundColor: Trading.safe + '14' }
+                   : { borderColor: Trading.dim + '40', opacity: 0.45 }]}>
+          <Text style={[cc.text, { color: c.active ? Trading.safe : Trading.muted }]}>
+            {c.active ? '✓ ' : '— '}{c.label}
+          </Text>
+        </View>
+      ))}
+    </View>
+  );
 }
+const cc = StyleSheet.create({
+  chip: { borderWidth: 1, borderRadius: 4, paddingHorizontal: 6, paddingVertical: 2 },
+  text: { fontSize: 10, fontWeight: '600' },
+});
 
-function SignalDetailModal({ sig, onClose, onViewOnChart }: SignalDetailProps) {
+// ── Hero Signal Card ──────────────────────────────────────────────────────────
+function SignalHeroCard({ sig, onTap }: { sig: MobileSignal; onTap: () => void }) {
+  const isLong  = sig.direction === 'Long';
+  const tc      = tierColor(sig.riskLevel);
+  const slPts   = Math.abs(sig.price - sig.sl);
+  const tp1Pts  = Math.abs(sig.price - sig.tp1);
+  const rrRatio = slPts > 0 ? (tp1Pts / slPts).toFixed(1) : '—';
+  const isWin   = sig.outcome === 'Win';
+  const isLoss  = sig.outcome === 'Loss';
+
+  const cols = [
+    { label: 'STOP',   price: sig.sl,    pts: slPts,  color: Trading.short },
+    { label: 'ENTRY',  price: sig.price,  pts: 0,      color: Trading.text  },
+    { label: 'TARGET', price: sig.tp1,    pts: tp1Pts, color: Trading.long  },
+  ];
+
+  return (
+    <Pressable onPress={onTap} style={[hc.card, { borderColor: tc + '55' }]}>
+      {/* Tier-colored accent bar */}
+      <View style={[hc.accentBar, { backgroundColor: tc }]} />
+
+      <View style={hc.inner}>
+        {/* Row 1: Tier + direction + time */}
+        <View style={hc.topRow}>
+          <TierBadge level={sig.riskLevel} size="md" />
+          <View style={[hc.dirChip, { backgroundColor: (isLong ? Trading.long : Trading.short) + '20', borderColor: (isLong ? Trading.long : Trading.short) + '60' }]}>
+            <Text style={[hc.dirText, { color: isLong ? Trading.long : Trading.short }]}>
+              {isLong ? '▲ LONG' : '▼ SHORT'}
+            </Text>
+          </View>
+          <View style={{ flex: 1 }} />
+          <Text style={hc.agoText}>{fmtAgo(sig.time)}</Text>
+        </View>
+
+        <Text style={hc.candle}>on closed candle · {fmtDate(sig.time)} {fmtTime(sig.time)}</Text>
+
+        {/* Row 2: Stop / Entry / Target */}
+        <View style={hc.levelsRow}>
+          {cols.map((col, i) => (
+            <View key={col.label} style={[hc.levelCol, i === 1 && hc.levelColCenter]}>
+              <Text style={[hc.levelLabel, { color: col.color }]}>{col.label}</Text>
+              <Text style={[hc.levelPrice, { color: col.color, fontFamily: Fonts?.mono }]}>{col.price.toFixed(2)}</Text>
+              {col.pts > 0 && (
+                <Text style={[hc.levelSub, { fontFamily: Fonts?.mono }]}>
+                  {col.pts.toFixed(1)} pts · {ptsToUsd(col.pts)}
+                </Text>
+              )}
+            </View>
+          ))}
+        </View>
+
+        {/* Row 3: R:R + outcome + confirmation chips */}
+        <View style={hc.footerRow}>
+          <View style={hc.rrChip}>
+            <Text style={hc.rrLabel}>R:R</Text>
+            <Text style={[hc.rrValue, { fontFamily: Fonts?.mono }]}>1 : {rrRatio}</Text>
+          </View>
+          {sig.outcome !== 'Open' && (
+            <View style={[hc.outcomeChip, { backgroundColor: ocColor(sig.outcome) + '20', borderColor: ocColor(sig.outcome) + '55' }]}>
+              <Text style={[hc.outcomeText, { color: ocColor(sig.outcome) }]}>
+                {isWin ? `Win TP${sig.tpHit}` : isLoss ? 'Loss' : 'Open'}
+                {sig.points !== null ? `  ${sig.points >= 0 ? '+' : ''}${sig.points.toFixed(1)}pts` : ''}
+              </Text>
+            </View>
+          )}
+          <View style={{ flex: 1 }} />
+          <ConfirmChips sig={sig} compact />
+        </View>
+      </View>
+    </Pressable>
+  );
+}
+const hc = StyleSheet.create({
+  card: {
+    marginHorizontal: 14, marginTop: 10,
+    borderRadius: 12, borderWidth: 1,
+    backgroundColor: Trading.surface,
+    flexDirection: 'row', overflow: 'hidden',
+  },
+  accentBar: { width: 4 },
+  inner: { flex: 1, padding: 14, gap: 10 },
+  topRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  dirChip: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
+  dirText: { fontSize: 13, fontWeight: '800', letterSpacing: 0.5 },
+  agoText: { color: Trading.muted, fontSize: 11 },
+  candle:  { color: Trading.muted, fontSize: 10, marginTop: -6 },
+  levelsRow: { flexDirection: 'row', gap: 0 },
+  levelCol: { flex: 1, alignItems: 'center', gap: 2 },
+  levelColCenter: { borderLeftWidth: 1, borderRightWidth: 1, borderColor: Trading.border },
+  levelLabel: { fontSize: 9, fontWeight: '700', letterSpacing: 1 },
+  levelPrice: { fontSize: 18, fontWeight: '700' },
+  levelSub:   { fontSize: 9, color: Trading.textSecondary },
+  footerRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  rrChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    backgroundColor: Trading.surfaceAlt, borderRadius: 6,
+    paddingHorizontal: 8, paddingVertical: 4,
+    borderWidth: 1, borderColor: Trading.border,
+  },
+  rrLabel: { color: Trading.muted, fontSize: 9, fontWeight: '700', letterSpacing: 0.5 },
+  rrValue: { color: Trading.text, fontSize: 11, fontWeight: '700' },
+  outcomeChip: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 3 },
+  outcomeText: { fontSize: 10, fontWeight: '700' },
+});
+
+// ── No-signal scanning state ──────────────────────────────────────────────────
+function ScanningCard() {
+  return (
+    <View style={sc.card}>
+      <Text style={sc.icon}>◌</Text>
+      <Text style={sc.title}>Scanning — no qualifying setup</Text>
+      <Text style={sc.sub}>A signal will appear here when MilkZone + Vector + Footprint align on a closed candle</Text>
+    </View>
+  );
+}
+const sc = StyleSheet.create({
+  card:  { marginHorizontal: 14, marginTop: 10, backgroundColor: Trading.surface, borderRadius: 12, borderWidth: 1, borderColor: Trading.border, padding: 24, alignItems: 'center', gap: 8 },
+  icon:  { fontSize: 32, color: Trading.muted, marginBottom: 4 },
+  title: { color: Trading.textSecondary, fontSize: 14, fontWeight: '600' },
+  sub:   { color: Trading.muted, fontSize: 11, textAlign: 'center', lineHeight: 16 },
+});
+
+// ── Signal detail modal ───────────────────────────────────────────────────────
+function SignalDetailModal({ sig, onClose, onViewOnChart }: { sig: MobileSignal; onClose: () => void; onViewOnChart: (t: number) => void }) {
   const isLong = sig.direction === 'Long';
-  const rl     = rlColor(sig.riskLevel);
+  const tc     = tierColor(sig.riskLevel);
   const oc     = ocColor(sig.outcome);
   const slDist = Math.abs(sig.sl - sig.price);
   const rr     = slDist > 0 ? +(Math.abs(sig.tp1 - sig.price) / slDist).toFixed(2) : null;
 
   const levels = [
-    { label: 'Entry', value: sig.price.toFixed(2), color: C.text },
-    { label: 'TP1',   value: sig.tp1.toFixed(2),   color: '#67e8f9' },
-    { label: 'TP2',   value: sig.tp2.toFixed(2),   color: '#22d3ee' },
-    { label: 'SL',    value: sig.sl.toFixed(2),    color: '#f87171' },
+    { label: 'Entry', value: sig.price.toFixed(2), color: Trading.text },
+    { label: 'TP1',   value: sig.tp1.toFixed(2),   color: Trading.long },
+    { label: 'TP2',   value: sig.tp2.toFixed(2),   color: Trading.long },
+    { label: 'SL',    value: sig.sl.toFixed(2),    color: Trading.short },
   ];
 
   return (
     <Modal visible transparent animationType="slide" onRequestClose={onClose}>
       <Pressable style={det.backdrop} onPress={onClose}>
         <Pressable style={det.sheet} onPress={e => e.stopPropagation()}>
-
-          {/* Header row */}
+          {/* Header */}
           <View style={det.header}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-              <Text style={[det.dir, { color: isLong ? C.up : C.down }]}>
-                {isLong ? '▲ Long' : '▼ Short'}
-              </Text>
-              <View style={[det.badge, { borderColor: rl + '55', backgroundColor: rl + '18' }]}>
-                <Text style={[det.badgeText, { color: rl }]}>{sig.riskLevel}</Text>
-              </View>
-              {!sig.rth && (
-                <View style={[det.badge, { borderColor: C.muted + '44', backgroundColor: C.muted + '11' }]}>
-                  <Text style={[det.badgeText, { color: C.muted }]}>ETH</Text>
-                </View>
-              )}
+            <TierBadge level={sig.riskLevel} size="lg" />
+            <View style={[det.dirChip, { backgroundColor: (isLong ? Trading.long : Trading.short) + '20', borderColor: (isLong ? Trading.long : Trading.short) + '55' }]}>
+              <Text style={[det.dirText, { color: isLong ? Trading.long : Trading.short }]}>{isLong ? '▲ LONG' : '▼ SHORT'}</Text>
             </View>
-            <Pressable onPress={onClose} style={det.closeBtn} hitSlop={10}>
-              <Text style={det.closeTxt}>✕</Text>
+            {!sig.rth && (
+              <View style={[det.tagChip, { borderColor: Trading.muted + '40' }]}>
+                <Text style={[det.tagText, { color: Trading.muted }]}>ETH</Text>
+              </View>
+            )}
+            <View style={{ flex: 1 }} />
+            <Pressable onPress={onClose} hitSlop={12}>
+              <Text style={det.close}>✕</Text>
             </Pressable>
           </View>
+          <Text style={det.subtitle}>{fmtDate(sig.time)} · {fmtTime(sig.time)}</Text>
 
-          <Text style={det.subtitle}>{fmtDate(sig.time)}  ·  {fmtTime(sig.time)}</Text>
-
-          {/* Price levels table */}
+          {/* Price levels */}
           <View style={det.table}>
             {levels.map((row, i) => (
               <View key={row.label} style={[det.tRow, i === levels.length - 1 && { borderBottomWidth: 0 }]}>
                 <Text style={det.tLabel}>{row.label}</Text>
-                <Text style={[det.tValue, { color: row.color }]}>{row.value}</Text>
+                <View style={{ alignItems: 'flex-end', gap: 1 }}>
+                  <Text style={[det.tValue, { color: row.color, fontFamily: Fonts?.mono }]}>{row.value}</Text>
+                  {row.label !== 'Entry' && (
+                    <Text style={det.tSub}>{Math.abs(+row.value - sig.price).toFixed(2)} pts · {ptsToUsd(Math.abs(+row.value - sig.price))}</Text>
+                  )}
+                </View>
               </View>
             ))}
           </View>
 
-          {/* R:R */}
-          {rr !== null && (
-            <Text style={det.rr}>Risk / Reward  ·  1 : {rr}</Text>
-          )}
+          {rr !== null && <Text style={det.rr}>Risk / Reward · 1 : {rr}</Text>}
 
-          {/* Strategies used */}
-          <View style={det.stratRow}>
-            <Text style={det.stratLabel}>Strategies</Text>
-            <View style={det.stratChips}>
-              {[
-                { key: 'fp',   label: 'Footprint',  active: sig.strategies.fp,   detail: sig.strategies.fp ? 'delta agrees' : '' },
-                { key: 'milk', label: sig.strategies.milkPts === 3 ? 'Milk ×3' : sig.strategies.milkPts === 1 ? 'Milk ×1' : 'Milk Zone',
-                               active: sig.strategies.milk,  detail: sig.strategies.milk ? `${sig.strategies.milkPts}pts` : '' },
-                { key: 'vec',  label: 'Vector',      active: sig.strategies.vec,  detail: sig.strategies.vec ? '2pts' : '' },
-              ].map(st => (
-                <View key={st.key}
-                  style={[det.stratChip,
-                    st.active
-                      ? { borderColor: '#4ade8055', backgroundColor: '#4ade8012' }
-                      : { borderColor: C.border,    backgroundColor: 'transparent', opacity: 0.4 }]}>
-                  <Text style={[det.stratChipTxt, { color: st.active ? '#4ade80' : C.muted }]}>
-                    {st.active ? '✓ ' : '— '}{st.label}
-                  </Text>
-                </View>
-              ))}
-            </View>
+          {/* Confirmation chips */}
+          <View style={{ marginBottom: 14 }}>
+            <Text style={det.sectionLabel}>CONFIRMATIONS</Text>
+            <ConfirmChips sig={sig} />
           </View>
 
-          {/* Outcome + P&L */}
+          {/* Outcome */}
           <View style={det.outcomeRow}>
             <Text style={[det.outcomeText, { color: oc }]}>
-              {sig.outcome === 'Open' ? 'Open trade'
-                : sig.outcome === 'Win' ? `Win — TP${sig.tpHit}`
-                : 'Loss'}
+              {sig.outcome === 'Open' ? 'Open trade' : sig.outcome === 'Win' ? `Win — TP${sig.tpHit}` : 'Loss'}
             </Text>
             {sig.points !== null && (
-              <Text style={[det.pnlText, { color: sig.points >= 0 ? C.up : C.down }]}>
+              <Text style={[det.pnlText, { color: sig.points >= 0 ? Trading.long : Trading.short }]}>
                 {sig.points >= 0 ? '+' : ''}{sig.points.toFixed(2)} pts
               </Text>
             )}
           </View>
 
-          {/* View on Chart */}
-          <Pressable style={({ pressed }) => [det.chartBtn, pressed && { opacity: 0.75 }]}
-            onPress={() => onViewOnChart(sig.time)}>
+          <Pressable style={det.chartBtn} onPress={() => onViewOnChart(sig.time)}>
             <Text style={det.chartBtnTxt}>View on Chart  →</Text>
           </Pressable>
-
         </Pressable>
       </Pressable>
     </Modal>
   );
 }
 
+// ── Main Signals Tab ──────────────────────────────────────────────────────────
 export default function SignalsTab() {
   const { timeframe, setTimeframe, apiBaseUrl, strategies, toggleStrategy, zones, setZones, exitStrategy } = useApp();
-  const [segment, setSegment]       = useState<Segment>('chart');
+  const [segment,      setSegment]      = useState<Segment>('chart');
   const [chartSignals, setChartSignals] = useState<MobileSignal[]>([]);
-  const [dirFilter,  setDirFilter]  = useState<DirFilter>('all');
-  const [riskFilter, setRiskFilter] = useState<RiskFilter>('all');
+  const [dirFilter,    setDirFilter]    = useState<DirFilter>('all');
+  const [riskFilter,   setRiskFilter]   = useState<RiskFilter>('all');
   const [selectedDate, setSelectedDate] = useState<string | null>(() => toDateKey(Math.floor(Date.now() / 1000)));
   const [calVisible,   setCalVisible]   = useState(false);
   const [importingZones, setImportingZones] = useState(false);
@@ -281,12 +371,10 @@ export default function SignalsTab() {
   const [rthOnly,      setRthOnly]      = useState(false);
   const priceRangeRef = useRef<{ high: number; low: number } | null>(null);
 
-  // ── Chart signals callback ─────────────────────────────────────────────────
   const onChartSignals = useCallback((sigs: MobileSignal[]) => {
     setChartSignals([...sigs].sort((a, b) => b.time - a.time));
   }, []);
 
-  // ── Filtered & stats ───────────────────────────────────────────────────────
   const signalDates = useMemo(() => {
     const s = new Set<string>();
     chartSignals.forEach(sig => s.add(toDateKey(sig.time)));
@@ -308,118 +396,96 @@ export default function SignalsTab() {
 
   const stats = useMemo(() => {
     const decided = filtered.filter(s => s.outcome !== 'Open');
-    const wins = decided.filter(s => s.outcome === 'Win').length;
-    const pnl  = decided.reduce((sum, s) => sum + (s.points ?? 0), 0);
+    const wins    = decided.filter(s => s.outcome === 'Win').length;
+    const pnl     = decided.reduce((sum, s) => sum + (s.points ?? 0), 0);
     return {
-      total:  filtered.length,
-      wins,
-      losses: decided.length - wins,
-      open:   filtered.length - decided.length,
-      wr:     decided.length ? Math.round(wins / decided.length * 100) : null,
-      pnl,
+      total: filtered.length, wins, losses: decided.length - wins,
+      open: filtered.length - decided.length,
+      wr: decided.length ? Math.round(wins / decided.length * 100) : null, pnl,
     };
   }, [filtered]);
 
-  // ── Zone import ────────────────────────────────────────────────────────────
+  // Most recent signal for hero card (from ALL signals, not just filtered)
+  const heroSig = chartSignals[0] ?? null;
+
   async function importZones() {
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!perm.granted) {
-      Alert.alert('Permission needed', 'Allow photo library access to import zones.');
-      return;
-    }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'], quality: 0.9, base64: true, allowsEditing: false,
-    });
+    if (!perm.granted) { Alert.alert('Permission needed', 'Allow photo library access to import zones.'); return; }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9, base64: true });
     if (result.canceled || !result.assets[0]) return;
     const asset = result.assets[0];
     if (!asset.base64) { Alert.alert('Error', 'Could not read image data.'); return; }
-
     setImportingZones(true);
     try {
       const resp = await fetch(`${apiBaseUrl}/api/zones/parse`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filename:   asset.fileName ?? 'screenshot.png',
-          data:       asset.base64,
-          mediaType:  asset.mimeType ?? 'image/png',
-          visibleHigh: priceRangeRef.current?.high,
-          visibleLow:  priceRangeRef.current?.low,
-        }),
+        body: JSON.stringify({ filename: asset.fileName ?? 'screenshot.png', data: asset.base64, mediaType: asset.mimeType ?? 'image/png', visibleHigh: priceRangeRef.current?.high, visibleLow: priceRangeRef.current?.low }),
       });
       const data = await resp.json();
       if (data.zones?.length) {
         setZones(data.zones);
         Alert.alert('Zones loaded', `Found ${data.zones.length} zone${data.zones.length !== 1 ? 's' : ''}.`);
-      } else {
-        Alert.alert('No zones found', 'Could not detect zones in this image.');
-      }
+      } else Alert.alert('No zones found', 'Could not detect zones in this image.');
     } catch (e) {
       Alert.alert('Import failed', String(e));
-    } finally {
-      setImportingZones(false);
-    }
+    } finally { setImportingZones(false); }
   }
-
-  const showZoneBanner = strategies.milkZones && zones.length === 0;
-  const showZoneBadge  = strategies.milkZones && zones.length > 0;
 
   return (
     <SafeAreaView style={s.safe} edges={['top']}>
-      {/* Timeframe selector */}
-      <View style={s.tfBar}>
-        {TIMEFRAMES.map(tf => (
-          <Pressable key={tf} onPress={() => setTimeframe(tf)}
-            style={[s.tfBtn, timeframe === tf && s.tfBtnActive]}>
-            <Text style={[s.tfLabel, timeframe === tf && s.tfLabelActive]}>{tf}</Text>
+
+      {/* ── App bar ──────────────────────────────────────────────────────────── */}
+      <View style={s.appBar}>
+        <View style={s.tfRow}>
+          {TIMEFRAMES.map(tf => (
+            <Pressable key={tf} onPress={() => setTimeframe(tf)}
+              style={[s.tfBtn, timeframe === tf && { borderColor: Trading.accent, backgroundColor: Trading.accent + '22' }]}>
+              <Text style={[s.tfLabel, timeframe === tf && { color: Trading.accent }]}>{tf}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {/* Segmented control */}
+        <View style={s.segPill}>
+          <Pressable style={[s.segBtn, segment === 'chart'   && s.segBtnOn]} onPress={() => { setSegment('chart'); setScrollToTime(null); }}>
+            <Text style={[s.segLbl, segment === 'chart'   && { color: '#fff' }]}>Chart</Text>
           </Pressable>
-        ))}
+          <Pressable style={[s.segBtn, segment === 'signals' && s.segBtnOn]} onPress={() => setSegment('signals')}>
+            <Text style={[s.segLbl, segment === 'signals' && { color: '#fff' }]}>Signals</Text>
+          </Pressable>
+        </View>
       </View>
 
-      {/* Strategy toggles */}
+      {/* ── Strategy toggles ─────────────────────────────────────────────────── */}
       <View style={s.stratBar}>
         <StrategyToggle label="Milk Zones" color={Trading.milkZones} active={strategies.milkZones} onPress={() => toggleStrategy('milkZones')} />
         <StrategyToggle label="Vector"     color={Trading.vector}    active={strategies.vector}    onPress={() => toggleStrategy('vector')} />
         <StrategyToggle label="Footprint"  color={Trading.footprint}  active={strategies.footprint}  onPress={() => toggleStrategy('footprint')} />
-      </View>
-
-      {/* Milk Zones banner / badge */}
-      {showZoneBanner && (
-        <Pressable style={[s.zoneBanner, importingZones && { opacity: 0.7 }]}
-          onPress={importZones} disabled={importingZones}>
-          {importingZones
-            ? <><ActivityIndicator color={Trading.milkZones} size="small" /><Text style={[s.zoneBannerText, { color: Trading.milkZones }]}>Reading zones with AI…</Text></>
-            : <><View style={[s.zoneDot, { backgroundColor: Trading.milkZones }]} /><Text style={[s.zoneBannerText, { color: Trading.milkZones }]}>Tap to import Milk Zones screenshot</Text></>}
-        </Pressable>
-      )}
-      {showZoneBadge && (
-        <View style={s.zoneBadge}>
-          <View style={[s.zoneDot, { backgroundColor: Trading.milkZones }]} />
-          <Text style={[s.zoneBadgeText, { color: Trading.milkZones }]}>{zones.length} zone{zones.length !== 1 ? 's' : ''} loaded</Text>
-          <Pressable onPress={() => setZones([])} style={s.zoneBtn}><Text style={s.zoneBtnText}>Clear</Text></Pressable>
-          <Pressable onPress={importZones} disabled={importingZones} style={s.zoneBtn}>
-            <Text style={[s.zoneBtnText, { color: Trading.accent }]}>{importingZones ? '…' : 'Re-import'}</Text>
+        {/* Zone badge */}
+        {strategies.milkZones && zones.length > 0 && (
+          <Pressable onPress={() => setZones([])} style={s.zoneBadge}>
+            <View style={[s.zoneDot, { backgroundColor: Trading.milkZones }]} />
+            <Text style={[s.zoneBadgeText, { color: Trading.milkZones }]}>{zones.length}z</Text>
           </Pressable>
-        </View>
-      )}
-
-      {/* Segmented control */}
-      <View style={s.segRow}>
-        <Pressable style={[s.segBtn, segment === 'chart'   && s.segBtnActive]} onPress={() => { setSegment('chart'); setScrollToTime(null); }}>
-          <Text style={[s.segLabel, segment === 'chart'   && s.segLabelActive]}>Chart</Text>
-        </Pressable>
-        <Pressable style={[s.segBtn, segment === 'signals' && s.segBtnActive]} onPress={() => setSegment('signals')}>
-          <Text style={[s.segLabel, segment === 'signals' && s.segLabelActive]}>Signals</Text>
-        </Pressable>
+        )}
       </View>
 
-      {/* ── Content area: chart + signals stacked in a flex:1 wrapper ────────── */}
-      {/* Both live inside one flex:1 container so absoluteFillObject stays inside the header */}
+      {/* Zone import banner */}
+      {strategies.milkZones && zones.length === 0 && (
+        <Pressable style={[s.zoneBanner, importingZones && { opacity: 0.7 }]} onPress={importZones} disabled={importingZones}>
+          {importingZones
+            ? <><ActivityIndicator color={Trading.milkZones} size="small" /><Text style={[s.zoneBannerTxt, { color: Trading.milkZones }]}>Reading zones…</Text></>
+            : <><View style={[s.zoneDot, { backgroundColor: Trading.milkZones }]} /><Text style={[s.zoneBannerTxt, { color: Trading.milkZones }]}>Tap to import Milk Zones screenshot</Text></>}
+        </Pressable>
+      )}
+
+      {/* ── Content ──────────────────────────────────────────────────────────── */}
       <View style={{ flex: 1 }}>
-        {/* Chart — always mounted, always rendered (WebView needs to be visible to init on iOS) */}
-        <View style={[StyleSheet.absoluteFillObject,
-                      { opacity: segment === 'chart' ? 1 : 0 }]}
-              pointerEvents={segment === 'chart' ? 'auto' : 'none'}>
+
+        {/* Chart — always mounted */}
+        <View style={[StyleSheet.absoluteFillObject, { opacity: segment === 'chart' ? 1 : 0 }]}
+          pointerEvents={segment === 'chart' ? 'auto' : 'none'}>
           <ChartView
             onPriceRange={(high, low) => { priceRangeRef.current = { high, low }; }}
             onSignals={onChartSignals}
@@ -427,303 +493,238 @@ export default function SignalsTab() {
           />
         </View>
 
-      {/* ── Signals tab — mirrors PC SignalsPanel ─────────────────────────────── */}
-      {segment === 'signals' && <View style={[StyleSheet.absoluteFillObject, s.sigPanel]}>
+        {/* ── Signals segment ─────────────────────────────────────────────── */}
+        {segment === 'signals' && (
+          <View style={[StyleSheet.absoluteFillObject, { backgroundColor: Trading.bg }]}>
+            <ScrollView showsVerticalScrollIndicator={false}>
 
-        {/* Stats bar */}
-        <View style={s.statsBar}>
-          <View style={s.statsGroup}>
-            <Text style={[s.statsBig, { color: stats.wr !== null ? (stats.wr >= 50 ? C.up : C.down) : C.muted }]}>
-              {stats.wr !== null ? `${stats.wr}%` : '—%'}
-            </Text>
-            <Text style={s.statsLabel}>win rate</Text>
-          </View>
-          <View style={s.statsDivider} />
-          <View style={s.statsGroup}>
-            <View style={{ flexDirection: 'row', gap: 10 }}>
-              <Text style={s.statsText}><Text style={{ color: C.up, fontWeight: '700' }}>{stats.wins}</Text><Text style={{ color: C.muted }}> W</Text></Text>
-              <Text style={s.statsText}><Text style={{ color: C.down, fontWeight: '700' }}>{stats.losses}</Text><Text style={{ color: C.muted }}> L</Text></Text>
-              <Text style={[s.statsText, { color: C.muted }]}>{stats.open} open</Text>
-            </View>
-          </View>
-          <View style={s.statsDivider} />
-          <Text style={[s.statsText, { color: stats.pnl >= 0 ? C.up : C.down, fontWeight: '700' }]}>
-            {stats.pnl >= 0 ? '+' : ''}{stats.pnl.toFixed(2)} pts
-          </Text>
-          <Text style={[s.statsLabel, { marginLeft: 2 }]}>{stats.total} signals</Text>
-          {exitStrategy !== 'current' && (() => {
-            const prof = EXIT_PROFILES[exitStrategy as keyof typeof EXIT_PROFILES];
-            return (
-              <View style={[s.exitBadge, { borderColor: prof.color + '55', backgroundColor: prof.color + '18' }]}>
-                <Text style={[s.exitBadgeText, { color: prof.color }]}>{prof.label}</Text>
-              </View>
-            );
-          })()}
-        </View>
+              {/* Hero card — most recent signal */}
+              {heroSig ? (
+                <SignalHeroCard sig={heroSig} onTap={() => setSelectedSig(heroSig)} />
+              ) : (
+                <ScanningCard />
+              )}
 
-        {/* Filter row 1: Direction + RTH + Date */}
-        <View style={s.filterBar}>
-          <Text style={s.filterLabel}>Dir</Text>
-          {(['all', 'long', 'short'] as DirFilter[]).map(d => (
-            <Pressable key={d} onPress={() => setDirFilter(d)}
-              style={[s.chip, dirFilter === d && { borderColor: d === 'long' ? C.up + '88' : d === 'short' ? C.down + '88' : C.accent + '88', backgroundColor: d === 'long' ? C.up + '18' : d === 'short' ? C.down + '18' : C.accent + '18' }]}>
-              <Text style={[s.chipText, dirFilter === d && { color: d === 'long' ? C.up : d === 'short' ? C.down : C.accent }]}>
-                {d === 'all' ? 'All' : d === 'long' ? '▲ Long' : '▼ Short'}
-              </Text>
-            </Pressable>
-          ))}
-          <View style={s.chipDivider} />
-          <Pressable onPress={() => setRthOnly(v => !v)}
-            style={[s.chip, rthOnly && { borderColor: C.accent + '88', backgroundColor: C.accent + '18' }]}>
-            <Text style={[s.chipText, rthOnly && { color: C.accent }]}>RTH</Text>
-          </Pressable>
-          <View style={s.chipDivider} />
-          <Pressable onPress={() => setCalVisible(true)}
-            style={[s.chip, selectedDate !== null && { borderColor: '#a78bfa88', backgroundColor: '#a78bfa18' }]}>
-            <Text style={[s.chipText, selectedDate !== null && { color: '#a78bfa' }]}>
-              {selectedDate
-                ? (selectedDate === toDateKey(Math.floor(Date.now() / 1000))
-                    ? 'Today'
-                    : 'From ' + new Date(selectedDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }))
-                : '📅 Date'}
-            </Text>
-          </Pressable>
-          {selectedDate !== null && (
-            <Pressable onPress={() => setSelectedDate(null)} style={s.chip}>
-              <Text style={[s.chipText, { color: C.muted }]}>✕</Text>
-            </Pressable>
-          )}
-        </View>
-
-        {/* Filter row 2: Risk level */}
-        <View style={s.filterBar}>
-          <Text style={s.filterLabel}>Risk</Text>
-          {(['all', 'safeplus', 'safe', 'risky', 'riskiest'] as RiskFilter[]).map(r => {
-            const col = r === 'all' ? C.accent : rlColor(r);
-            return (
-              <Pressable key={r} onPress={() => setRiskFilter(r)}
-                style={[s.chip, riskFilter === r && { borderColor: col + '88', backgroundColor: col + '18' }]}>
-                <Text style={[s.chipText, riskFilter === r && { color: col }]}>
-                  {r === 'all' ? 'All' : r === 'safeplus' ? 'Safe+' : r === 'safe' ? 'Safe' : r === 'risky' ? 'Risky' : 'Riskiest'}
+              {/* Stats + filters */}
+              <View style={s.statsRow}>
+                <Text style={[s.statWr, { color: stats.wr !== null ? (stats.wr >= 50 ? Trading.long : Trading.short) : Trading.muted }]}>
+                  {stats.wr !== null ? `${stats.wr}%` : '—%'}
                 </Text>
-              </Pressable>
-            );
-          })}
-        </View>
+                <Text style={s.statLabel}>WR</Text>
+                <View style={s.statDiv} />
+                <Text style={[s.statNum, { color: Trading.long }]}>{stats.wins}W</Text>
+                <Text style={[s.statNum, { color: Trading.short }]}>{stats.losses}L</Text>
+                <Text style={[s.statNum, { color: Trading.muted }]}>{stats.open} open</Text>
+                <View style={s.statDiv} />
+                <Text style={[s.statPnl, { color: stats.pnl >= 0 ? Trading.long : Trading.short, fontFamily: Fonts?.mono }]}>
+                  {stats.pnl >= 0 ? '+' : ''}{stats.pnl.toFixed(1)} pts
+                </Text>
+                <Text style={[s.statLabel, { color: Trading.muted }]}>{stats.total} sig</Text>
+              </View>
 
-        {/* Calendar modal */}
-        <CalendarModal
-          visible={calVisible}
-          selectedDate={selectedDate}
-          signalDates={signalDates}
-          onSelect={setSelectedDate}
-          onClose={() => setCalVisible(false)}
-        />
-
-        {/* Signal detail bottom sheet */}
-        {selectedSig && (
-          <SignalDetailModal
-            sig={selectedSig}
-            onClose={() => setSelectedSig(null)}
-            onViewOnChart={(time) => {
-              setSelectedSig(null);
-              setScrollToTime(time);
-              setSegment('chart');
-            }}
-          />
-        )}
-
-        {/* Table header */}
-        <View style={s.tableHeader}>
-          <Text style={[s.thCell, { flex: 2.2 }]}>DATE</Text>
-          <Text style={[s.thCell, { flex: 2 }]}>TIME</Text>
-          <Text style={[s.thCell, { flex: 1.2 }]}>DIR</Text>
-          <Text style={[s.thCell, { flex: 1.5 }]}>RISK</Text>
-          <Text style={[s.thCell, { flex: 2.2, textAlign: 'right' }]}>ENTRY</Text>
-          <Text style={[s.thCell, { flex: 2.2, textAlign: 'right' }]}>TP1</Text>
-          <Text style={[s.thCell, { flex: 2, textAlign: 'right' }]}>SL</Text>
-          <Text style={[s.thCell, { flex: 1.4, textAlign: 'center' }]}>W/L</Text>
-          <Text style={[s.thCell, { flex: 2.2, textAlign: 'right' }]}>P&L</Text>
-        </View>
-
-        {/* Signal rows */}
-        {filtered.length === 0 ? (
-          <View style={s.empty}>
-            {chartSignals.length === 0
-              ? <Text style={s.emptyText}>Switch to Chart to load signals</Text>
-              : <Text style={s.emptyText}>No signals match filters</Text>}
-          </View>
-        ) : (
-          <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
-            {filtered.map((sig, idx) => {
-              const isLong = sig.direction === 'Long';
-              const dirColor = isLong ? C.up : C.down;
-              const rl = rlColor(sig.riskLevel);
-              const oc = ocColor(sig.outcome);
-              return (
-                <Pressable key={`${sig.time}-${sig.direction}`}
-                  onPress={() => setSelectedSig(sig)}
-                  style={({ pressed }) => [s.row, idx % 2 !== 0 && { backgroundColor: 'rgba(255,255,255,0.012)' },
-                    (sig.riskLevel === 'risky' || sig.riskLevel === 'riskiest') && { opacity: 0.8 },
-                    pressed && { backgroundColor: C.accent + '0f' }]}>
-                  {/* Date */}
-                  <Text style={[s.cell, { flex: 2.2, color: C.muted }]}>{fmtDate(sig.time)}</Text>
-                  {/* Time */}
-                  <Text style={[s.cell, { flex: 2, color: C.accent }]}>{fmtTime(sig.time)}</Text>
-                  {/* Direction */}
-                  <Text style={[s.cell, { flex: 1.2, color: dirColor, fontWeight: '700' }]}>
-                    {isLong ? '▲ L' : '▼ S'}
-                  </Text>
-                  {/* Risk badge */}
-                  <View style={{ flex: 1.5, justifyContent: 'center' }}>
-                    <View style={[s.badge, { borderColor: rl + '44', backgroundColor: rl + '18' }]}>
-                      <Text style={[s.badgeText, { color: rl }]}>{sig.riskLevel}</Text>
-                    </View>
-                  </View>
-                  {/* Entry */}
-                  <Text style={[s.cell, { flex: 2.2, textAlign: 'right', color: C.text }]}>{sig.price.toFixed(2)}</Text>
-                  {/* TP1 */}
-                  <Text style={[s.cell, { flex: 2.2, textAlign: 'right', color: '#67e8f9' }]}>{sig.tp1.toFixed(2)}</Text>
-                  {/* SL */}
-                  <Text style={[s.cell, { flex: 2, textAlign: 'right', color: '#f87171' }]}>{sig.sl.toFixed(2)}</Text>
-                  {/* W/L badge */}
-                  <View style={{ flex: 1.4, alignItems: 'center', justifyContent: 'center' }}>
-                    {sig.outcome === 'Open' ? (
-                      <Text style={{ fontSize: 10, color: C.muted }}>—</Text>
-                    ) : sig.outcome === 'Win' ? (
-                      <View style={[s.wlBadge, { backgroundColor: sig.tpHit === 2 ? 'rgba(38,200,122,0.22)' : 'rgba(38,200,122,0.14)', borderColor: sig.tpHit === 2 ? 'rgba(38,200,122,0.6)' : 'rgba(74,222,128,0.4)' }]}>
-                        <Text style={[s.wlText, { color: sig.tpHit === 2 ? '#26c87a' : '#4ade80' }]}>W{sig.tpHit}</Text>
-                      </View>
-                    ) : (
-                      <View style={[s.wlBadge, { backgroundColor: 'rgba(239,68,68,0.14)', borderColor: 'rgba(239,68,68,0.4)' }]}>
-                        <Text style={[s.wlText, { color: C.down }]}>L</Text>
-                      </View>
-                    )}
-                  </View>
-                  {/* P&L */}
-                  <Text style={[s.cell, { flex: 2.2, textAlign: 'right', color: oc, fontWeight: '700' }]}>
-                    {sig.points !== null ? `${sig.points >= 0 ? '+' : ''}${sig.points.toFixed(2)}` : '—'}
+              {/* Filter row 1 */}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.filterScroll} contentContainerStyle={s.filterRow}>
+                {(['all', 'long', 'short'] as DirFilter[]).map(d => {
+                  const col = d === 'long' ? Trading.long : d === 'short' ? Trading.short : Trading.accent;
+                  const on  = dirFilter === d;
+                  return (
+                    <Pressable key={d} onPress={() => setDirFilter(d)} style={[s.fc, on && { borderColor: col + '88', backgroundColor: col + '18' }]}>
+                      <Text style={[s.ft, on && { color: col }]}>{d === 'all' ? 'All' : d === 'long' ? '▲ Long' : '▼ Short'}</Text>
+                    </Pressable>
+                  );
+                })}
+                <View style={s.filterSep} />
+                <Pressable onPress={() => setRthOnly(v => !v)} style={[s.fc, rthOnly && { borderColor: Trading.accent + '88', backgroundColor: Trading.accent + '18' }]}>
+                  <Text style={[s.ft, rthOnly && { color: Trading.accent }]}>RTH</Text>
+                </Pressable>
+                <View style={s.filterSep} />
+                <Pressable onPress={() => setCalVisible(true)} style={[s.fc, selectedDate !== null && { borderColor: Trading.vector + '88', backgroundColor: Trading.vector + '18' }]}>
+                  <Text style={[s.ft, selectedDate !== null && { color: Trading.vector }]}>
+                    {selectedDate ? (selectedDate === toDateKey(Math.floor(Date.now()/1000)) ? 'Today' : 'From ' + new Date(selectedDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })) : '📅 Date'}
                   </Text>
                 </Pressable>
-              );
-            })}
-          </ScrollView>
+                {selectedDate !== null && (
+                  <Pressable onPress={() => setSelectedDate(null)} style={s.fc}><Text style={[s.ft, { color: Trading.muted }]}>✕</Text></Pressable>
+                )}
+              </ScrollView>
+
+              {/* Filter row 2: Risk tier */}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.filterScroll} contentContainerStyle={s.filterRow}>
+                {(['all', 'safeplus', 'safe', 'risky', 'riskiest'] as RiskFilter[]).map(r => {
+                  const col = r === 'all' ? Trading.accent : tierColor(r);
+                  const on  = riskFilter === r;
+                  return (
+                    <Pressable key={r} onPress={() => setRiskFilter(r)} style={[s.fc, on && { borderColor: col + '80', backgroundColor: col + '18' }]}>
+                      <Text style={[s.ft, on && { color: col }]}>
+                        {r === 'all' ? 'All' : r === 'safeplus' ? `◆ SAFE+` : r === 'safe' ? `◆ SAFE` : r === 'risky' ? `△ RISKY` : `▽ RISKIEST`}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+
+              {/* Signal feed */}
+              {filtered.length === 0 ? (
+                <View style={s.empty}>
+                  <Text style={s.emptyText}>{chartSignals.length === 0 ? 'Switch to Chart to load signals' : 'No signals match filters'}</Text>
+                </View>
+              ) : (
+                filtered.map((sig, idx) => {
+                  const isLong   = sig.direction === 'Long';
+                  const tc       = tierColor(sig.riskLevel);
+                  const oc       = ocColor(sig.outcome);
+                  const pnlStr   = sig.points !== null ? `${sig.points >= 0 ? '+' : ''}${sig.points.toFixed(1)}` : '—';
+                  const pnlDol   = sig.points !== null ? ptsToUsd(Math.abs(sig.points)) : '';
+                  return (
+                    <Pressable key={`${sig.time}-${sig.direction}-${idx}`}
+                      onPress={() => setSelectedSig(sig)}
+                      style={({ pressed }) => [sf.row, pressed && { backgroundColor: Trading.accent + '0c' }]}>
+                      {/* Tier-colored left border */}
+                      <View style={[sf.tierBar, { backgroundColor: tc }]} />
+                      <View style={sf.body}>
+                        {/* Row 1: direction + entry + time */}
+                        <View style={sf.topRow}>
+                          <Text style={[sf.dir, { color: isLong ? Trading.long : Trading.short }]}>
+                            {isLong ? '▲' : '▼'} {isLong ? 'LONG' : 'SHORT'}
+                          </Text>
+                          <Text style={[sf.entry, { fontFamily: Fonts?.mono }]}>{sig.price.toFixed(2)}</Text>
+                          <View style={{ flex: 1 }} />
+                          <Text style={sf.time}>{fmtDate(sig.time)} {fmtTime(sig.time)}</Text>
+                        </View>
+                        {/* Row 2: confirmations + outcome */}
+                        <View style={sf.bottomRow}>
+                          <ConfirmChips sig={sig} compact />
+                          <View style={{ flex: 1 }} />
+                          {sig.outcome !== 'Open' && (
+                            <View style={{ alignItems: 'flex-end' }}>
+                              <Text style={[sf.pnl, { color: oc, fontFamily: Fonts?.mono }]}>{pnlStr} pts</Text>
+                              <Text style={[sf.pnlDol, { color: oc + 'aa' }]}>{pnlDol}</Text>
+                            </View>
+                          )}
+                          {sig.outcome === 'Open' && <Text style={[sf.open]}>open</Text>}
+                        </View>
+                      </View>
+                    </Pressable>
+                  );
+                })
+              )}
+
+              <View style={{ height: 40 }} />
+            </ScrollView>
+          </View>
         )}
-      </View>}
-      </View>{/* end content wrapper */}
+
+        {/* Modals */}
+        <CalendarModal visible={calVisible} selectedDate={selectedDate} signalDates={signalDates} onSelect={setSelectedDate} onClose={() => setCalVisible(false)} />
+        {selectedSig && (
+          <SignalDetailModal sig={selectedSig} onClose={() => setSelectedSig(null)}
+            onViewOnChart={(time) => { setSelectedSig(null); setScrollToTime(time); setSegment('chart'); }} />
+        )}
+      </View>
+
     </SafeAreaView>
   );
 }
 
+// ── Styles ────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  safe:    { flex: 1, backgroundColor: C.bg },
-  tfBar:   { flexDirection: 'row', paddingHorizontal: 16, paddingVertical: 10, gap: 6, borderBottomWidth: 1, borderBottomColor: C.border },
-  stratBar: { flexDirection: 'row', paddingHorizontal: 10, paddingVertical: 8, gap: 8, borderBottomWidth: 1, borderBottomColor: C.border },
-  tfBtn:   { paddingHorizontal: 14, paddingVertical: 6, borderRadius: 999, borderWidth: 1.5, borderColor: '#222222', backgroundColor: C.panel },
-  tfBtnActive: { borderColor: C.accent, backgroundColor: C.accent + '20' },
-  tfLabel: { color: C.dim, fontSize: 13, fontWeight: '600' },
-  tfLabelActive: { color: C.accent, fontWeight: '700' },
+  safe:   { flex: 1, backgroundColor: Trading.bg },
 
-  zoneBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, marginHorizontal: 16, marginTop: 8, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10, borderWidth: 1.5, borderColor: Trading.milkZones + '66', backgroundColor: Trading.milkZones + '11' },
-  zoneBannerText: { fontSize: 13, fontWeight: '600' },
-  zoneDot:   { width: 8, height: 8, borderRadius: 4 },
-  zoneBadge: { flexDirection: 'row', alignItems: 'center', gap: 8, marginHorizontal: 16, marginTop: 8, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10, backgroundColor: Trading.milkZones + '11', borderWidth: 1, borderColor: Trading.milkZones + '44' },
-  zoneBadgeText: { fontSize: 12, fontWeight: '600', flex: 1 },
-  zoneBtn:   { paddingHorizontal: 8, paddingVertical: 4 },
-  zoneBtnText: { color: C.muted, fontSize: 12, fontWeight: '600' },
+  appBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 10, borderBottomWidth: 1, borderBottomColor: Trading.border },
+  tfRow:  { flexDirection: 'row', gap: 4 },
+  tfBtn:  { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1, borderColor: Trading.border },
+  tfLabel:{ color: Trading.muted, fontSize: 12, fontWeight: '600' },
 
-  segRow:   { flexDirection: 'row', marginHorizontal: 16, marginVertical: 10, backgroundColor: C.panel, borderRadius: 10, padding: 3, borderWidth: 1, borderColor: C.border },
-  segBtn:   { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
-  segBtnActive: { backgroundColor: C.accent },
-  segLabel: { color: C.muted, fontSize: 14, fontWeight: '600' },
-  segLabelActive: { color: '#fff' },
+  segPill: { flexDirection: 'row', backgroundColor: Trading.surfaceAlt, borderRadius: 8, padding: 2, borderWidth: 1, borderColor: Trading.border },
+  segBtn:  { paddingHorizontal: 14, paddingVertical: 6, borderRadius: 6 },
+  segBtnOn:{ backgroundColor: Trading.accent },
+  segLbl:  { color: Trading.muted, fontSize: 12, fontWeight: '600' },
 
-  sigPanel:  { flex: 1, backgroundColor: C.bg },
+  stratBar: { flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 8, gap: 8, borderBottomWidth: 1, borderBottomColor: Trading.border, alignItems: 'center' },
+  zoneBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 6, borderWidth: 1, borderColor: Trading.milkZones + '50', backgroundColor: Trading.milkZones + '10' },
+  zoneBadgeText: { fontSize: 10, fontWeight: '700' },
+  zoneDot: { width: 6, height: 6, borderRadius: 3 },
+  zoneBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, marginHorizontal: 14, marginTop: 6, padding: 10, borderRadius: 8, borderWidth: 1, borderColor: Trading.milkZones + '50', backgroundColor: Trading.milkZones + '10' },
+  zoneBannerTxt: { fontSize: 12, fontWeight: '600' },
 
-  statsBar:  { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 14, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: C.border, backgroundColor: C.panel, flexWrap: 'wrap' },
-  statsGroup: { flexDirection: 'row', alignItems: 'baseline', gap: 5 },
-  statsBig:  { fontSize: 20, fontWeight: '800', lineHeight: 24 },
-  statsLabel: { fontSize: 9, color: C.muted },
-  statsText:  { fontSize: 11 },
-  statsDivider: { width: 1, height: 20, backgroundColor: C.border },
+  // Stats bar
+  statsRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingVertical: 8, marginTop: 10, backgroundColor: Trading.surface, borderRadius: 10, marginHorizontal: 14, borderWidth: 1, borderColor: Trading.border },
+  statWr:   { fontSize: 20, fontWeight: '800' },
+  statLabel:{ fontSize: 9, color: Trading.muted, fontWeight: '600', letterSpacing: 0.4 },
+  statDiv:  { width: 1, height: 16, backgroundColor: Trading.border },
+  statNum:  { fontSize: 12, fontWeight: '700' },
+  statPnl:  { fontSize: 12, fontWeight: '700' },
 
-  exitBadge:     { borderRadius: 4, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 2 },
-  exitBadgeText: { fontSize: 9, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
+  // Filters
+  filterScroll:  { paddingHorizontal: 14, marginTop: 8 },
+  filterRow:     { flexDirection: 'row', gap: 6, paddingRight: 14 },
+  fc:            { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: Trading.border, backgroundColor: Trading.surface },
+  ft:            { fontSize: 11, color: Trading.muted, fontWeight: '600' },
+  filterSep:     { width: 1, backgroundColor: Trading.border, alignSelf: 'stretch', marginVertical: 4 },
 
-  filterBar:   { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: C.border, backgroundColor: C.panel, flexWrap: 'wrap' },
-  filterLabel: { fontSize: 9, color: C.dim, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.6, marginRight: 2, width: 26 },
-  chip:        { paddingHorizontal: 9, paddingVertical: 4, borderRadius: 12, borderWidth: 1, borderColor: '#222222', backgroundColor: C.panel },
-  chipText:    { fontSize: 10, color: C.muted, fontWeight: '600' },
-  chipDivider: { width: 1, height: 14, backgroundColor: C.border, marginHorizontal: 2 },
-
-  tableHeader: { flexDirection: 'row', paddingHorizontal: 10, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: C.border, backgroundColor: C.panel },
-  thCell:    { fontSize: 8, color: C.dim, fontWeight: '600', letterSpacing: 0.5 },
-
-  row:       { flexDirection: 'row', paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: C.border + '55', alignItems: 'center' },
-  cell:      { fontSize: 10.5 },
-
-  badge:     { borderRadius: 3, borderWidth: 1, paddingHorizontal: 4, paddingVertical: 1, alignSelf: 'flex-start' },
-  badgeText: { fontSize: 8, fontWeight: '700', textTransform: 'uppercase' },
-  wlBadge:   { borderRadius: 3, borderWidth: 1, paddingHorizontal: 4, paddingVertical: 1, minWidth: 20, alignItems: 'center' },
-  wlText:    { fontSize: 8, fontWeight: '800' },
-
-  empty:     { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 60 },
-  emptyText: { color: C.muted, fontSize: 13 },
+  empty:     { paddingVertical: 40, alignItems: 'center' },
+  emptyText: { color: Trading.muted, fontSize: 13 },
 });
 
-// ── Calendar stylesheet ────────────────────────────────────────────────────────
-const CELL = 40;
+// Signal feed row
+const sf = StyleSheet.create({
+  row:      { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: Trading.border + '55' },
+  tierBar:  { width: 3 },
+  body:     { flex: 1, paddingHorizontal: 12, paddingVertical: 10, gap: 6 },
+  topRow:   { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  dir:      { fontSize: 13, fontWeight: '800', letterSpacing: 0.5 },
+  entry:    { fontSize: 13, fontWeight: '700', color: Trading.text },
+  time:     { fontSize: 10, color: Trading.muted },
+  bottomRow:{ flexDirection: 'row', alignItems: 'center', gap: 6 },
+  pnl:      { fontSize: 13, fontWeight: '700' },
+  pnlDol:   { fontSize: 9 },
+  open:     { fontSize: 10, color: Trading.muted, fontStyle: 'italic' },
+});
+
+// Calendar
+const CELL = 38;
 const cal = StyleSheet.create({
-  backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.72)', alignItems: 'center', justifyContent: 'center' },
-  sheet:    { width: 300, borderRadius: 12, backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, overflow: 'hidden' },
-
-  header:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border },
-  monthLabel: { fontSize: 14, fontWeight: '700', color: C.text },
-  navBtn:     { width: 32, height: 32, alignItems: 'center', justifyContent: 'center' },
-  navArrow:   { fontSize: 20, color: C.accent, fontWeight: '300' },
-
-  dowRow:     { flexDirection: 'row', paddingHorizontal: 8, paddingVertical: 6 },
-  dowLabel:   { width: CELL, textAlign: 'center', fontSize: 10, color: C.muted, fontWeight: '600' },
-
-  grid:       { flexDirection: 'row', flexWrap: 'wrap', paddingHorizontal: 8, paddingBottom: 8 },
-  dayCell:    { width: CELL, height: CELL, alignItems: 'center', justifyContent: 'center' },
-  daySel:     { backgroundColor: C.accent, borderRadius: CELL / 2 },
-  dayToday:   { borderWidth: 1, borderColor: C.accent + '66', borderRadius: CELL / 2 },
-  dayText:    { fontSize: 13, color: C.text },
+  backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', alignItems: 'center', justifyContent: 'center' },
+  sheet:    { width: 300, borderRadius: 14, backgroundColor: Trading.surface, borderWidth: 1, borderColor: Trading.border, overflow: 'hidden' },
+  header:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: Trading.border },
+  monthLabel:{ fontSize: 14, fontWeight: '700', color: Trading.text },
+  navBtn:   { width: 32, height: 32, alignItems: 'center', justifyContent: 'center' },
+  navArrow: { fontSize: 22, color: Trading.accent, fontWeight: '300' },
+  dowRow:   { flexDirection: 'row', paddingHorizontal: 8, paddingVertical: 6 },
+  dowLabel: { width: CELL, textAlign: 'center', fontSize: 10, color: Trading.muted, fontWeight: '600' },
+  grid:     { flexDirection: 'row', flexWrap: 'wrap', paddingHorizontal: 8, paddingBottom: 8 },
+  dayCell:  { width: CELL, height: CELL, alignItems: 'center', justifyContent: 'center' },
+  daySel:   { backgroundColor: Trading.accent, borderRadius: CELL / 2 },
+  dayToday: { borderWidth: 1, borderColor: Trading.accent + '66', borderRadius: CELL / 2 },
+  dayText:  { fontSize: 13, color: Trading.text },
   dayTextSel: { color: '#fff', fontWeight: '700' },
-  dot:        { position: 'absolute', bottom: 5, width: 4, height: 4, borderRadius: 2, backgroundColor: C.accent },
-
-  footer:     { borderTopWidth: 1, borderTopColor: C.border, padding: 10, flexDirection: 'row', justifyContent: 'center', gap: 12 },
-  clearBtn:   { paddingVertical: 6, paddingHorizontal: 16, borderWidth: 1, borderColor: C.border, borderRadius: 8 },
-  clearText:  { fontSize: 12, color: C.accent, fontWeight: '600' },
+  dot:      { position: 'absolute', bottom: 5, width: 4, height: 4, borderRadius: 2, backgroundColor: Trading.accent },
+  footer:   { borderTopWidth: 1, borderTopColor: Trading.border, padding: 10, flexDirection: 'row', justifyContent: 'center', gap: 12 },
+  clearBtn: { paddingVertical: 6, paddingHorizontal: 16, borderWidth: 1, borderColor: Trading.border, borderRadius: 8 },
+  clearText:{ fontSize: 12, color: Trading.accent, fontWeight: '600' },
 });
 
-// ── Signal detail bottom-sheet stylesheet ──────────────────────────────────────
+// Signal detail modal
 const det = StyleSheet.create({
-  backdrop:    { flex: 1, backgroundColor: 'rgba(0,0,0,0.72)', justifyContent: 'flex-end' },
-  sheet:       { backgroundColor: C.panel, borderTopLeftRadius: 18, borderTopRightRadius: 18,
-                 borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1, borderColor: C.border,
-                 paddingHorizontal: 20, paddingTop: 20, paddingBottom: 40 },
-  header:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2 },
-  dir:         { fontSize: 20, fontWeight: '800' },
-  badge:       { borderRadius: 4, borderWidth: 1, paddingHorizontal: 7, paddingVertical: 3 },
-  badgeText:   { fontSize: 10, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.4 },
-  closeBtn:    { width: 30, height: 30, alignItems: 'center', justifyContent: 'center' },
-  closeTxt:    { color: C.muted, fontSize: 18 },
-  subtitle:    { fontSize: 12, color: C.muted, marginTop: 2, marginBottom: 16 },
-  table:       { borderRadius: 8, borderWidth: 1, borderColor: C.border, overflow: 'hidden', marginBottom: 14, backgroundColor: '#070b11' },
-  tRow:        { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 11, paddingHorizontal: 16, borderBottomWidth: 1, borderBottomColor: C.border + '55' },
-  tLabel:      { fontSize: 12, color: C.muted, fontWeight: '600' },
-  tValue:      { fontSize: 13, fontWeight: '700' },
-  rr:          { fontSize: 11, color: C.muted, textAlign: 'center', marginBottom: 14 },
-  stratRow:    { marginBottom: 14 },
-  stratLabel:  { fontSize: 10, color: C.muted, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 },
-  stratChips:  { flexDirection: 'row', gap: 6 },
-  stratChip:   { borderRadius: 6, borderWidth: 1, paddingHorizontal: 9, paddingVertical: 5 },
-  stratChipTxt:{ fontSize: 11, fontWeight: '600' },
-  outcomeRow:  { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, paddingVertical: 4 },
-  outcomeText: { fontSize: 15, fontWeight: '700' },
-  pnlText:     { fontSize: 24, fontWeight: '800' },
-  chartBtn:    { backgroundColor: C.accent + '22', borderWidth: 1, borderColor: C.accent + '66', borderRadius: 12, paddingVertical: 14, alignItems: 'center' },
-  chartBtnTxt: { color: C.accent, fontSize: 15, fontWeight: '700', letterSpacing: 0.3 },
+  backdrop:  { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'flex-end' },
+  sheet:     { backgroundColor: Trading.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1, borderColor: Trading.border, paddingHorizontal: 20, paddingTop: 20, paddingBottom: 44, gap: 0 },
+  header:    { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
+  dirChip:   { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1 },
+  dirText:   { fontSize: 14, fontWeight: '800' },
+  tagChip:   { paddingHorizontal: 6, paddingVertical: 3, borderRadius: 4, borderWidth: 1 },
+  tagText:   { fontSize: 9, fontWeight: '700' },
+  close:     { color: Trading.muted, fontSize: 18, paddingLeft: 8 },
+  subtitle:  { fontSize: 12, color: Trading.muted, marginBottom: 14 },
+  table:     { borderRadius: 10, borderWidth: 1, borderColor: Trading.border, overflow: 'hidden', marginBottom: 12, backgroundColor: Trading.panel },
+  tRow:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 11, paddingHorizontal: 14, borderBottomWidth: 1, borderBottomColor: Trading.border + '55' },
+  tLabel:    { fontSize: 12, color: Trading.muted, fontWeight: '600' },
+  tValue:    { fontSize: 15, fontWeight: '700' },
+  tSub:      { fontSize: 10, color: Trading.muted },
+  rr:        { fontSize: 11, color: Trading.muted, textAlign: 'center', marginBottom: 14 },
+  sectionLabel: { fontSize: 9, color: Trading.muted, fontWeight: '700', letterSpacing: 1, marginBottom: 8 },
+  outcomeRow:{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 14, marginBottom: 18 },
+  outcomeText:{ fontSize: 15, fontWeight: '700' },
+  pnlText:   { fontSize: 24, fontWeight: '800' },
+  chartBtn:  { backgroundColor: Trading.accent + '20', borderWidth: 1, borderColor: Trading.accent + '60', borderRadius: 12, paddingVertical: 14, alignItems: 'center' },
+  chartBtnTxt:{ color: Trading.accent, fontSize: 14, fontWeight: '700', letterSpacing: 0.3 },
 });

@@ -23,6 +23,8 @@ import fs   from "fs";
 import path from "path";
 import { db } from "./db";
 import { cachedCandles } from "@shared/schema";
+import { normalizeSymbol } from "@shared/symbol";
+import { isSaneBarTime } from "@shared/bar-time";
 import { sql } from "drizzle-orm";
 import { type Express }    from "express";
 import { type Server as HttpServer } from "http";
@@ -39,15 +41,17 @@ const DEFAULT_TICK_SIZE      = 0.25;
 const MAX_TICK_DEVIATION     = 600;
 const DEFAULT_MAX_TICK_DEVIATION = 600;
 
-const MW_DATA_ROOT = path.join(
+// TODO: make configurable for distribution (e.g. via MW_DATA_ROOT env var)
+const MW_DATA_ROOT = process.env.MW_DATA_ROOT ?? path.join(
   process.env.USERPROFILE ?? "C:\\Users\\jacks",
   "AppData", "Roaming", "MotiveWave", "historical_data", "RITHMIC",
 );
 
 // Map: logical symbol → (a) regex to match ALL contract-month directories,
-//                        (b) the CURRENT active dir for live tick watching.
-// Historical data is spread across multiple expiry dirs (MESH6, MESM6, …).
-// loadMultiDir() merges them all; only the activeDir is watched for live ticks.
+//                        (b) activeDir = COLD-START FALLBACK ONLY.
+// The live directory is now chosen dynamically by pickActiveDir() (newest-written contract),
+// so the quarterly roll no longer breaks the feed. Historical data is still merged across all
+// matching expiry dirs (MESH6, MESM6, …) by loadMultiDir().
 const MW_INSTRUMENTS: { symbol: string; dirPattern: RegExp; activeDir: string }[] = [
   { symbol: "MES", dirPattern: /^MES[A-Z]\d+\.CME$/, activeDir: "MESM6.CME" },
 ];
@@ -70,6 +74,27 @@ function getContractDirs(pattern: RegExp): string[] {
         } catch { return false; }
       });
   } catch { return []; }
+}
+
+/**
+ * Pick the active contract directory dynamically: the matching dir whose most recent
+ * .tick_data / .bar_data1 file has the newest mtime — i.e. the contract MotiveWave is
+ * currently writing. Roll-proof: no hardcoded contract month.
+ */
+function pickActiveDir(pattern: RegExp): string | null {
+  const dirs = getContractDirs(pattern);
+  let best: string | null = null;
+  let bestMtime = -1;
+  for (const d of dirs) {
+    try {
+      const files = fs.readdirSync(d).filter(f => f.endsWith(".tick_data") || f.endsWith(".bar_data1"));
+      for (const f of files) {
+        const m = fs.statSync(path.join(d, f)).mtimeMs;
+        if (m > bestMtime) { bestMtime = m; best = d; }
+      }
+    } catch { /* skip unreadable dir */ }
+  }
+  return best;
 }
 
 /**
@@ -215,6 +240,7 @@ function parseTickFileAsBars(filePath: string): MinBar[] {
     // Distribute ticks proportionally across the elapsed portion of the file window
     const tickMs     = fileMs + Math.floor((i / totalRecords) * elapsedMs);
     const bucketSec  = Math.floor(tickMs / 60_000) * 60;
+    if (!isSaneBarTime(bucketSec)) continue; // skip bars from a garbage-named tick file
 
     const ex = minuteMap.get(bucketSec);
     if (!ex) {
@@ -359,7 +385,7 @@ function findActiveTickFile(instrDir: string): string | null {
  * approach used by the reference Python implementation (rithmic_feed.py) and
  * handles every known MW format without any assumptions about record layout.
  */
-function readLastTickRecord(filePath: string): number | null {
+function readLastTickRecord(filePath: string, hint?: number): number | null {
   let fileSize: number;
   try { fileSize = fs.statSync(filePath).size; } catch { return null; }
   if (fileSize < 4) return null;
@@ -373,12 +399,26 @@ function readLastTickRecord(filePath: string): number | null {
     fs.closeSync(fd);
   } catch { return null; }
 
-  // Scan backwards — the most recent price is near the end of the file.
+  // Collect every plausible MES-range float in the tail (scanning from the end = newest first).
+  const candidates: number[] = [];
   for (let i = scanSize - 4; i >= 0; i--) {
     const v = buf.readFloatBE(i);
-    if (isFinite(v) && v >= 400 && v <= 50_000) return v;
+    if (isFinite(v) && v >= 400 && v <= 50_000) candidates.push(v);
   }
-  return null;
+  if (!candidates.length) return null;
+
+  // With a reference price, return the candidate CLOSEST to it. Corrupt byte patterns produce
+  // in-range floats that are far from the true price (e.g. 1339 when price is 6857); closest-to-
+  // hint rejects those while still tracking real movement (consecutive ticks are near each other).
+  if (hint && hint > 0) {
+    let best = candidates[0], bestDiff = Math.abs(candidates[0] - hint);
+    for (const c of candidates) {
+      const d = Math.abs(c - hint);
+      if (d < bestDiff) { best = c; bestDiff = d; }
+    }
+    return best;
+  }
+  return candidates[0]; // no reference yet — newest in-range float wins
 }
 
 /** Update both the in-progress 1-min and 5-min bars with a new tick price and broadcast both. */
@@ -509,7 +549,8 @@ function onTickFileChange(symbol: string, instrDir: string, changedFilename: str
   if (newSize <= prevSize) return; // no new data
   activeTickSize.set(instrDir, newSize);
 
-  const price = readLastTickRecord(fp);
+  const symHint = normalizeSymbol(symbol);
+  const price = readLastTickRecord(fp, lastTickPrice.get(symHint) ?? latestBar5.get(symHint)?.close);
   if (price === null) return;
   const sym = symbol.toUpperCase();
   applyTick(sym, price); // lastTickPrice is set inside applyTick after sanity check
@@ -558,9 +599,8 @@ function persistCompletedBar5(symbol: string, bar: MinBar) {
  * so the 16ms disk heartbeat stays suppressed while TickRelay is active.
  */
 export function notifyExternalTick(symbol: string, price: number) {
-  // Normalize to logical symbol — strip contract month (MESM6→MES) and futures suffix (MES=F→MES)
-  // so keys match what MW_INSTRUMENTS uses and the heartbeat suppression works correctly.
-  const sym = symbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F", "");
+  // Canonical symbol so keys match the disk reader and the client.
+  const sym = normalizeSymbol(symbol);
   const refBar = inProgressBar1m.get(sym) ?? latestBar5.get(sym);
   if (refBar && refBar.close > 0) {
     const ratio = price / refBar.close;
@@ -706,6 +746,7 @@ function parseBarFile(filePath: string): MinBar[] {
 
     // minuteOff is the minute-of-week offset from the file's epoch timestamp.
     const timeSec = Math.floor(fileMs / 1000) + minuteOff * 60;
+    if (!isSaneBarTime(timeSec)) continue; // drop corrupt/future-dated bars (bad filename or seq)
 
     bars.push({
       timeSec,
@@ -743,6 +784,8 @@ function aggregate(minBars: MinBar[], periodMin: number): MinBar[] {
 
 /** Upsert — overwrites existing rows so corrupt DB data is always replaced */
 async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  bars = bars.filter(b => isSaneBarTime(b.timeSec, nowSec)); // never persist future/corrupt-dated bars
   if (!bars.length) return;
   // Reject bars with prices outside a safe range — catches corrupt tick-file float32 misreads
   // (512, 8192, 14336, 47104, etc.) before they reach the DB and distort chart auto-scale.
@@ -842,7 +885,8 @@ async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
 
 // ── File-change tracking ──────────────────────────────────────────────────────
 
-const fileMTimes = new Map<string, number>();
+const fileMTimes   = new Map<string, number>();
+const fileBarCounts = new Map<string, number>(); // filePath → last-seen bar count (for tail upsert)
 
 function getBarFiles(instrDir: string): string[] {
   try {
@@ -928,12 +972,22 @@ async function pollChanged(symbol: string, instrDir: string) {
     const minBars = parseBarFile(fp);
     if (!minBars.length) continue;
 
-    const bars5  = aggregate(minBars, 5);
-    const bars60 = aggregate(minBars, 60);
+    // 1m: upsert only the new tail (the big DB win). Keep a 2-bar overlap so the last,
+    // possibly still-forming, minute gets its final values.
+    const prevCount = fileBarCounts.get(fp) ?? 0;
+    fileBarCounts.set(fp, minBars.length);
+    const startIdx = Math.max(0, Math.min(prevCount - 2, minBars.length - 1));
+    const newMin = minBars.slice(startIdx);
+    if (newMin.length) await bulkUpsert(symbol, "1", newMin);
 
-    await bulkUpsert(symbol, "1",  minBars);
-    await bulkUpsert(symbol, "5",  bars5);
-    await bulkUpsert(symbol, "60", bars60);
+    // 5m/60m: re-aggregate from the last ~130 minutes so each higher-TF bucket is rebuilt
+    // from ALL of its 1m constituents (a partial bucket would otherwise overwrite a full one).
+    const lastSec  = minBars[minBars.length - 1]?.timeSec ?? 0;
+    const recent   = minBars.filter(b => b.timeSec >= lastSec - 130 * 60);
+    const bars5  = aggregate(recent, 5);
+    const bars60 = aggregate(recent, 60);
+    if (bars5.length)  await bulkUpsert(symbol, "5",  bars5);
+    if (bars60.length) await bulkUpsert(symbol, "60", bars60);
 
     // Keep latest bar in memory for HTTP poll endpoint
     const latest = bars5[bars5.length - 1];
@@ -994,8 +1048,21 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
   console.log("[mw-reader] Starting — data root:", MW_DATA_ROOT);
 
   (async () => {
+    // One-time startup purge: corrupt rows with out-of-range timestamps (e.g. dated in the future)
+    // pollute the cached-days list and push the chart's date window into empty future space — the
+    // root cause of the "wrong dates + giant catch-up candle" display.
+    try {
+      const maxTs = Math.floor(Date.now() / 1000) + 36 * 3600;
+      const info = db.$client.prepare(
+        `DELETE FROM cached_candles WHERE timestamp > ? OR timestamp < 1262304000`
+      ).run(maxTs);
+      if (info.changes) console.log(`[mw-reader] purged ${info.changes} corrupt out-of-range candle rows`);
+    } catch (e: any) { console.warn("[mw-reader] startup purge failed:", e.message); }
+
     for (const { symbol, dirPattern, activeDir } of MW_INSTRUMENTS) {
-      const instrDir = path.join(MW_DATA_ROOT, activeDir);
+      // Dynamic: follow whichever contract MW is actively writing. activeDir is now only a
+      // cold-start fallback for when no contract dir has any files yet.
+      const instrDir = pickActiveDir(dirPattern) ?? path.join(MW_DATA_ROOT, activeDir);
 
       // Discover all contract dirs for historical merge
       const allContractDirs = getContractDirs(dirPattern);
@@ -1020,9 +1087,10 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
       let seedBar = latestBar5.get(sym);
       if (!seedBar) {
         try {
+          const nowSecGuard = Math.floor(Date.now() / 1000) + 36 * 3600;
           const rowArr = db.$client.prepare(
-            `SELECT close FROM cached_candles WHERE symbol = ? AND resolution = '5' ORDER BY timestamp DESC LIMIT 1`
-          ).all(sym) as any[];
+            `SELECT close FROM cached_candles WHERE symbol = ? AND resolution = '5' AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1`
+          ).all(sym, nowSecGuard) as any[];
           const row = rowArr[0];
           if (row && Number.isFinite(Number(row.close))) {
             const close = Number(row.close);
@@ -1077,7 +1145,7 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         try {
           const tickStat = fs.statSync(initialTickFile);
           const ageMin = (Date.now() - tickStat.mtimeMs) / 60_000;
-          const tickPrice = readLastTickRecord(initialTickFile);
+          const tickPrice = readLastTickRecord(initialTickFile, latestBar5.get(sym)?.close);
           if (tickPrice !== null) {
             const nowSec = Math.floor(Date.now() / 1000);
             const bucket1m = Math.floor(nowSec / 60) * 60;
@@ -1162,18 +1230,13 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         }
       }, 5_000);
 
-      // 16ms tick-only heartbeat (~60fps) — keeps the chart Y-axis label smooth in disk mode.
-      // ONLY broadcasts the lightweight {type:"tick"} message — no bar OHLCV.
-      // Suppressed when TickRelay is active (notifyExternalTick handles all broadcasts then).
-      // Sending full bar messages at 60fps was wasteful: the client throttles bar state
-      // updates to 2s anyway, so 118 of 120 bar sends per second were silently dropped.
-      setInterval(() => {
-        const sym = symbol.toUpperCase();
-        const p   = lastTickPrice.get(sym);
-        if (p === undefined) return;
-        if (Date.now() - (lastExternalTickMs.get(sym) ?? 0) < 5_000) return;
-        if (_broadcast) _broadcast({ type: "tick", symbol: sym, price: p });
-      }, 16);
+      // REMOVED: the 16ms heartbeat that re-applied the last known price via _broadcast().
+      // It was the primary source of "ghost candles": when the feed went quiet (after hours,
+      // ETH, or a frozen Rithmic sim) it kept opening flat O=H=L=C bars every bucket with no
+      // real trades. It also set lastTickAt = Date.now() indirectly, so the stale-feed
+      // detector below never fired. Real ticks still arrive via fs.watch + the 16ms
+      // fallback poll (which only applies a price when the tick FILE actually grows) and via
+      // the 1s bar-file poll, so the live price still updates without synthesizing fake candles.
 
       // 1s bar-state heartbeat — updates in-progress OHLCV bars and broadcasts them.
       // 1s cadence matches notifyExternalTick's forming-bar throttle so disk mode and
