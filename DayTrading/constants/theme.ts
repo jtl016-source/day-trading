@@ -1,58 +1,69 @@
 import { Platform } from 'react-native';
 
-// ── Cockpit palette — near-black base with cool blue tint ─────────────────────
+// ── MERIDIAN palette — dark HUD, teal accent over a near-black teal/violet flow ─
+// Ported from the design source of truth (trading-terminal-mobile mockup):
+//   bg #06070b · accent #2dd4bf · amber #ffb454 · up #1fd98a · down #ff4d6d
+//   text #e9ebf1 · muted #7c8190
+// Every screen reads these tokens, so repointing them re-skins the whole app.
 export const Trading = {
-  // Backgrounds
-  bg:          '#040d12',   // near-black, cool tint
-  surface:     '#07111a',   // card / panel bg
-  surfaceAlt:  '#0b1825',   // alternate card shade
-  surfaceCard: '#0f1f2e',   // raised card
-  panel:       '#091520',   // panel overlay
+  // Backgrounds (solid, slightly cool near-black — read well over the gradient bg)
+  bg:          '#06070b',   // base
+  surface:     '#0c0e13',   // card / panel bg
+  surfaceAlt:  '#11141b',   // alternate card shade
+  surfaceCard: '#151922',   // raised card
+  panel:       '#0a0c11',   // panel overlay
 
-  // Borders (hairline — layered panels, not flat gray cards)
-  border:      '#19293d',
-  borderDefault:'#1e2f42',
-  borderAccent:'#243d54',
+  // Glass fills — translucent white, let the animated background show through
+  glass:       'rgba(255,255,255,0.022)',
+  glass2:      'rgba(255,255,255,0.04)',
+
+  // Hairlines
+  line:        'rgba(255,255,255,0.08)',
+  lineSoft:    'rgba(255,255,255,0.045)',
+  border:      'rgba(255,255,255,0.08)',
+  borderDefault:'rgba(255,255,255,0.10)',
+  borderAccent:'rgba(45,212,191,0.30)',
 
   // Text
-  text:        '#e8f0f7',   // warm white, not harsh
-  textSecondary:'#7a9ab8',
-  muted:       '#4a6880',
-  dim:         '#2e4257',
+  text:        '#e9ebf1',
+  textSecondary:'#aeb4c0',
+  muted:       '#7c8190',
+  dim:         '#565b69',
 
-  // Accent
-  accent:      '#3d8ef8',
+  // Accent — teal
+  accent:      '#2dd4bf',
+  amber:       '#ffb454',
 
   // Direction
-  long:        '#22c55e',   // LONG = green
-  short:       '#ef4444',   // SHORT = red
+  long:        '#1fd98a',   // LONG = green
+  short:       '#ff4d6d',   // SHORT = red
 
-  // Legacy (keep for chart-view compatibility)
-  green:       '#22c55e',
-  red:         '#ef4444',
-  orange:      '#f59e0b',
+  // Legacy aliases (kept for chart-view + existing screens)
+  green:       '#1fd98a',
+  red:         '#ff4d6d',
+  orange:      '#ffb454',
   purple:      '#a78bfa',
-  gold:        '#fbbf24',
+  gold:        '#ffd27a',
 
-  // ── Tier system — color + glyph, never color alone ───────────────────────────
-  // SAFE+  ◆ emerald  #10b981
-  // SAFE   ◆ teal     #14b8a6
-  // RISKY  △ amber    #f59e0b
-  // RISKIEST ▽ red-orange #f97316
-  safeplus:    '#10b981',   // emerald
-  safe:        '#14b8a6',   // teal
-  risky:       '#f59e0b',   // amber
-  riskiest:    '#f97316',   // red-orange
+  // ── Tier system — color + glyph, never color alone (mockup TIER_C mapping) ────
+  // SAFE+  ◆ green  #1fd98a
+  // SAFE   ◆ teal   #2dd4bf
+  // RISKY  △ amber  #ffb454
+  // RISKIEST ▽ red  #ff4d6d
+  safeplus:    '#1fd98a',
+  safe:        '#2dd4bf',
+  risky:       '#ffb454',
+  riskiest:    '#ff4d6d',
 
   // ── Auto-trader arm states ────────────────────────────────────────────────────
-  armOff:      '#4a6880',   // muted gray — off/idle
-  armArmed:    '#f59e0b',   // amber — connected, ready, not firing
-  armLive:     '#10b981',   // emerald — firing live orders
+  armOff:      '#7c8190',   // muted — off/idle
+  armArmed:    '#ffb454',   // amber — connected, ready, not firing
+  armLive:     '#1fd98a',   // green — firing live orders
 
   // ── Strategy brand colors (chart overlays) ────────────────────────────────────
-  milkZones:   '#14b8a6',
-  vector:      '#8b5cf6',
-  footprint:   '#f97316',
+  milkZones:   '#2dd4bf',
+  vector:      '#a78bfa',
+  footprint:   '#ffb454',
 };
 
 export const Colors = {
@@ -85,23 +96,15 @@ export const TIER = {
 
 export type TierKey = keyof typeof TIER;
 
-export const Fonts = Platform.select({
-  ios: {
-    sans: 'system-ui',
-    serif: 'ui-serif',
-    rounded: 'ui-rounded',
-    mono: 'ui-monospace',   // SF Mono on iOS
-  },
-  default: {
-    sans: 'normal',
-    serif: 'serif',
-    rounded: 'normal',
-    mono: 'monospace',
-  },
-  web: {
-    sans: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-    serif: "Georgia, 'Times New Roman', serif",
-    rounded: "'SF Pro Rounded', sans-serif",
-    mono: "SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
-  },
-});
+// ── Fonts — loaded via useFonts() in app/_layout.tsx (splash-gated) ───────────
+// Display/labels = Chakra Petch · all numbers = IBM Plex Mono.
+// The family strings equal the @expo-google-fonts export names once loaded.
+export const Fonts = {
+  sans:     'ChakraPetch_500Medium',
+  display:  'ChakraPetch_600SemiBold',
+  bold:     'ChakraPetch_700Bold',
+  mono:     'IBMPlexMono_500Medium',
+  monoBold: 'IBMPlexMono_600SemiBold',
+  rounded:  'ChakraPetch_500Medium',
+  serif:    Platform.select({ ios: 'ui-serif', web: "Georgia, 'Times New Roman', serif", default: 'serif' }),
+};

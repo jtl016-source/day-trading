@@ -1,8 +1,12 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { View, StyleSheet, ActivityIndicator, Text, Pressable } from 'react-native';
 import { WebView } from 'react-native-webview';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useApp, Timeframe } from '@/context/app-context';
 import { Trading } from '@/constants/theme';
+import { isRTH, mapDbSignal, isPcDisplaySignal, type MobileSignal, type OutcomeResult } from '@/lib/signal-map';
+// Re-export so existing imports from '@/components/chart-view' keep resolving.
+export type { MobileSignal, OutcomeResult } from '@/lib/signal-map';
 
 const FETCH_INTERVAL: Record<Timeframe, string> = {
   '1m': '1m', '5m': '5m', '15m': '5m', '60m': '60m',
@@ -12,6 +16,8 @@ const DISPLAY_MIN: Record<Timeframe, number> = {
 };
 
 const LW_CDN = 'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';
+const LW_STORAGE_KEY = 'lw_script_v4.2.0';
+
 function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Request timed out')), timeoutMs);
@@ -19,12 +25,19 @@ function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
   });
 }
 
+// In-memory cache for the LW script within a single JS runtime session.
+// Backed by AsyncStorage so restarts don't re-hit the CDN once the script is saved.
 let _lwCache: Promise<string> | null = null;
 function getLwScript(): Promise<string> {
   if (!_lwCache) {
-    _lwCache = fetchWithTimeout(LW_CDN, 15000)
-      .then(r => { if (!r.ok) throw new Error('CDN HTTP ' + r.status); return r.text(); })
-      .catch(e => { _lwCache = null; throw e; });
+    _lwCache = AsyncStorage.getItem(LW_STORAGE_KEY).then(async (saved) => {
+      if (saved) return saved;
+      const r = await fetchWithTimeout(LW_CDN, 20000);
+      if (!r.ok) throw new Error('CDN HTTP ' + r.status);
+      const text = await r.text();
+      AsyncStorage.setItem(LW_STORAGE_KEY, text).catch(() => {});
+      return text;
+    }).catch(e => { _lwCache = null; throw e; });
   }
   return _lwCache;
 }
@@ -630,7 +643,10 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
           // Normalise to seconds before bucketing — values < 1e10 are already seconds.
           var tickRaw = msg.time || Date.now();
           var tickSec = tickRaw > 1e10 ? Math.floor(tickRaw / 1000) : tickRaw;
-          var bucketSec = Math.floor(tickSec / liveDisplaySec) * liveDisplaySec;
+          // 60m uses a 30-min offset so buckets start at :30 (13:30 UTC = RTH open) — MUST match
+          // the historical aggToInterval/get60mBucket or the forming 60m bar lands a half-hour off.
+          var liveOff = liveDisplaySec === 3600 ? 1800 : 0;
+          var bucketSec = Math.floor((tickSec - liveOff) / liveDisplaySec) * liveDisplaySec + liveOff;
           if (!liveLastBar || bucketSec > liveLastBar.time) {
             liveLastBar = { time: bucketSec, open: p, high: p, low: p, close: p, volume: 0 };
           } else {
@@ -648,9 +664,19 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
           var bar = msg.bar;
           if (!bar.symbol || !bar.symbol.startsWith(liveSym)) return;
 
+          // Spike guard — reject a corrupt live bar (matches historical spikeBarOk wick limit)
+          // so a bad MW read can't paint a giant wick on the most-recent candle.
+          if (bar.high <= bar.low || bar.low <= 0 || bar.close <= 0) return;
+          var bRange = bar.high - bar.low;
+          var bBL = Math.min(bar.open, bar.close), bBH = Math.max(bar.open, bar.close);
+          if ((bRange / bar.close > 0.015 && Math.abs(bar.open - bar.close) / bRange < 0.10) ||
+              (bBL - bar.low) / bar.close > 0.015 || (bar.high - bBH) / bar.close > 0.015) return;
+
           // Map the fetch-resolution bar onto the display-resolution bucket.
           // For a 15m display chart receiving 5m bars, three 5m bars share one 15m bucket.
-          var dispBucket = Math.floor(bar.time / liveDisplaySec) * liveDisplaySec;
+          // 60m uses the 30-min offset to match historical aggregation (see tick handler).
+          var barOff = liveDisplaySec === 3600 ? 1800 : 0;
+          var dispBucket = Math.floor((bar.time - barOff) / liveDisplaySec) * liveDisplaySec + barOff;
 
           if (!liveLastBar || dispBucket > liveLastBar.time) {
             // New display bucket — start fresh
@@ -746,6 +772,10 @@ function aggToInterval(bars: any[], intervalMin: number): any[] {
 // appear as "little candles at the bottom" when charted.
 function isValidBar(b: any): boolean {
   if (!b || !b.time) return false;
+  // Timestamp sanity — mirrors PC shared/bar-time.ts isSaneBarTime():
+  // reject pre-2010 (bad parse) and >36h future (corrupt rows that smear the date axis).
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (b.time < 1_262_304_000 || b.time > nowSec + 36 * 3600) return false;
   const { open: o, high: h, low: l, close: c } = b;
   if (!o || !h || !l || !c) return false;
   if (h < l || l <= 0 || o <= 0 || c <= 0) return false;
@@ -755,6 +785,53 @@ function isValidBar(b: any): boolean {
   // H-L spread > 15% of close = corrupt bar (catch-up candles from MW reconnect)
   if ((h - l) / c > 0.15) return false;
   return true;
+}
+
+// Per-bar spike/wick sanity (PC Pass 1 / clean5m). Run BEFORE aggregation so a corrupt 5m
+// bar can't poison its 15m bucket — exactly what the PC does in its candleData clean5m step.
+function spikeBarOk(c: any): boolean {
+  const MAX_PRICE = 9e13, MIN_PRICE = 1;
+  const MAX_TS = Math.floor(Date.now() / 1000) + 36 * 3600;
+  if (!c || !c.time) return false;
+  if (c.time <= 1_262_304_000 || c.time > MAX_TS) return false;
+  if (!Number.isFinite(c.open) || !Number.isFinite(c.high) || !Number.isFinite(c.low) || !Number.isFinite(c.close)) return false;
+  if (c.open < MIN_PRICE || c.high < MIN_PRICE || c.low < MIN_PRICE || c.close < MIN_PRICE) return false;
+  if (c.open >= MAX_PRICE || c.high >= MAX_PRICE || c.low >= MAX_PRICE || c.close >= MAX_PRICE) return false;
+  if (c.high <= c.low) return false;
+  const range = c.high - c.low;
+  if (range / c.close > 0.015 && Math.abs(c.open - c.close) / range < 0.10) return false; // doji-spike
+  const bL = Math.min(c.open, c.close), bH = Math.max(c.open, c.close);
+  if ((bL - c.low) / c.close > 0.015 || (c.high - bH) / c.close > 0.015) return false;     // wick > 1.5%
+  return true;
+}
+
+// EXACT 1:1 port of the PC's CURRENT cleaner (client/src/hooks/useTerminalData.ts cleanRows).
+// The PC deliberately uses a SURGICAL filter — per-bar spike sanity + interval-alignment +
+// volume>0 — and explicitly does NOT use neighbour / phantom / isolation passes, because in a
+// trending market those delete genuine bars and tear holes (gaps). The phone previously ran
+// the abandoned multi-pass filter, so it showed ghost/"false" candles the PC doesn't. Now both
+// keep exactly the same bars. `intervalSec` = the interval of the bars being cleaned.
+function spikeThrSec(intervalSec: number): number {
+  return intervalSec <= 60 ? 0.005 : intervalSec <= 300 ? 0.010 : intervalSec <= 900 ? 0.015 : 0.025;
+}
+function badBarPC(o: number, h: number, l: number, c: number, thr: number): boolean {
+  if (![o, h, l, c].every((v) => Number.isFinite(v))) return true;
+  if (h < l || o > h + 1e-9 || o < l - 1e-9 || c > h + 1e-9 || c < l - 1e-9 || c <= 0) return true;
+  if ((h - l) / c > thr) return true; // absurd range
+  return false;
+}
+function isAlignedPC(time: number, intervalSec: number): boolean {
+  if (intervalSec >= 3600) return true; // 60m uses a session offset — skip the strict check
+  return Number.isInteger(time) && time % intervalSec === 0; // drop forming/partial ghost bars
+}
+function cleanPC(input: any[], intervalSec: number): any[] {
+  const thr = spikeThrSec(intervalSec);
+  return input
+    .filter((b: any) => {
+      const v = Number(b.volume ?? b.v ?? 1); // missing volume defaults to 1 (kept), like the PC
+      return !badBarPC(b.open, b.high, b.low, b.close, thr) && isAlignedPC(b.time, intervalSec) && v > 0;
+    })
+    .sort((a: any, b: any) => a.time - b.time);
 }
 
 // Sliding-window Highest(Lowest(low, 20), 20) — matches PC computeVectorLine
@@ -869,73 +946,12 @@ function buildProxyFp(c: any): FpCandle {
   return { time: c.time, levels, totalBidVol, totalAskVol, candleDelta: totalAskVol - totalBidVol, poc, high: c.high, low: c.low, imbalances };
 }
 
-export type OutcomeResult = { outcome: 'Win' | 'Loss' | 'Open'; tpHit: 1 | 2 | null; points: number | null };
-
-// ── Signal mapping helper — converts a DB row (from /api/signals/history) to MobileSignal.
-// Used in both the initial load and the bar_complete refetch path to stay consistent.
-function mapDbSignal(s: any): MobileSignal {
-  const isLong = s.direction === 'Long';
-  const isTp2  = s.outcome === 'win_tp2'  || s.outcome === 'tp2';
-  const isTp1  = s.outcome === 'win_tp1'  || s.outcome === 'win_trailer' || s.outcome === 'tp1';
-  const isLoss = s.outcome === 'loss'     || s.outcome === 'sl';
-  const pts    = isTp2  ? (isLong ? s.tp2 - s.entry : s.entry - s.tp2)
-               : isTp1  ? (isLong ? s.tp1 - s.entry : s.entry - s.tp1)
-               : isLoss ? (isLong ? s.sl  - s.entry : s.entry - s.sl)
-               : null;
-  return {
-    time:         s.timestamp,
-    direction:    s.direction,
-    riskLevel:    s.riskLevel,
-    price:        s.entry,
-    tp1:          s.tp1,
-    tp2:          s.tp2,
-    sl:           s.sl,
-    outcome:      (isTp2 || isTp1) ? 'Win' : isLoss ? 'Loss' : 'Open',
-    tpHit:        isTp2 ? 2 : isTp1 ? 1 : null,
-    points:       pts !== null ? +pts.toFixed(2) : null,
-    rth:          isRTH(s.timestamp),
-    exitOutcomes: {},
-    strategies:   { fp: false, milk: false, vec: false, milkPts: 0 },
-  } as MobileSignal;
-}
-
-export interface MobileSignal {
-  time: number;
-  direction: 'Long' | 'Short';
-  riskLevel: 'safeplus' | 'safe' | 'risky' | 'riskiest';
-  price: number;
-  tp1: number;
-  tp2: number;
-  sl: number;
-  outcome: 'Win' | 'Loss' | 'Open';
-  tpHit: 1 | 2 | null;
-  points: number | null;
-  rth: boolean;
-  /** Pre-computed outcomes for each exit strategy (avoids needing candle data later). */
-  exitOutcomes: Record<string, OutcomeResult & { tp1: number; tp2: number; sl: number }>;
-  /** Which strategies contributed points to this signal. */
-  strategies: { fp: boolean; milk: boolean; vec: boolean; milkPts: number };
-}
+// OutcomeResult / MobileSignal / mapDbSignal / isPcDisplaySignal / isRTH now live in
+// lib/signal-map.ts (shared with the Market & Signals screens) — imported above.
 
 
 // ── Yellow Box pivot levels from yesterday's RTH session ──────────────────────
-
-// DST-safe RTH check — matches trading-utils.ts isRTH() exactly.
-// Old version used hardcoded UTC offsets which broke in winter (EST=UTC-5 vs EDT=UTC-4),
-// causing RTH to end at 3 PM ET instead of 4 PM ET from November through March.
-const _nyRthFmt = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/New_York',
-  weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
-});
-function isRTH(ts: number): boolean {
-  const parts = _nyRthFmt.formatToParts(new Date(ts * 1000));
-  const day  = parts.find(p => p.type === 'weekday')?.value ?? '';
-  const hour = parseInt(parts.find(p => p.type === 'hour')?.value  ?? '0');
-  const min  = parseInt(parts.find(p => p.type === 'minute')?.value ?? '0');
-  if (day === 'Sat' || day === 'Sun') return false;
-  const etMins = hour * 60 + min;
-  return etMins >= 9 * 60 + 30 && etMins < 16 * 60;
-}
+// (isRTH imported from lib/signal-map.ts)
 
 function computeYellowBoxLevels(rawBars: any[]): {
   levels: { price: number; label: string; color: string }[];
@@ -1121,7 +1137,13 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
 
   const retryCountRef = useRef(0);
 
-  const sym = instrument.replace(/[^A-Za-z0-9]/g, '').replace(/\d+$/, '');
+  // Canonical symbol — exact port of shared/symbol.ts normalizeSymbol() on PC.
+  // MESM6 -> MES, MESM6.CME -> MES, MES1! -> MES, MES=F -> MES (keeps PC/iPhone identical).
+  const sym = instrument.toUpperCase().trim()
+    .replace(/\.[A-Z]+$/, '')               // strip exchange suffix (.CME)
+    .replace(/=F$/, '')                      // strip Yahoo futures suffix
+    .replace(/[FGHJKMNQUVXZ]\d{1,2}$/, '')   // strip CME month-code + year (MESM6 -> MES)
+    .replace(/\d+!?$/, '');                  // strip TradingView contract suffix (MES1! -> MES)
   const fetchInterval = FETCH_INTERVAL[timeframe];
   const displayMin = DISPLAY_MIN[timeframe];
 
@@ -1140,9 +1162,12 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
       try {
         webViewRef.current?.injectJavaScript(`window.setStatus('Loading data…');true;`);
 
-        // ── Fetch display candles — 90-day window matches PC view ────────────
+        // ── Fetch display candles — 10-day fast-open window, EXACTLY like the PC
+        // (FAST_OPEN_DAYS in useTerminalData). Pulling 90 days here — and worse, 90 days of
+        // 1m bars below (~130k bars) — overflowed the iOS WKWebView payload limit and the
+        // chart never appeared. 10 days paints instantly and matches the PC's initial view.
         const nowSec  = Math.floor(Date.now() / 1000);
-        const fromSec = nowSec - 90 * 86400;
+        const fromSec = nowSec - 10 * 86400;
         const toSec   = nowSec + 86400;
         const url = `${apiBaseUrl}/api/data/cached-continuous/${sym}/${fetchInterval}?from=${fromSec}&to=${toSec}`;
         const resp = await fetchWithTimeout(url, 15000);
@@ -1172,22 +1197,18 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
         }
         if (cancelled) return;
 
-        // ── Validate + sort — removes corrupted "little candles" from MW ──────
-        const valid1m = dedupByTime(
-          (rawBars1m.length ? rawBars1m : rawBars)
-            .filter(isValidBar)
-            .sort((a: any, b: any) => a.time - b.time)
-        );
-        const validDisplay = dedupByTime(
-          rawBars.filter(isValidBar).sort((a: any, b: any) => a.time - b.time)
-        );
-
-        // ── Display candles for current timeframe ─────────────────────────────
-        // Shows ALL historical data from MotiveWave (no RTH filter).
-        // Weekend/overnight gaps appear naturally on the time axis.
-        const candles = dedupByTime(aggToInterval(validDisplay, displayMin))
-          .sort((a: any, b: any) => a.time - b.time);
+        // ── Display candles — EXACT PC ordering so both charts keep identical bars ──
+        // PC (market.tsx): per-bar spike-clean the FETCHED bars → aggregate to the display
+        // interval → full multi-pass filter (neighbor/phantom/isolation) on the result.
+        // Doing the spike-clean BEFORE aggregation prevents a corrupt 5m bar from poisoning
+        // its 15m bucket; the full multi-pass AFTER aggregation removes phantom display bars.
+        const preClean = (rawBars as any[]).filter(spikeBarOk).sort((a: any, b: any) => a.time - b.time);
+        const aggDisplay = dedupByTime(aggToInterval(preClean, displayMin)).sort((a: any, b: any) => a.time - b.time);
+        const candles = cleanPC(aggDisplay, displayMin * 60);                 // surgical clean at the display interval
         const chartTimes = candles.map((c: any) => c.time);
+
+        // 1m base for vector computation — same surgical clean at 1m resolution
+        const valid1m = dedupByTime(cleanPC(rawBars1m.length ? rawBars1m : rawBars, 60));
 
         if (!candles.length) {
           webViewRef.current?.injectJavaScript(`window.setStatus('No data available');true;`);
@@ -1261,6 +1282,7 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
             const cutoff = Math.floor(Date.now() / 1000) - 90 * 86400;
             signals = (sd.signals ?? [])
               .filter((s: any) => s.timestamp >= cutoff)
+              .filter(isPcDisplaySignal)   // PARITY: match the PC chart (safe/safeplus + isStrong)
               .map(mapDbSignal);
           }
         } catch { /* non-fatal */ }
@@ -1390,7 +1412,7 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
 
         // ── Yellow Box pivot levels ───────────────────────────────────────────
         if (strategies.milkZones) {
-          const ybox = computeYellowBoxLevels(valid1m.length ? valid1m : validDisplay);
+          const ybox = computeYellowBoxLevels(valid1m.length ? valid1m : candles);
           if (ybox) {
             webViewRef.current?.injectJavaScript(
               `window.setYellowBoxData(${JSON.stringify(ybox.levels)},${ybox.sessionStart},${ybox.sessionEnd},true);true;`
@@ -1493,6 +1515,7 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
                 const cutoff = Math.floor(Date.now() / 1000) - 90 * 86400;
                 const fresh: MobileSignal[] = (sd.signals ?? [])
                   .filter((s: any) => s.timestamp >= cutoff)
+                  .filter(isPcDisplaySignal)   // PARITY: match the PC chart
                   .map(mapDbSignal);
                 webViewRef.current?.injectJavaScript(
                   `window.setSignals(${JSON.stringify(fresh)});true;`
@@ -1507,7 +1530,7 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
                 if (!sr.ok) return;
                 const sd = await sr.json();
                 const cutoff = Math.floor(Date.now() / 1000) - 90 * 86400;
-                const fresh: MobileSignal[] = (sd.signals ?? []).filter((s: any) => s.timestamp >= cutoff).map(mapDbSignal);
+                const fresh: MobileSignal[] = (sd.signals ?? []).filter((s: any) => s.timestamp >= cutoff).filter(isPcDisplaySignal).map(mapDbSignal);
                 webViewRef.current?.injectJavaScript(`window.setSignals(${JSON.stringify(fresh)});true;`);
                 if (fresh.length) onSignals?.(fresh);
               }).catch(() => {});

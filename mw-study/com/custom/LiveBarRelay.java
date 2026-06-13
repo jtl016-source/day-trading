@@ -48,13 +48,25 @@ public class LiveBarRelay extends Study {
   // Set to true once history has been dumped for the current connection
   private final AtomicBoolean historyDumped      = new AtomicBoolean(false);
 
+  // Stored from the most recent calculate() call so onOpen() can dump history
+  // immediately without waiting for a new bar (critical on weekends / closed markets).
+  private volatile DataSeries lastDs     = null;
+  private volatile String     lastSymbol = null;
+
   // ── Footprint accumulator — per-price bid/ask volume for the current 5m bucket ──
   private final TreeMap<Float, long[]> footprintLevels = new TreeMap<>(); // price → [bidVol, askVol]
   private volatile long   footprintBucketMs  = 0;   // current 5-min bucket start (epoch ms)
   private volatile String footprintSymbol    = "";   // symbol of current bucket
-  // Fix 8 diagnostics: warn ONCE if SDK reflection misses the real method name
-  private static final AtomicBoolean warnedNoVol  = new AtomicBoolean(false);
-  private static final AtomicBoolean warnedNoSide = new AtomicBoolean(false);
+
+  // ── Per-tick forming-bar relay ──────────────────────────────────────────────
+  // The price-only tick already lets the client update the last bar's CLOSE on every
+  // tick, but it never carries the forming candle's OPEN/HIGH/LOW/VOLUME. We now read
+  // the live (incomplete) bar straight from MW's DataSeries on every tick and send a
+  // {type:"bar",complete:false} so the forming candle's wicks/body match MotiveWave.
+  // Capped to FORMING_BAR_THROTTLE_MS to avoid the documented React re-render flood
+  // (LEARNINGS: "Forming bars … throttled to 1/second").
+  private volatile long lastFormingBarMs = 0;
+  private static final long FORMING_BAR_THROTTLE_MS = 200;
 
   private final ScheduledExecutorService scheduler =
     Executors.newSingleThreadScheduledExecutor(r -> {
@@ -82,10 +94,19 @@ public class LiveBarRelay extends Study {
         public void onOpen(WebSocket ws) {
           wsRef.set(ws);
           ws.request(Long.MAX_VALUE);
-          // Reset dump flag so history is re-sent for the new connection
           historyDumped.set(false);
           pendingHistoryDump.set(true);
           System.out.println("[LiveBarRelay] Connected to " + WS_ENDPOINT);
+
+          // Fire history dump immediately using the stored DataSeries so it works even
+          // on weekends/closed markets when calculate() is never called after reconnect.
+          final DataSeries ds  = lastDs;
+          final String     sym = lastSymbol;
+          if (ds != null && sym != null && historyDumped.compareAndSet(false, true)) {
+            pendingHistoryDump.set(false);
+            final int tot = ds.size();
+            scheduler.execute(() -> dumpHistory(ds, sym, tot));
+          }
         }
 
         @Override
@@ -127,6 +148,35 @@ public class LiveBarRelay extends Study {
       "{\"type\":\"tick\",\"symbol\":\"%s\",\"price\":%.4f,\"time\":%d}",
       symbol, price, now));
 
+    // ── Forming-bar OHLCV on every tick (throttled) ───────────────────────────
+    // Send the live candle straight from MW's DataSeries so its open/high/low/volume
+    // track the tick in near-real-time (not just on the periodic calculate() pass).
+    if (now - lastFormingBarMs >= FORMING_BAR_THROTTLE_MS) {
+      lastFormingBarMs = now;
+      DataSeries ds  = ctx.getDataSeries();
+      int        idx = ds.size() - 1;
+      if (idx >= 0) {
+        long  tMs = ds.getStartTime(idx);
+        float o   = ds.getOpen(idx);
+        // close := freshest tick; high/low reconciled with it so OHLC is never malformed
+        // (close > high / close < low would be rejected server-side) and the wick always
+        // includes the latest print.
+        float c   = price;
+        float h   = Math.max(ds.getHigh(idx), price);
+        float l   = Math.min(ds.getLow(idx),  price);
+        long  vol = (long) ds.getVolume(idx);
+        boolean complete = ds.isBarComplete(idx);
+        String res       = inferResolution(ds, idx);
+        if (h >= l && o > 0) {
+          sendWs(String.format(
+            "{\"type\":\"bar\",\"symbol\":\"%s\",\"resolution\":\"%s\"" +
+            ",\"time\":%d,\"open\":%.4f,\"high\":%.4f,\"low\":%.4f,\"close\":%.4f" +
+            ",\"volume\":%d,\"complete\":%b}",
+            symbol, res, tMs / 1000L, o, h, l, c, vol, complete));
+        }
+      }
+    }
+
     // ── Footprint accumulation ────────────────────────────────────────────
     long intervalMs = 5L * 60L * 1000L;                         // 5-minute buckets
     long bucketMs   = (now / intervalMs) * intervalMs;
@@ -142,18 +192,19 @@ public class LiveBarRelay extends Study {
       footprintBucketMs = bucketMs;
       footprintSymbol   = symbol;
 
-      // Extract volume and direction from the Tick object via reflection
-      long    vol   = extractLong(tick, "getVolume", "getSize", "getQuantity", "getLastSize");
-      boolean isAsk = extractBool(tick, "isAsk", "askTick", "isBuyTick");
-      if (vol == 0 && warnedNoVol.compareAndSet(false, true))
-        System.out.println("[LiveBarRelay] WARNING: no volume method matched on Tick — footprint volume is tick-count only. Fix extractLong() method names.");
-      if (!isAsk && warnedNoSide.compareAndSet(false, true))
-        System.out.println("[LiveBarRelay] WARNING: side method not matched on Tick (defaulting to bid). Fix extractBool() method names if all footprint delta is negative.");
-      if (vol <= 0) vol = 1; // treat unknown as 1 contract
-
-      long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
-      if (isAsk) arr[1] += vol; // ask volume (aggressive buy)
-      else       arr[0] += vol; // bid volume (aggressive sell)
+      // REAL footprint straight from the MotiveWave SDK Tick (filled from Rithmic's live trade
+      // feed) — no reflection, no guessing:
+      //   getVolume()  → actual trade size; 0 on quote-only ticks (bid/ask change, no trade)
+      //   isAskTick()  → true when the trade LIFTED the ask (aggressive BUY), false when it HIT
+      //                  the bid (aggressive SELL). This is the genuine aggressor side. The old
+      //                  code guessed method names ("isAsk"/"askTick"/"isBuyTick") that don't
+      //                  exist, so every trade defaulted to "bid" → fabricated sell-biased delta.
+      int vol = tick.getVolume();
+      if (vol > 0) { // ignore quote-only ticks so they don't pollute the footprint with phantom volume
+        long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
+        if (tick.isAskTick()) arr[1] += vol; // aggressive buy  → ask volume
+        else                  arr[0] += vol; // aggressive sell → bid volume
+      }
     }
   }
 
@@ -174,30 +225,6 @@ public class LiveBarRelay extends Study {
       symbol, bucketMs / 1000L, levels));
   }
 
-  /** Extracts a long value from an object by trying method names in order (reflection). */
-  private static long extractLong(Object obj, String... methodNames) {
-    for (String name : methodNames) {
-      try {
-        java.lang.reflect.Method m = obj.getClass().getMethod(name);
-        Object v = m.invoke(obj);
-        if (v instanceof Number) return ((Number) v).longValue();
-      } catch (Exception ignored) {}
-    }
-    return 0L;
-  }
-
-  /** Extracts a boolean from an object by trying method names in order (reflection). */
-  private static boolean extractBool(Object obj, String... methodNames) {
-    for (String name : methodNames) {
-      try {
-        java.lang.reflect.Method m = obj.getClass().getMethod(name);
-        Object v = m.invoke(obj);
-        if (v instanceof Boolean) return (Boolean) v;
-      } catch (Exception ignored) {}
-    }
-    return false; // default: treat as bid (sell aggression) if direction unknown
-  }
-
   // ── Bar callback ──────────────────────────────────────────────────────────────
 
   @Override
@@ -206,8 +233,12 @@ public class LiveBarRelay extends Study {
     int        total  = ds.size();
     String     symbol = ctx.getInstrument().getSymbol();
 
-    // ── History dump: fires once per WS connection, on the very first calculate() ──
-    // Run in background so MW's calculation thread is never blocked by WS I/O.
+    // Always keep the reference fresh so onOpen() can dump history on reconnect
+    // even when markets are closed and calculate() won't be called again.
+    lastDs     = ds;
+    lastSymbol = symbol;
+
+    // ── History dump: fires once per WS connection (fallback if onOpen fired before first calculate()) ──
     if (pendingHistoryDump.compareAndSet(true, false) && !historyDumped.get()) {
       historyDumped.set(true);
       final DataSeries snap = ds;

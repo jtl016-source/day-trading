@@ -66,17 +66,23 @@ MotiveWave (Java study)
 - **riskiest**: zone + vector direction only
 - Cooldown: 10 RTH bars between signals (prevents clustering)
 
-### RTH Definition
-- Mon–Fri, 13:30–21:00 UTC (9:30am–5pm ET)
-- ETH = everything else (overnight, weekends)
-- This definition is used in BOTH server (`isRTH` in mw-reader.ts) and client
+### RTH / ETH Definition (CME ES/MES futures)
+- **RTH**: Mon–Fri, 9:30 AM – **5:00 PM ET** (user-defined close). Compute with `Intl.DateTimeFormat({timeZone:"America/New_York"})` — NEVER a hardcoded UTC offset (9:30 ET = 13:30 UTC in EDT but 14:30 UTC in EST). Canonical: `isRTH` in `client/src/lib/trading-utils.ts` (`etMins < 17*60`).
+- **ETH**: the overnight Globex session — Sun 6:00 PM ET → Fri 5:00 PM ET minus the RTH window (i.e. 6:00 PM → 9:30 AM).
+- **CLOSED**: daily maintenance halt 5:00–6:00 PM ET, and the weekend (Fri 5 PM → Sun 6 PM).
+- Full session classifier (RTH/ETH/CLOSED) for display: `marketSession()` in `client/src/components/terminal/Clock.tsx`.
+
+### Signal rules (user-defined)
+- **No signals after 3:15 PM ET** (15:15) on any interval — too risky near the RTH close.
+- **During ETH, only vector side-entry signals** (`signalType: "vector-side-entry"`) may fire/display — all confluence (milk/vector/footprint) signals are RTH-only.
 
 ---
 
 ## Style Rules
 - Never add `autoscaleInfoProvider` without `() => null` for indicator series
 - Always use `useLayoutEffect` for any code that reads DOM dimensions at init
-- `fetchInterval` maps: `"1m"→1m`, `"5m"|"15m"→5m`, `"60m"→60m` — 15m is always aggregated client-side
+- `fetchInterval` maps: `"1m"→1m`, `"5m"→5m`, `"15m"→15m`, `"60m"→60m` — server tries resolution `["15","5"]` for 15m (native 15m bars first, falls back to 5m aggregation)
+- `cached-days` includes `resolution IN ('5','15','60')` so native 15m days from MW relay appear in the scrubber
 - Candle coloring: above vector = normal colors, below vector = dim/muted colors
 - All candle data passes through `dedupMap` before `series.setData()`
 - Signal computation always uses `rth !== false` filter (RTH-only candles for strategies)

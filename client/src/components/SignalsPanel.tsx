@@ -93,7 +93,7 @@ function isRTH(ts: number): boolean {
   const d = new Date(ts * 1000);
   if (d.getUTCDay() === 0 || d.getUTCDay() === 6) return false;
   const m = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return m >= 13 * 60 + 30 && m < 20 * 60; // 9:30 AM – 4:00 PM ET
+  return m >= 13 * 60 + 30 && m < 21 * 60; // 9:30 AM – 5:00 PM ET (EDT)
 }
 
 /** Returns true if the timestamp falls in the CME ES/MES settlement break (4:30pm–6:00pm ET). */
@@ -304,16 +304,16 @@ function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = 
         // FIX 4: proxy data cannot be "strong" — cap at weak (2pts max)
         if (fpR?.isProxyData) fpStrong = false;
         const totalPts = (fpFires ? (fpStrong ? 4 : 2) : 0) + milkPtsL + (vecTestedL ? 2 : 0);
-        if (totalPts >= 1) {
-          const level: RiskLevel = totalPts >= 8 ? "safeplus" : totalPts >= 4 ? "safe" : totalPts >= 3 ? "risky" : "riskiest";
-          if (!(rthFlag && utcH >= 20 && level !== "safe" && level !== "safeplus")) {
-            const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-            if (i - (rthFlag ? lastLongBar : lastLongEthBar) >= cd) {
-              if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
-              raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Long", riskLevel: level, price: c.close,
-                tp1: c.close + TP_FIXED_1, tp2: c.close + TP_FIXED_2, sl: c.close - SL_FIXED,
-                milkOk: milkBullOk, secondaryVecOk: secLongOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
-            }
+        // SINGLE-TIER: only safe-quality setups (≥4 pts) fire; every signal is labeled "safe".
+        // Weaker setups (the old risky/riskiest) are no longer signals — no categories.
+        if (totalPts >= 4) {
+          const level: RiskLevel = "safe";
+          const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
+          if (i - (rthFlag ? lastLongBar : lastLongEthBar) >= cd) {
+            if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
+            raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Long", riskLevel: level, price: c.close,
+              tp1: c.close + TP_FIXED_1, tp2: c.close + TP_FIXED_2, sl: c.close - SL_FIXED,
+              milkOk: milkBullOk, secondaryVecOk: secLongOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
           }
         }
       }
@@ -341,16 +341,15 @@ function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = 
         // FIX 4: proxy data cannot be "strong" — cap at weak (2pts max)
         if (fpR?.isProxyData) fpStrong = false;
         const totalPts = (fpFires ? (fpStrong ? 4 : 2) : 0) + milkPtsS + (vecTestedS ? 2 : 0);
-        if (totalPts >= 1) {
-          const level: RiskLevel = totalPts >= 8 ? "safeplus" : totalPts >= 4 ? "safe" : totalPts >= 3 ? "risky" : "riskiest";
-          if (!(rthFlag && utcH >= 20 && level !== "safe" && level !== "safeplus")) {
-            const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-            if (i - (rthFlag ? lastShortBar : lastShortEthBar) >= cd) {
-              if (rthFlag) lastShortBar = i; else lastShortEthBar = i;
-              raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Short", riskLevel: level, price: c.close,
-                tp1: c.close - TP_FIXED_1, tp2: c.close - TP_FIXED_2, sl: c.close + SL_FIXED,
-                milkOk: milkBearOk, secondaryVecOk: secShortOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
-            }
+        // SINGLE-TIER: only safe-quality setups (≥4 pts) fire; every signal is labeled "safe".
+        if (totalPts >= 4) {
+          const level: RiskLevel = "safe";
+          const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
+          if (i - (rthFlag ? lastShortBar : lastShortEthBar) >= cd) {
+            if (rthFlag) lastShortBar = i; else lastShortEthBar = i;
+            raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Short", riskLevel: level, price: c.close,
+              tp1: c.close - TP_FIXED_1, tp2: c.close - TP_FIXED_2, sl: c.close + SL_FIXED,
+              milkOk: milkBearOk, secondaryVecOk: secShortOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
           }
         }
       }
@@ -1116,14 +1115,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         <button style={sel(direction === "long",  "#26c87a")} onClick={() => setDirection("long")}>Long ▲</button>
         <button style={sel(direction === "short", "#ef5350")} onClick={() => setDirection("short")}>Short ▼</button>
 
-        <span style={{ width: 1, height: 16, background: MW.border }} />
-
-        {/* Risk filter */}
-        <button style={sel(riskFilter === "all")}                   onClick={() => setRiskFilter("all")}>All Risk</button>
-        <button style={sel(riskFilter === "safeplus",  "#a78bfa")}   onClick={() => setRiskFilter("safeplus")}>SAFE+</button>
-        <button style={sel(riskFilter === "safe",     "#26c87a")}   onClick={() => setRiskFilter("safe")}>Safe</button>
-        <button style={sel(riskFilter === "risky",    "#f59e0b")}   onClick={() => setRiskFilter("risky")}>Risky</button>
-        <button style={sel(riskFilter === "riskiest", "#ef5350")}   onClick={() => setRiskFilter("riskiest")}>Riskiest</button>
+        {/* Risk filter removed — every signal is a single "safe" tier, no categories. */}
 
         <span style={{ width: 1, height: 16, background: MW.border }} />
 

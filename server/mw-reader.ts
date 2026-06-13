@@ -35,11 +35,12 @@ import { type Server as HttpServer } from "http";
 // points from the last known good price (catches corrupt tick-file bytes).
 const TICK_SIZE              = 0.25;   // MES/ES minimum tick = 0.25 index points
 const DEFAULT_TICK_SIZE      = 0.25;
-// 600 ticks = 150 pts. Catches corrupt float32 misreads (~796 ticks / 199 pts seen in practice)
-// while allowing legitimate 100-pt single-tick gaps during extreme volatility.
-// First tick after a long session gap (>30 min) bypasses this check entirely (see applyTick).
-const MAX_TICK_DEVIATION     = 600;
-const DEFAULT_MAX_TICK_DEVIATION = 600;
+// 200 ticks = 50 pts. Disk-path ticks are sampled once per file-change event (every few seconds),
+// so a legitimate price move between samples is small (a 40-pt sell-off over 15m is ~0.04 pts/sec).
+// The corrupt byte-scan case we saw was 53 pts (212 ticks) — this threshold rejects it while
+// allowing genuine intra-session moves. Session opens (>30 min silence) bypass this entirely.
+const MAX_TICK_DEVIATION     = 200;
+const DEFAULT_MAX_TICK_DEVIATION = 200;
 
 // TODO: make configurable for distribution (e.g. via MW_DATA_ROOT env var)
 const MW_DATA_ROOT = process.env.MW_DATA_ROOT ?? path.join(
@@ -408,7 +409,7 @@ function readLastTickRecord(filePath: string, hint?: number): number | null {
   if (!candidates.length) return null;
 
   // With a reference price, return the candidate CLOSEST to it. Corrupt byte patterns produce
-  // in-range floats that are far from the true price (e.g. 1339 when price is 6857); closest-to-
+  // in-range floats that are far from the true price (e.g. 7524 when price is 7577); closest-to-
   // hint rejects those while still tracking real movement (consecutive ticks are near each other).
   if (hint && hint > 0) {
     let best = candidates[0], bestDiff = Math.abs(candidates[0] - hint);
@@ -416,6 +417,10 @@ function readLastTickRecord(filePath: string, hint?: number): number | null {
       const d = Math.abs(c - hint);
       if (d < bestDiff) { best = c; bestDiff = d; }
     }
+    // If even the best candidate is >40 pts from the reference, the entire tail is corrupt.
+    // Return null — no update is safer than a wrong wick. TickRelay continues providing
+    // accurate prices, and the next real file change will supply a fresh (closer) candidate.
+    if (bestDiff > 40) return null;
     return best;
   }
   return candidates[0]; // no reference yet — newest in-range float wins

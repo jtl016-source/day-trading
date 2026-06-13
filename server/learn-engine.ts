@@ -74,6 +74,21 @@ function classifyBucket(timestampSec: number): SessionBucket {
   return "ah";
 }
 
+// DST-safe RTH check (Mon–Fri 9:30 AM–4:00 PM ET). Replaces the old hardcoded 13:30–21:00 UTC
+// windows, which were both an hour off in winter (EST) AND ended at 5 PM instead of 4 PM.
+const _rthEtFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
+});
+function isRTHsec(timestampSec: number): boolean {
+  const parts = _rthEtFmt.formatToParts(new Date(timestampSec * 1000));
+  const wd = parts.find(p => p.type === "weekday")?.value ?? "";
+  if (wd === "Sat" || wd === "Sun") return false;
+  const h = parseInt(parts.find(p => p.type === "hour")?.value ?? "0", 10);
+  const m = parseInt(parts.find(p => p.type === "minute")?.value ?? "0", 10);
+  const mins = h * 60 + m;
+  return mins >= 9 * 60 + 30 && mins < 17 * 60; // 9:30 AM – 5:00 PM ET
+}
+
 function parseFp(trade: typeof signalHistory.$inferSelect): any | null {
   if (!trade.footprintReading) return null;
   try { return JSON.parse(trade.footprintReading); } catch { return null; }
@@ -206,7 +221,7 @@ export async function runLearningSession(symbol = "MES", interval = "5m"): Promi
       midTradeDivergence:    false, // FOOTPRINT-LEARN: ephemeral — not stored, only live alerts
       footprintFiredAlone:   (fp?.confirmed ?? false) && s.riskLevel === "risky", // FOOTPRINT-LEARN: risky + fp confirmed = likely standalone (no zone)
       footprintDeltaValue:   fp?.candleDelta ?? 0, // FOOTPRINT-LEARN:
-      footprintWasDuringETH: (() => { const d = new Date(s.timestamp * 1000); const h = d.getUTCHours(); const m = d.getUTCMinutes(); const mins = h * 60 + m; return !(d.getUTCDay() >= 1 && d.getUTCDay() <= 5 && mins >= 13 * 60 + 30 && mins < 21 * 60); })(), // FOOTPRINT-LEARN:
+      footprintWasDuringETH: !isRTHsec(s.timestamp), // FOOTPRINT-LEARN: ETH = anything outside RTH
       // VECTOR-LEARN: inferred from signal type and tier
       vectorTimeframesConfirmed: 0, // VECTOR-LEARN: not stored in DB row; would need a schema column to track
       vectorWasPrimary:    true, // VECTOR-LEARN: default — cannot derive from DB row without confirmations column
@@ -497,12 +512,8 @@ export async function backfillSignals(): Promise<{ inserted: number; skipped: nu
       if (!isLong && !isShort) continue;
       if (i - lastSignalBar < COOLDOWN) continue;
 
-      // RTH filter: Mon–Fri 13:30–21:00 UTC
-      const d = new Date(c.timestamp * 1000);
-      const dow = d.getUTCDay();
-      if (dow === 0 || dow === 6) continue;
-      const utcMin = d.getUTCHours() * 60 + d.getUTCMinutes();
-      if (utcMin < 13 * 60 + 30 || utcMin >= 21 * 60) continue;
+      // RTH filter: Mon–Fri 9:30 AM–4:00 PM ET (DST-safe)
+      if (!isRTHsec(c.timestamp)) continue;
 
       lastSignalBar = i;
 

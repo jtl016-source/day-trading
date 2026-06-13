@@ -1,506 +1,622 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
-  View, Text, Pressable, ScrollView, StyleSheet,
-  Alert, ActivityIndicator, Animated,
+  View, Text, Pressable, ScrollView, StyleSheet, Modal,
+  TextInput, Alert, ActivityIndicator, KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useApp, EXIT_PROFILES, type ExitStrategy } from '@/context/app-context';
+import Animated, { FadeInDown, FadeIn } from 'react-native-reanimated';
+import * as Haptics from 'expo-haptics';
+import { useApp } from '@/context/app-context';
 import { Trading, Fonts } from '@/constants/theme';
-import { SyncChip } from '@/components/sync-chip';
 
-const AT_KEY = 'autoTraderSettings_v1';
-const HOLD_MS = 2000; // ms to hold before arm/disarm confirms
-
-type ContractType = 'MES' | 'ES';
-type Direction    = 'both' | 'long' | 'short';
+type Outcome      = 'win_tp1' | 'win_tp2' | 'loss' | 'breakeven' | '';
 type RiskLevel    = 'safe' | 'risky' | 'riskiest';
-type Interval     = '1m' | '5m' | '15m' | '60m';
+type EmotionState = 'calm' | 'fomo' | 'fear' | 'revenge' | 'other';
+type SetupType    = 'side_entry' | 'tabletop' | 'confluence' | 'pattern' | 'other' | '';
 
-// ── Arm state: OFF | ARMED | LIVE ─────────────────────────────────────────────
-// OFF   = enabled=false (or disconnected)
-// ARMED = enabled=true + connected (ready but no active trade)
-// LIVE  = enabled=true + connected + active trade open
-type ArmState = 'OFF' | 'ARMED' | 'LIVE';
-
-function getArmState(enabled: boolean, connected: boolean, hasActiveTrade: boolean): ArmState {
-  if (!enabled) return 'OFF';
-  if (!connected) return 'OFF'; // treat disconnected+enabled as OFF visually
-  return hasActiveTrade ? 'LIVE' : 'ARMED';
+interface JournalEntry {
+  id: number;
+  timestamp: number;
+  symbol: string;
+  direction: string;
+  signal_id: number | null;
+  entry_price: number;
+  exit_price: number | null;
+  outcome: string | null;
+  pnl_pts: number | null;
+  pnl_dollars: number | null;
+  risk_level: string;
+  followed_plan: number;
+  emotion_state: string;
+  setup_type: string | null;
+  notes: string | null;
+  error_made: string | null;
 }
 
-export default function AutoTraderScreen() {
-  const { apiBaseUrl, exitStrategy, setExitStrategy } = useApp();
+interface JournalStats {
+  total: number;
+  closed: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  totalPnlDollars: number;
+  byEmotion: Record<string, { count: number; wins: number; losses: number }>;
+  byPlan: Record<string, { count: number; wins: number }>;
+}
 
-  // ── Connection + trade state ────────────────────────────────────────────────
-  const [connected,      setConnected]      = useState(false);
-  const [hasActiveTrade, setHasActiveTrade] = useState(false);
+const OUTCOME_LABEL: Record<string, string> = {
+  win_tp1: 'TP1 Win', win_tp2: 'TP2 Win', loss: 'Loss', breakeven: 'Breakeven',
+};
+const OUTCOME_COLOR: Record<string, string> = {
+  win_tp1: '#22c55e', win_tp2: '#16a34a', loss: '#ef4444', breakeven: '#94a3b8',
+};
+const EMOTION_LABEL: Record<string, string> = {
+  calm: 'Calm', fomo: 'FOMO', fear: 'Fear', revenge: 'Revenge', other: 'Other',
+};
 
-  // ── Auto-trader settings ────────────────────────────────────────────────────
-  const [enabled,       setEnabled]       = useState(false);
-  const [contractType,  setContractType]  = useState<ContractType>('MES');
-  const [contracts,     setContracts]     = useState(1);
-  const [tp1Only,       setTp1Only]       = useState(false);
-  const [direction,     setDirection]     = useState<Direction>('both');
-  const [riskLevels,    setRiskLevels]    = useState<Set<RiskLevel>>(new Set(['safe']));
-  const [intervals,     setIntervals]     = useState<Set<Interval>>(new Set(['5m']));
-  const [resetLoading,  setResetLoading]  = useState(false);
+function pnlColor(v: number | null): string {
+  if (v == null || v === 0) return Trading.muted;
+  return v > 0 ? Trading.long : Trading.short;
+}
+function fmtPnl(v: number | null): string {
+  if (v == null) return '—';
+  return `${v > 0 ? '+' : ''}${v.toFixed(2)}`;
+}
+function calcPnl(entry: number, exit: number | null, dir: string) {
+  if (exit == null) return { pts: null, dollars: null };
+  const pts = dir === 'Long' ? exit - entry : entry - exit;
+  return { pts, dollars: pts * 5 };
+}
+function riskColor(rl: string): string {
+  const map: Record<string, string> = { safe: Trading.safe, risky: Trading.risky, riskiest: Trading.riskiest };
+  return map[rl] ?? Trading.muted;
+}
+function fmtDate(ts: number): string {
+  return new Date(ts * 1000).toLocaleDateString('en-US', {
+    month: 'short', day: 'numeric', timeZone: 'America/New_York',
+  });
+}
+function fmtTime(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString('en-US', {
+    hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York',
+  });
+}
 
-  // ── Hold-to-arm state ───────────────────────────────────────────────────────
-  const [isSyncing, setIsSyncing] = useState(false);   // waiting for server confirmation
-  const holdProgress = useRef(new Animated.Value(0)).current;
-  const holdAnimRef  = useRef<Animated.CompositeAnimation | null>(null);
+const EMPTY_FORM = {
+  symbol: 'MES', direction: 'Long' as 'Long' | 'Short',
+  entryPrice: '', exitPrice: '', outcome: '' as Outcome,
+  riskLevel: 'safe' as RiskLevel, followedPlan: true,
+  emotionState: 'calm' as EmotionState, setupType: '' as SetupType,
+  notes: '', errorMade: '',
+};
 
-  const pollRef       = useRef<ReturnType<typeof setInterval> | null>(null);
-  const settingsLoaded = useRef(false);
+export default function JournalScreen() {
+  const { apiBaseUrl } = useApp();
+  const [entries, setEntries] = useState<JournalEntry[]>([]);
+  const [stats,   setStats]   = useState<JournalStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(false);
 
-  const armState = getArmState(enabled, connected, hasActiveTrade);
+  // Form
+  const [showForm, setShowForm] = useState(false);
+  const [editId,   setEditId]   = useState<number | null>(null);
+  const [form,     setForm]     = useState({ ...EMPTY_FORM });
 
-  // ── Persist + sync to server on settings change ─────────────────────────────
-  useEffect(() => {
-    if (!settingsLoaded.current) return;
-    const payload = {
-      enabled, contractType, contracts, tp1Only, direction,
-      riskLevels: [...riskLevels], intervals: [...intervals], exitStrategy,
-    };
-    AsyncStorage.setItem(AT_KEY, JSON.stringify(payload)).catch(() => {});
-    fetch(`${apiBaseUrl}/api/trade/settings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
-  }, [enabled, contractType, contracts, tp1Only, direction, riskLevels, intervals, exitStrategy, apiBaseUrl]);
+  // Detail modal
+  const [selected, setSelected] = useState<JournalEntry | null>(null);
 
-  // ── Load persisted settings on mount ────────────────────────────────────────
-  useEffect(() => {
-    AsyncStorage.getItem(AT_KEY).then(raw => {
-      if (raw) {
-        try {
-          const s = JSON.parse(raw);
-          if (typeof s.enabled === 'boolean') setEnabled(s.enabled);
-          if (s.contractType === 'MES' || s.contractType === 'ES') setContractType(s.contractType);
-          if (typeof s.contracts === 'number') setContracts(s.contracts);
-          if (typeof s.tp1Only === 'boolean') setTp1Only(s.tp1Only);
-          if (s.direction === 'both' || s.direction === 'long' || s.direction === 'short') setDirection(s.direction);
-          if (Array.isArray(s.riskLevels)) setRiskLevels(new Set(s.riskLevels as RiskLevel[]));
-          if (Array.isArray(s.intervals)) setIntervals(new Set(s.intervals as Interval[]));
-        } catch {}
-      }
-    }).finally(() => { settingsLoaded.current = true; });
-  }, []);
-
-  // ── Poll connection + trade status every 5 s ─────────────────────────────
-  const pollStatus = useCallback(async () => {
+  const load = useCallback(async () => {
     try {
-      const r = await fetch(`${apiBaseUrl}/api/trade/status`);
-      if (!r.ok) throw new Error('');
-      const d = await r.json();
-      setConnected(!!d.connected);
-    } catch { setConnected(false); }
-
-    try {
-      const r2 = await fetch(`${apiBaseUrl}/api/trade/current`);
-      if (r2.ok) {
-        const d2 = await r2.json();
-        setHasActiveTrade(!!(d2.trade && d2.trade.status === 'open'));
-      }
+      const [eRes, sRes] = await Promise.all([
+        fetch(`${apiBaseUrl}/api/journal`),
+        fetch(`${apiBaseUrl}/api/journal/stats`),
+      ]);
+      if (eRes.ok) setEntries(await eRes.json());
+      if (sRes.ok) setStats(await sRes.json());
     } catch {}
+    setLoading(false);
   }, [apiBaseUrl]);
 
-  useEffect(() => {
-    pollStatus();
-    pollRef.current = setInterval(pollStatus, 5000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [pollStatus]);
+  useEffect(() => { load(); }, [load]);
 
-  // ── Hold-to-arm / disarm ────────────────────────────────────────────────────
-  function startHold() {
-    if (isSyncing || !connected) return;
-    holdAnimRef.current = Animated.timing(holdProgress, {
-      toValue: 1, duration: HOLD_MS, useNativeDriver: false,
+  const resetForm = () => { setForm({ ...EMPTY_FORM }); setEditId(null); };
+
+  const openAdd = () => { resetForm(); setShowForm(true); };
+  const openEdit = (e: JournalEntry) => {
+    setForm({
+      symbol: e.symbol, direction: e.direction as 'Long' | 'Short',
+      entryPrice: String(e.entry_price),
+      exitPrice: e.exit_price != null ? String(e.exit_price) : '',
+      outcome: (e.outcome ?? '') as Outcome,
+      riskLevel: (e.risk_level ?? 'safe') as RiskLevel,
+      followedPlan: !!e.followed_plan,
+      emotionState: (e.emotion_state ?? 'calm') as EmotionState,
+      setupType: (e.setup_type ?? '') as SetupType,
+      notes: e.notes ?? '', errorMade: e.error_made ?? '',
     });
-    holdAnimRef.current.start(({ finished }) => {
-      holdProgress.setValue(0);
-      if (finished) {
-        // Toggle confirmed — sync to server
-        setIsSyncing(true);
-        const next = !enabled;
-        fetch(`${apiBaseUrl}/api/trade/settings`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled: next }),
-        })
-          .then(() => setEnabled(next))
-          .catch(() => {})
-          .finally(() => setIsSyncing(false));
-      }
-    });
-  }
+    setEditId(e.id);
+    setShowForm(true);
+  };
 
-  function cancelHold() {
-    holdAnimRef.current?.stop();
-    Animated.timing(holdProgress, {
-      toValue: 0, duration: 150, useNativeDriver: false,
-    }).start();
-  }
-
-  // ── Helpers ─────────────────────────────────────────────────────────────────
-  const resetLock = useCallback(async () => {
-    setResetLoading(true);
+  const save = async () => {
+    if (!form.entryPrice) { Alert.alert('Entry price required'); return; }
+    setSaving(true);
+    const ep = parseFloat(form.entryPrice);
+    const xp = form.exitPrice ? parseFloat(form.exitPrice) : null;
+    const { pts, dollars } = calcPnl(ep, xp, form.direction);
+    const body = {
+      timestamp: Math.floor(Date.now() / 1000),
+      symbol: form.symbol, direction: form.direction,
+      entryPrice: ep, exitPrice: xp,
+      outcome: form.outcome || null,
+      pnlPts: pts, pnlDollars: dollars,
+      riskLevel: form.riskLevel, followedPlan: form.followedPlan,
+      emotionState: form.emotionState, setupType: form.setupType || null,
+      notes: form.notes || null, errorMade: form.errorMade || null,
+    };
     try {
-      const r = await fetch(`${apiBaseUrl}/api/trade/reset-flag`, { method: 'POST' });
-      const d = await r.json();
-      Alert.alert(
-        d.ok ? 'Lock Reset' : 'Not Connected',
-        d.ok ? 'Trade lock cleared — ready for new orders.'
-             : 'AutoTrader not connected. Lock will clear on next connect.',
-      );
-    } catch (e) {
-      Alert.alert('Error', String(e));
-    } finally { setResetLoading(false); }
-  }, [apiBaseUrl]);
+      if (editId != null) {
+        await fetch(`${apiBaseUrl}/api/journal/${editId}`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      } else {
+        await fetch(`${apiBaseUrl}/api/journal`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      }
+      resetForm();
+      setShowForm(false);
+      load();
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    } catch (e) { Alert.alert('Error saving', String(e)); }
+    setSaving(false);
+  };
 
-  const toggleRiskLevel = (level: RiskLevel) => setRiskLevels(prev => {
-    const n = new Set(prev); n.has(level) ? n.delete(level) : n.add(level); return n;
-  });
-  const toggleInterval = (iv: Interval) => setIntervals(prev => {
-    const n = new Set(prev); n.has(iv) ? n.delete(iv) : n.add(iv); return n;
-  });
+  const deleteEntry = (id: number) => {
+    Alert.alert('Delete entry?', 'This cannot be undone.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        await fetch(`${apiBaseUrl}/api/journal/${id}`, { method: 'DELETE' }).catch(() => {});
+        setSelected(null);
+        load();
+      }},
+    ]);
+  };
 
-  // ── Arm state display ────────────────────────────────────────────────────────
-  const armColor  = armState === 'LIVE' ? Trading.armLive : armState === 'ARMED' ? Trading.armArmed : Trading.armOff;
-  const holdLabel = enabled ? 'HOLD TO DISARM' : 'HOLD TO ARM';
-  const holdBg    = holdProgress.interpolate({ inputRange: [0, 1], outputRange: ['#00000000', armColor + 'cc'] });
+  const autoPnl = (() => {
+    if (!form.entryPrice || !form.exitPrice) return null;
+    const { pts } = calcPnl(parseFloat(form.entryPrice), parseFloat(form.exitPrice), form.direction);
+    return pts;
+  })();
 
   return (
     <SafeAreaView style={s.safe} edges={['top']}>
+      {/* ── App bar ──────────────────────────────────────────────────────────── */}
+      <View style={s.appBar}>
+        <Text style={s.appBarTitle}>TRADE JOURNAL</Text>
+        <Pressable style={s.addBtn} onPress={openAdd}>
+          <Text style={s.addBtnTxt}>+ Log Trade</Text>
+        </Pressable>
+      </View>
+
       <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
+        {/* ── Stats ──────────────────────────────────────────────────────────── */}
+        {stats && (
+          <Animated.View entering={FadeIn.duration(300)} style={s.statGrid}>
+            <StatCell label="TOTAL"    value={String(stats.total)} />
+            <StatCell label="WIN RATE" value={stats.closed ? `${Math.round(stats.winRate)}%` : '—'}
+              color={stats.winRate >= 50 ? Trading.long : Trading.short} />
+            <StatCell label="NET $"    value={`${stats.totalPnlDollars >= 0 ? '+' : ''}$${Math.abs(stats.totalPnlDollars).toFixed(0)}`}
+              color={pnlColor(stats.totalPnlDollars)} />
+            <StatCell label="CLOSED"  value={String(stats.closed)} />
+          </Animated.View>
+        )}
 
-        {/* ── App bar ─────────────────────────────────────────────────────── */}
-        <View style={s.appBar}>
-          <Text style={s.appBarTitle}>AUTO TRADER</Text>
-          <SyncChip connected={connected} feedName="MW" />
-        </View>
-
-        {/* ── Master arm banner ───────────────────────────────────────────── */}
-        <View style={[s.armBanner, { borderColor: armColor + '60', backgroundColor: armColor + '12' }]}>
-          {/* State row */}
-          <View style={s.armStateRow}>
-            {armState === 'LIVE' && <ArmPulse color={armColor} />}
-            <Text style={[s.armStateLabel, { color: armColor }]}>
-              {armState === 'LIVE'  ? 'LIVE'  :
-               armState === 'ARMED' ? 'ARMED' : 'DISARMED'}
-            </Text>
-            {armState !== 'OFF' && (
-              <Text style={s.armSubLabel}>
-                {armState === 'LIVE'  ? 'Trade open · monitoring' :
-                 armState === 'ARMED' ? `${contractType} · ${contracts} contract${contracts > 1 ? 's' : ''}` : ''}
-              </Text>
-            )}
+        {/* ── Entry list ─────────────────────────────────────────────────────── */}
+        {loading ? (
+          <View style={s.empty}><ActivityIndicator color={Trading.accent} /></View>
+        ) : entries.length === 0 ? (
+          <View style={s.empty}>
+            <Text style={s.emptyTxt}>No journal entries yet</Text>
+            <Text style={s.emptySub}>Tap "+ Log Trade" to record your first trade</Text>
           </View>
-
-          {/* Sync line */}
-          {armState !== 'OFF' && (
-            <Text style={[s.armSyncLine, { color: armColor + 'cc' }]}>
-              ⇄ Mirrored with PC Engine · {connected ? 'in sync' : 'reconnecting…'}
-            </Text>
-          )}
-
-          {!connected && enabled && (
-            <View style={s.staleBanner}>
-              <Text style={s.staleText}>NOT SYNCED — DISPLAYED STATE MAY BE STALE</Text>
-            </View>
-          )}
-
-          {/* Hold-to-arm button */}
-          <View style={s.holdOuter}>
-            <Animated.View style={[StyleSheet.absoluteFillObject, { backgroundColor: holdBg, borderRadius: 10 }]} />
-            <Pressable
-              style={s.holdBtn}
-              onPressIn={startHold}
-              onPressOut={cancelHold}
-              disabled={isSyncing || !connected}
-            >
-              {isSyncing ? (
-                <ActivityIndicator color={armColor} size="small" />
-              ) : (
-                <Text style={[s.holdBtnText, { color: connected ? armColor : Trading.muted }]}>
-                  {!connected ? 'CONNECT MW TO ARM' : holdLabel}
-                </Text>
-              )}
-            </Pressable>
-          </View>
-
-          <Text style={s.holdHint}>Hold 2 seconds to confirm — prevents accidental triggers</Text>
-        </View>
-
-        {/* ── Settings sections ────────────────────────────────────────────── */}
-        <Section label="CONTRACT">
-          <View style={s.chipRow}>
-            {(['MES', 'ES'] as ContractType[]).map(t => (
-              <Pressable key={t} onPress={() => setContractType(t)} style={[s.chip, contractType === t && { borderColor: Trading.accent, backgroundColor: Trading.accent + '18' }]}>
-                <Text style={[s.chipText, contractType === t && { color: Trading.accent }]}>
-                  {t === 'MES' ? 'MES  Micro · $5/pt' : 'ES  Full · $50/pt'}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-        </Section>
-
-        <Section label="CONTRACTS PER TRADE">
-          <View style={s.stepperRow}>
-            <Pressable onPress={() => setContracts(c => Math.max(1, c - 1))} style={s.stepBtn} hitSlop={8}>
-              <Text style={s.stepBtnText}>−</Text>
-            </Pressable>
-            <Text style={[s.stepValue, { fontFamily: Fonts?.mono }]}>{contracts}</Text>
-            <Pressable onPress={() => setContracts(c => Math.min(10, c + 1))} style={s.stepBtn} hitSlop={8}>
-              <Text style={s.stepBtnText}>+</Text>
-            </Pressable>
-          </View>
-        </Section>
-
-        <Section label="EXIT MODE">
-          <View style={s.chipRow}>
-            {([false, true] as const).map(tp1 => (
-              <Pressable key={String(tp1)} onPress={() => setTp1Only(tp1)} style={[s.chip, tp1Only === tp1 && { borderColor: Trading.accent, backgroundColor: Trading.accent + '18' }]}>
-                <Text style={[s.chipText, tp1Only === tp1 && { color: Trading.accent }]}>
-                  {tp1 ? 'TP1 Only' : 'TP1 + TP2'}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-          <Text style={s.hint}>{tp1Only ? 'All contracts exit at TP1' : 'Half at TP1 · runners trail to TP2'}</Text>
-        </Section>
-
-        <Section label="EXIT STRATEGY">
-          {(Object.entries(EXIT_PROFILES) as [Exclude<ExitStrategy,'current'>, typeof EXIT_PROFILES[keyof typeof EXIT_PROFILES]][]).map(([key, prof]) => {
-            const active = exitStrategy === key;
-            const tiers = prof.rth;
-            return (
-              <Pressable key={key} onPress={() => setExitStrategy(key)}
-                style={[s.stratRow, active && { borderColor: prof.color + '80', backgroundColor: prof.color + '0e' }]}>
-                <View style={s.stratLeft}>
-                  <View style={[s.stratDot, { backgroundColor: active ? prof.color : Trading.border }]} />
-                  <View>
-                    <Text style={[s.stratLabel, active && { color: prof.color }]}>{prof.label}</Text>
-                    <Text style={s.stratDesc}>{prof.desc}</Text>
-                  </View>
-                </View>
-                <View style={s.stratLevels}>
-                  <Text style={[s.stratNum, { fontFamily: Fonts?.mono, color: active ? Trading.safeplus : Trading.muted }]}>
-                    TP {tiers.safe.tp1} / {tiers.safe.tp2}
-                  </Text>
-                  <Text style={[s.stratNum, { fontFamily: Fonts?.mono, color: active ? Trading.riskiest : Trading.dim }]}>
-                    SL {tiers.safe.sl}
-                  </Text>
-                </View>
-              </Pressable>
-            );
-          })}
-        </Section>
-
-        <Section label="DIRECTION">
-          <View style={s.chipRow}>
-            {(['both', 'long', 'short'] as Direction[]).map(d => (
-              <Pressable key={d} onPress={() => setDirection(d)}
-                style={[s.chip, direction === d && { borderColor: d === 'long' ? Trading.long : d === 'short' ? Trading.short : Trading.accent, backgroundColor: (d === 'long' ? Trading.long : d === 'short' ? Trading.short : Trading.accent) + '18' }]}>
-                <Text style={[s.chipText, direction === d && { color: d === 'long' ? Trading.long : d === 'short' ? Trading.short : Trading.accent }]}>
-                  {d === 'both' ? 'Both' : d === 'long' ? '▲ Long' : '▼ Short'}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-        </Section>
-
-        <Section label="RISK TIERS">
-          {([['safe', Trading.safe], ['risky', Trading.risky], ['riskiest', Trading.riskiest]] as [RiskLevel, string][]).map(([level, color]) => {
-            const active = riskLevels.has(level);
-            return (
-              <Pressable key={level} onPress={() => toggleRiskLevel(level)}
-                style={[s.checkRow, active && { backgroundColor: color + '12' }]}>
-                <View style={[s.checkBox, { borderColor: active ? color : Trading.border }, active && { backgroundColor: color }]}>
-                  {active && <Text style={s.checkMark}>✓</Text>}
-                </View>
-                <Text style={[s.checkLabel, { color: active ? color : Trading.textSecondary }]}>
-                  {level.toUpperCase()}
-                </Text>
-              </Pressable>
-            );
-          })}
-          <Text style={s.hint}>SAFE+ always trades when enabled</Text>
-        </Section>
-
-        <Section label="INTERVALS">
-          <View style={s.chipRow}>
-            {(['1m', '5m', '15m', '60m'] as Interval[]).map(iv => {
-              const active = intervals.has(iv);
+        ) : (
+          <View style={{ gap: 8 }}>
+            {entries.map((e, i) => {
+              const long = e.direction === 'Long';
+              const oc   = e.outcome ? OUTCOME_COLOR[e.outcome] : Trading.amber;
+              const ocLabel = e.outcome ? OUTCOME_LABEL[e.outcome] : 'Open';
               return (
-                <Pressable key={iv} onPress={() => toggleInterval(iv)}
-                  style={[s.chip, active && { borderColor: Trading.accent, backgroundColor: Trading.accent + '18' }]}>
-                  <Text style={[s.chipText, active && { color: Trading.accent }]}>{iv}</Text>
-                </Pressable>
+                <Animated.View key={e.id} entering={FadeInDown.duration(360).delay(Math.min(i, 15) * 35)}>
+                  <Pressable style={s.card} onPress={() => { Haptics.selectionAsync().catch(() => {}); setSelected(e); }}>
+                    <View style={s.cardTop}>
+                      <View style={s.cardId}>
+                        <Text style={[s.dir, { color: long ? Trading.long : Trading.short, backgroundColor: (long ? Trading.long : Trading.short) + '1a' }]}>
+                          {e.direction.toUpperCase()}
+                        </Text>
+                        <Text style={s.sym}>{e.symbol}</Text>
+                        <View style={[s.tier, { borderColor: riskColor(e.risk_level) + '80' }]}>
+                          <Text style={[s.tierTxt, { color: riskColor(e.risk_level) }]}>
+                            {e.risk_level.toUpperCase()}
+                          </Text>
+                        </View>
+                      </View>
+                      <Text style={s.dateTime}>{fmtDate(e.timestamp)} · {fmtTime(e.timestamp)}</Text>
+                    </View>
+
+                    <View style={s.priceRow}>
+                      <PriceCell label="ENTRY" value={e.entry_price.toFixed(2)} />
+                      <PriceCell label="EXIT"  value={e.exit_price != null ? e.exit_price.toFixed(2) : '—'} />
+                      <PriceCell label="PNL PTS" value={fmtPnl(e.pnl_pts)} color={pnlColor(e.pnl_pts)} />
+                      <PriceCell label="PNL $"   value={e.pnl_dollars != null ? `$${e.pnl_dollars.toFixed(0)}` : '—'} color={pnlColor(e.pnl_dollars)} />
+                    </View>
+
+                    <View style={s.foot}>
+                      <View style={[s.outcomeChip, { backgroundColor: oc + '1a', borderColor: oc + '50' }]}>
+                        {!e.outcome && <View style={[s.dot, { backgroundColor: Trading.amber }]} />}
+                        <Text style={[s.outcomeTxt, { color: oc }]}>{ocLabel}</Text>
+                      </View>
+                      <Text style={s.emo}>{EMOTION_LABEL[e.emotion_state] ?? e.emotion_state}</Text>
+                    </View>
+                  </Pressable>
+                </Animated.View>
               );
             })}
           </View>
-        </Section>
-
-        {/* Reset lock */}
-        <View style={s.resetSection}>
-          <Text style={s.resetTitle}>STUCK ORDERS</Text>
-          <Text style={s.resetDesc}>If MotiveWave shows an open position but no order exists, tap to unstick the lock.</Text>
-          <Pressable onPress={resetLock} disabled={resetLoading} style={s.resetBtn}>
-            {resetLoading
-              ? <ActivityIndicator color={Trading.risky} size="small" />
-              : <Text style={s.resetBtnText}>Reset Trade Lock</Text>}
-          </Pressable>
-        </View>
-
+        )}
+        <View style={{ height: 24 }} />
       </ScrollView>
+
+      {/* ── Add / Edit form modal ─────────────────────────────────────────────── */}
+      <Modal visible={showForm} animationType="slide" onRequestClose={() => { setShowForm(false); resetForm(); }}>
+        <SafeAreaView style={s.formSafe} edges={['top', 'bottom']}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={s.formBar}>
+              <Text style={s.formTitle}>{editId != null ? 'Edit Entry' : 'Log a Trade'}</Text>
+              <Pressable onPress={() => { setShowForm(false); resetForm(); }} hitSlop={12}>
+                <Text style={s.formClose}>✕</Text>
+              </Pressable>
+            </View>
+            <ScrollView contentContainerStyle={s.formScroll} keyboardShouldPersistTaps="handled">
+
+              {/* Symbol + Direction */}
+              <FormSection label="SYMBOL">
+                <TextInput style={s.input} value={form.symbol}
+                  onChangeText={v => setForm(f => ({ ...f, symbol: v.toUpperCase() }))}
+                  placeholder="MES" placeholderTextColor={Trading.dim}
+                  autoCapitalize="characters" returnKeyType="done" />
+              </FormSection>
+
+              <FormSection label="DIRECTION">
+                <View style={s.toggleRow}>
+                  {(['Long', 'Short'] as const).map(d => (
+                    <Pressable key={d} onPress={() => setForm(f => ({ ...f, direction: d }))}
+                      style={[s.toggleBtn, form.direction === d && { borderColor: d === 'Long' ? Trading.long : Trading.short, backgroundColor: (d === 'Long' ? Trading.long : Trading.short) + '20' }]}>
+                      <Text style={[s.toggleTxt, form.direction === d && { color: d === 'Long' ? Trading.long : Trading.short }]}>
+                        {d === 'Long' ? '▲ Long' : '▼ Short'}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </FormSection>
+
+              {/* Prices */}
+              <View style={s.priceInputRow}>
+                <View style={{ flex: 1 }}>
+                  <FormSection label="ENTRY PRICE">
+                    <TextInput style={s.input} value={form.entryPrice}
+                      onChangeText={v => setForm(f => ({ ...f, entryPrice: v }))}
+                      placeholder="5842.25" placeholderTextColor={Trading.dim}
+                      keyboardType="decimal-pad" returnKeyType="done" />
+                  </FormSection>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <FormSection label="EXIT PRICE">
+                    <TextInput style={s.input} value={form.exitPrice}
+                      onChangeText={v => setForm(f => ({ ...f, exitPrice: v }))}
+                      placeholder="open" placeholderTextColor={Trading.dim}
+                      keyboardType="decimal-pad" returnKeyType="done" />
+                  </FormSection>
+                </View>
+              </View>
+
+              {autoPnl != null && (
+                <Text style={[s.autoPnl, { color: pnlColor(autoPnl) }]}>
+                  Auto P&L: {fmtPnl(autoPnl)} pts / ${Math.abs(autoPnl * 5).toFixed(0)} USD
+                </Text>
+              )}
+
+              {/* Outcome */}
+              <FormSection label="OUTCOME">
+                <View style={s.toggleRow}>
+                  {[['', 'Open'], ['win_tp1', 'TP1 Win'], ['win_tp2', 'TP2 Win'], ['loss', 'Loss'], ['breakeven', 'BE']]
+                    .map(([v, label]) => {
+                      const on = form.outcome === v;
+                      const col = v ? (OUTCOME_COLOR[v] ?? Trading.accent) : Trading.amber;
+                      return (
+                        <Pressable key={v} onPress={() => setForm(f => ({ ...f, outcome: v as Outcome }))}
+                          style={[s.toggleBtnSm, on && { borderColor: col, backgroundColor: col + '20' }]}>
+                          <Text style={[s.toggleTxtSm, on && { color: col }]}>{label}</Text>
+                        </Pressable>
+                      );
+                    })}
+                </View>
+              </FormSection>
+
+              {/* Risk level */}
+              <FormSection label="RISK LEVEL">
+                <View style={s.toggleRow}>
+                  {(['safe', 'risky', 'riskiest'] as RiskLevel[]).map(r => {
+                    const on = form.riskLevel === r;
+                    const col = riskColor(r);
+                    return (
+                      <Pressable key={r} onPress={() => setForm(f => ({ ...f, riskLevel: r }))}
+                        style={[s.toggleBtn, on && { borderColor: col, backgroundColor: col + '20' }]}>
+                        <Text style={[s.toggleTxt, on && { color: col }]}>{r.toUpperCase()}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </FormSection>
+
+              {/* Followed plan */}
+              <FormSection label="FOLLOWED PLAN?">
+                <View style={s.toggleRow}>
+                  {([true, false] as const).map(v => {
+                    const on = form.followedPlan === v;
+                    const col = v ? Trading.long : Trading.short;
+                    return (
+                      <Pressable key={String(v)} onPress={() => setForm(f => ({ ...f, followedPlan: v }))}
+                        style={[s.toggleBtn, on && { borderColor: col, backgroundColor: col + '20' }]}>
+                        <Text style={[s.toggleTxt, on && { color: col }]}>{v ? 'Yes' : 'No'}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </FormSection>
+
+              {/* Emotion */}
+              <FormSection label="EMOTION STATE">
+                <View style={s.toggleRow}>
+                  {(['calm', 'fomo', 'fear', 'revenge', 'other'] as EmotionState[]).map(e => {
+                    const on = form.emotionState === e;
+                    return (
+                      <Pressable key={e} onPress={() => setForm(f => ({ ...f, emotionState: e }))}
+                        style={[s.toggleBtnSm, on && { borderColor: Trading.accent, backgroundColor: Trading.accent + '20' }]}>
+                        <Text style={[s.toggleTxtSm, on && { color: Trading.accent }]}>{EMOTION_LABEL[e]}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </FormSection>
+
+              {/* Setup type */}
+              <FormSection label="SETUP TYPE">
+                <View style={s.toggleRow}>
+                  {([['', 'None'], ['side_entry', 'Side Entry'], ['tabletop', 'Tabletop'],
+                     ['confluence', 'Confluence'], ['pattern', 'Pattern'], ['other', 'Other']]
+                    .map(([v, label]) => {
+                      const on = form.setupType === v;
+                      return (
+                        <Pressable key={v} onPress={() => setForm(f => ({ ...f, setupType: v as SetupType }))}
+                          style={[s.toggleBtnSm, on && { borderColor: Trading.accent, backgroundColor: Trading.accent + '20' }]}>
+                          <Text style={[s.toggleTxtSm, on && { color: Trading.accent }]}>{label}</Text>
+                        </Pressable>
+                      );
+                    }))}
+                </View>
+              </FormSection>
+
+              {/* Notes */}
+              <FormSection label="NOTES">
+                <TextInput style={[s.input, s.textArea]} value={form.notes}
+                  onChangeText={v => setForm(f => ({ ...f, notes: v }))}
+                  placeholder="What happened, key observations…" placeholderTextColor={Trading.dim}
+                  multiline numberOfLines={3} returnKeyType="default" />
+              </FormSection>
+
+              {/* Error */}
+              <FormSection label="ERROR / WHAT TO IMPROVE">
+                <TextInput style={[s.input, s.textArea]} value={form.errorMade}
+                  onChangeText={v => setForm(f => ({ ...f, errorMade: v }))}
+                  placeholder="Entered too early, chased price, ignored 60m veto…" placeholderTextColor={Trading.dim}
+                  multiline numberOfLines={3} returnKeyType="default" />
+              </FormSection>
+
+              <Pressable style={[s.saveBtn, saving && { opacity: 0.6 }]} onPress={save} disabled={saving}>
+                {saving ? <ActivityIndicator color={Trading.bg} /> : <Text style={s.saveBtnTxt}>{editId != null ? 'Update Entry' : 'Save Trade'}</Text>}
+              </Pressable>
+              <View style={{ height: 32 }} />
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+
+      {/* ── Detail modal ─────────────────────────────────────────────────────── */}
+      {selected && <DetailModal entry={selected} onClose={() => setSelected(null)} onEdit={() => { openEdit(selected); setSelected(null); }} onDelete={() => deleteEntry(selected.id)} />}
     </SafeAreaView>
   );
 }
 
-// ── Sub-components ─────────────────────────────────────────────────────────────
-
-function Section({ label, children }: { label: string; children: React.ReactNode }) {
+function StatCell({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
-    <View style={s.section}>
-      <Text style={s.sectionLabel}>{label}</Text>
-      <View style={s.sectionBody}>{children}</View>
+    <View style={s.stat}>
+      <Text style={s.statLabel}>{label}</Text>
+      <Text style={[s.statValue, color ? { color } : null]}>{value}</Text>
     </View>
   );
 }
 
-function ArmPulse({ color }: { color: string }) {
-  const scale = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    const anim = Animated.loop(Animated.sequence([
-      Animated.timing(scale, { toValue: 1.4, duration: 700, useNativeDriver: true }),
-      Animated.timing(scale, { toValue: 1,   duration: 700, useNativeDriver: true }),
-    ]));
-    anim.start();
-    return () => anim.stop();
-  }, [scale]);
+function PriceCell({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
-    <Animated.View style={[s.armPulse, { backgroundColor: color, shadowColor: color, transform: [{ scale }] }]} />
+    <View style={{ flex: 1 }}>
+      <Text style={s.pcLabel}>{label}</Text>
+      <Text style={[s.pcValue, color ? { color } : null]}>{value}</Text>
+    </View>
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────────
+function FormSection({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <View style={s.fSection}>
+      <Text style={s.fLabel}>{label}</Text>
+      {children}
+    </View>
+  );
+}
+
+function DetailModal({ entry, onClose, onEdit, onDelete }: {
+  entry: JournalEntry; onClose: () => void; onEdit: () => void; onDelete: () => void;
+}) {
+  const long = entry.direction === 'Long';
+  const oc   = entry.outcome ? OUTCOME_COLOR[entry.outcome] : Trading.amber;
+  return (
+    <Modal visible transparent animationType="slide" onRequestClose={onClose}>
+      <Pressable style={dm.backdrop} onPress={onClose}>
+        <Animated.View entering={FadeIn.duration(200)} style={dm.sheet} onStartShouldSetResponder={() => true}>
+          <View style={dm.header}>
+            <Text style={[dm.dir, { color: long ? Trading.long : Trading.short }]}>
+              {long ? '▲ LONG' : '▼ SHORT'}
+            </Text>
+            <Text style={dm.sym}>{entry.symbol}</Text>
+            <View style={{ flex: 1 }} />
+            <Pressable style={dm.editBtn} onPress={onEdit}><Text style={dm.editTxt}>Edit</Text></Pressable>
+            <Pressable style={dm.delBtn} onPress={onDelete}><Text style={dm.delTxt}>Delete</Text></Pressable>
+            <Pressable onPress={onClose} hitSlop={12}><Text style={dm.close}>✕</Text></Pressable>
+          </View>
+
+          <Text style={dm.sub}>{fmtDate(entry.timestamp)} · {fmtTime(entry.timestamp)} ET · {(entry.risk_level ?? '').toUpperCase()}</Text>
+
+          <View style={dm.table}>
+            {[
+              { label: 'Entry',  value: entry.entry_price.toFixed(2),               color: Trading.text },
+              { label: 'Exit',   value: entry.exit_price?.toFixed(2) ?? 'Open',     color: Trading.text },
+              { label: 'PnL pts',value: fmtPnl(entry.pnl_pts),                     color: pnlColor(entry.pnl_pts) },
+              { label: 'PnL $',  value: entry.pnl_dollars != null ? `$${entry.pnl_dollars.toFixed(0)}` : '—', color: pnlColor(entry.pnl_dollars) },
+            ].map((row, i, arr) => (
+              <View key={row.label} style={[dm.row, i === arr.length - 1 && { borderBottomWidth: 0 }]}>
+                <Text style={dm.rowLabel}>{row.label}</Text>
+                <Text style={[dm.rowValue, { color: row.color }]}>{row.value}</Text>
+              </View>
+            ))}
+          </View>
+
+          <View style={dm.metaRow}>
+            <MetaBadge label={entry.outcome ? OUTCOME_LABEL[entry.outcome] : 'Open'} color={oc} />
+            <MetaBadge label={EMOTION_LABEL[entry.emotion_state] ?? entry.emotion_state} color={Trading.muted} />
+            <MetaBadge label={entry.followed_plan ? '✓ Plan' : '✗ Plan'} color={entry.followed_plan ? Trading.long : Trading.short} />
+          </View>
+
+          {entry.setup_type && <Text style={dm.setup}>Setup: {entry.setup_type.replace('_', ' ')}</Text>}
+          {entry.notes && <Text style={dm.notesTxt}>{entry.notes}</Text>}
+          {entry.error_made && (
+            <View style={dm.errorBox}>
+              <Text style={dm.errorLabel}>ERROR / IMPROVE</Text>
+              <Text style={dm.errorTxt}>{entry.error_made}</Text>
+            </View>
+          )}
+        </Animated.View>
+      </Pressable>
+    </Modal>
+  );
+}
+
+function MetaBadge({ label, color }: { label: string; color: string }) {
+  return (
+    <View style={[dm.badge, { borderColor: color + '60', backgroundColor: color + '18' }]}>
+      <Text style={[dm.badgeTxt, { color }]}>{label}</Text>
+    </View>
+  );
+}
+
 const s = StyleSheet.create({
-  safe:   { flex: 1, backgroundColor: Trading.bg },
-  scroll: { paddingBottom: 48 },
+  safe:    { flex: 1, backgroundColor: 'transparent' },
+  appBar:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Trading.line },
+  appBarTitle: { fontFamily: Fonts.display, fontSize: 13, fontWeight: '800', letterSpacing: 2, color: Trading.text },
+  addBtn:  { backgroundColor: 'rgba(45,212,191,0.12)', borderWidth: 1, borderColor: 'rgba(45,212,191,0.35)', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 7 },
+  addBtnTxt: { color: Trading.accent, fontSize: 12, fontWeight: '700', fontFamily: Fonts.display },
 
-  appBar: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 18, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Trading.border,
-  },
-  appBarTitle: { color: Trading.text, fontSize: 13, fontWeight: '800', letterSpacing: 2 },
+  scroll: { paddingHorizontal: 14, paddingTop: 10, paddingBottom: 16, gap: 10 },
 
-  // ── Master arm banner ────────────────────────────────────────────────────────
-  armBanner: {
-    margin: 14, borderRadius: 12, borderWidth: 1,
-    padding: 18, gap: 12,
-  },
-  armStateRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  armStateLabel: { fontSize: 22, fontWeight: '900', letterSpacing: 2 },
-  armSubLabel:   { color: Trading.textSecondary, fontSize: 12, marginLeft: 4 },
-  armSyncLine:   { fontSize: 11, letterSpacing: 0.3, marginTop: -4 },
+  statGrid: { flexDirection: 'row', gap: 7 },
+  stat:    { flex: 1, backgroundColor: Trading.glass, borderWidth: 1, borderColor: Trading.line, borderRadius: 10, paddingVertical: 9, paddingHorizontal: 8 },
+  statLabel:{ fontSize: 8, letterSpacing: 1, color: Trading.muted, fontWeight: '600' },
+  statValue:{ fontFamily: Fonts.mono, fontSize: 15, fontWeight: '600', color: Trading.text, marginTop: 3 },
 
-  armPulse: {
-    width: 10, height: 10, borderRadius: 5,
-    shadowOffset: { width: 0, height: 0 }, shadowRadius: 6, shadowOpacity: 0.9, elevation: 4,
-  },
+  card:    { backgroundColor: Trading.glass, borderWidth: 1, borderColor: Trading.line, borderRadius: 12, padding: 12 },
+  cardTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  cardId:  { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  dir:     { fontFamily: Fonts.mono, fontSize: 9, fontWeight: '600', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 5 },
+  sym:     { fontSize: 13, fontWeight: '700', color: Trading.text, fontFamily: Fonts.display },
+  tier:    { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 5, borderWidth: 1 },
+  tierTxt: { fontSize: 8, fontWeight: '700', letterSpacing: 0.5 },
+  dateTime:{ fontFamily: Fonts.mono, fontSize: 10, color: Trading.muted },
 
-  staleBanner: {
-    backgroundColor: Trading.riskiest + '22',
-    borderRadius: 6, padding: 8,
-    borderWidth: 1, borderColor: Trading.riskiest + '60',
-  },
-  staleText: { color: Trading.riskiest, fontSize: 11, fontWeight: '700', textAlign: 'center', letterSpacing: 0.5 },
+  priceRow:{ flexDirection: 'row', marginTop: 9, gap: 4 },
+  pcLabel: { fontSize: 7, letterSpacing: 0.5, color: Trading.dim, fontWeight: '600' },
+  pcValue: { fontFamily: Fonts.mono, fontSize: 12, fontWeight: '500', color: Trading.text, marginTop: 2 },
 
-  holdOuter: {
-    borderRadius: 10, overflow: 'hidden',
-    borderWidth: 1, borderColor: Trading.border,
-    minHeight: 52,
-  },
-  holdBtn: {
-    minHeight: 52, alignItems: 'center', justifyContent: 'center',
-    paddingHorizontal: 24,
-  },
-  holdBtnText: { fontSize: 14, fontWeight: '800', letterSpacing: 2 },
-  holdHint:    { color: Trading.muted, fontSize: 10, textAlign: 'center', letterSpacing: 0.2 },
+  foot:    { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingTop: 9, borderTopWidth: 1, borderTopColor: Trading.lineSoft, marginTop: 9 },
+  outcomeChip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1 },
+  outcomeTxt:  { fontFamily: Fonts.mono, fontSize: 9, fontWeight: '600', letterSpacing: 0.5 },
+  dot:     { width: 6, height: 6, borderRadius: 3 },
+  emo:     { fontSize: 10, color: Trading.muted },
 
-  // ── Sections ─────────────────────────────────────────────────────────────────
-  section: { marginHorizontal: 14, marginTop: 14 },
-  sectionLabel: {
-    color: Trading.muted, fontSize: 10, fontWeight: '700',
-    letterSpacing: 2, marginBottom: 8,
-  },
-  sectionBody: {
-    backgroundColor: Trading.surface, borderRadius: 10,
-    borderWidth: 1, borderColor: Trading.border,
-    overflow: 'hidden',
-  },
+  empty:   { paddingVertical: 60, alignItems: 'center', gap: 8 },
+  emptyTxt:{ color: Trading.muted, fontSize: 14 },
+  emptySub:{ color: Trading.dim, fontSize: 11 },
 
-  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, padding: 12 },
-  chip: {
-    paddingHorizontal: 14, paddingVertical: 9, borderRadius: 8,
-    borderWidth: 1, borderColor: Trading.border,
-  },
-  chipText: { color: Trading.textSecondary, fontSize: 13, fontWeight: '600' },
+  // Form modal
+  formSafe:  { flex: 1, backgroundColor: '#08090d' },
+  formBar:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: Trading.line },
+  formTitle: { fontFamily: Fonts.display, fontSize: 15, fontWeight: '700', letterSpacing: 1, color: Trading.text },
+  formClose: { color: Trading.muted, fontSize: 20 },
+  formScroll:{ paddingHorizontal: 16, paddingTop: 8, paddingBottom: 24, gap: 4 },
 
-  hint: { color: Trading.muted, fontSize: 11, paddingHorizontal: 12, paddingBottom: 12 },
+  fSection:  { marginTop: 12 },
+  fLabel:    { fontSize: 9, letterSpacing: 1, color: Trading.muted, fontWeight: '600', marginBottom: 6 },
 
-  stepperRow: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    gap: 24, padding: 14,
-  },
-  stepBtn: {
-    width: 44, height: 44, borderRadius: 10, alignItems: 'center', justifyContent: 'center',
-    backgroundColor: Trading.surfaceAlt, borderWidth: 1, borderColor: Trading.border,
-  },
-  stepBtnText: { color: Trading.text, fontSize: 22, fontWeight: '300' },
-  stepValue:   { color: Trading.text, fontSize: 26, fontWeight: '700', minWidth: 48, textAlign: 'center' },
+  input:     { backgroundColor: 'rgba(0,0,0,0.35)', borderRadius: 8, borderWidth: 1, borderColor: Trading.line, color: Trading.text, fontSize: 14, paddingHorizontal: 12, paddingVertical: 10, fontFamily: Fonts.mono },
+  textArea:  { minHeight: 70, paddingTop: 10 },
 
-  // Exit strategy rows
-  stratRow: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    padding: 14, borderWidth: 1.5, borderColor: 'transparent',
-    borderBottomWidth: 1, borderBottomColor: Trading.border,
-  },
-  stratLeft:   { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1 },
-  stratDot:    { width: 9, height: 9, borderRadius: 5 },
-  stratLabel:  { color: Trading.text, fontSize: 14, fontWeight: '700' },
-  stratDesc:   { color: Trading.muted, fontSize: 11, marginTop: 2 },
-  stratLevels: { alignItems: 'flex-end', gap: 2 },
-  stratNum:    { fontSize: 11 },
+  toggleRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  toggleBtn: { paddingHorizontal: 16, paddingVertical: 9, borderRadius: 8, borderWidth: 1, borderColor: Trading.line, backgroundColor: Trading.glass },
+  toggleTxt: { color: Trading.muted, fontSize: 13, fontWeight: '600' },
+  toggleBtnSm: { paddingHorizontal: 11, paddingVertical: 7, borderRadius: 7, borderWidth: 1, borderColor: Trading.line, backgroundColor: Trading.glass },
+  toggleTxtSm: { color: Trading.muted, fontSize: 11, fontWeight: '600' },
 
-  // Risk level checks
-  checkRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14,
-    borderBottomWidth: 1, borderBottomColor: Trading.border,
-  },
-  checkBox: {
-    width: 22, height: 22, borderRadius: 6, borderWidth: 1.5,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  checkMark:  { color: Trading.bg, fontSize: 13, fontWeight: '900' },
-  checkLabel: { fontSize: 14, fontWeight: '700' },
+  priceInputRow: { flexDirection: 'row', gap: 10, marginTop: 12 },
 
-  // Reset section
-  resetSection: {
-    margin: 14, backgroundColor: Trading.surface,
-    borderRadius: 10, borderWidth: 1, borderColor: Trading.border,
-    padding: 16, gap: 8,
-  },
-  resetTitle: { color: Trading.muted, fontSize: 10, fontWeight: '700', letterSpacing: 2 },
-  resetDesc:  { color: Trading.textSecondary, fontSize: 12, lineHeight: 18 },
-  resetBtn: {
-    height: 44, alignItems: 'center', justifyContent: 'center',
-    backgroundColor: Trading.risky + '18', borderRadius: 8,
-    borderWidth: 1, borderColor: Trading.risky + '60',
-  },
-  resetBtnText: { color: Trading.risky, fontSize: 13, fontWeight: '700' },
+  autoPnl: { fontSize: 12, fontFamily: Fonts.mono, fontWeight: '600', textAlign: 'center', marginTop: 4 },
+
+  saveBtn:    { marginTop: 20, backgroundColor: Trading.accent, borderRadius: 10, paddingVertical: 15, alignItems: 'center' },
+  saveBtnTxt: { color: '#04140f', fontSize: 15, fontWeight: '800', letterSpacing: 0.5, fontFamily: Fonts.display },
+});
+
+const dm = StyleSheet.create({
+  backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
+  sheet:    { backgroundColor: '#0a0c12', borderTopLeftRadius: 20, borderTopRightRadius: 20, borderTopWidth: 1, borderColor: 'rgba(45,212,191,0.2)', paddingHorizontal: 20, paddingTop: 18, paddingBottom: 40 },
+  header:   { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  dir:      { fontSize: 16, fontWeight: '800' },
+  sym:      { fontSize: 16, fontWeight: '700', color: Trading.text, fontFamily: Fonts.display },
+  close:    { color: Trading.muted, fontSize: 18 },
+  editBtn:  { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1, borderColor: Trading.line },
+  editTxt:  { color: Trading.accent, fontSize: 12, fontWeight: '600' },
+  delBtn:   { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1, borderColor: Trading.short + '60', backgroundColor: Trading.short + '12' },
+  delTxt:   { color: Trading.short, fontSize: 12, fontWeight: '600' },
+  sub:      { fontSize: 11, color: Trading.muted, marginTop: 8, marginBottom: 14 },
+  table:    { borderRadius: 10, borderWidth: 1, borderColor: Trading.line, overflow: 'hidden', backgroundColor: Trading.glass },
+  row:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 11, paddingHorizontal: 14, borderBottomWidth: 1, borderBottomColor: Trading.lineSoft },
+  rowLabel: { fontSize: 12, color: Trading.muted, fontWeight: '600' },
+  rowValue: { fontFamily: Fonts.mono, fontSize: 15, fontWeight: '700' },
+  metaRow:  { flexDirection: 'row', gap: 8, marginTop: 14, flexWrap: 'wrap' },
+  badge:    { paddingHorizontal: 9, paddingVertical: 5, borderRadius: 7, borderWidth: 1 },
+  badgeTxt: { fontSize: 11, fontWeight: '700', letterSpacing: 0.3 },
+  setup:    { fontSize: 11, color: Trading.muted, marginTop: 10 },
+  notesTxt: { fontSize: 13, color: Trading.text, marginTop: 10, lineHeight: 19 },
+  errorBox: { backgroundColor: Trading.short + '10', borderRadius: 8, borderWidth: 1, borderColor: Trading.short + '30', padding: 12, marginTop: 12 },
+  errorLabel:{ fontSize: 9, color: Trading.short, fontWeight: '700', letterSpacing: 1, marginBottom: 4 },
+  errorTxt: { fontSize: 12, color: Trading.text, lineHeight: 18 },
 });

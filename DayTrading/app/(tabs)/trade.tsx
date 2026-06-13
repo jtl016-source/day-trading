@@ -4,9 +4,11 @@ import {
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import Animated, { FadeInDown, FadeIn } from 'react-native-reanimated';
 import { useApp } from '@/context/app-context';
 import { Trading, Fonts } from '@/constants/theme';
 import { TierBadge } from '@/components/tier-badge';
+import { AnimatedNumber, GlowPulse, LivePulse, PressableScale } from '@/components/animated-ui';
 
 // ── Mini chart WebView (lw-charts v4 CDN) ─────────────────────────────────────
 const MINI_LW_CDN = 'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';
@@ -95,6 +97,7 @@ function ptsUsd(pts: number, contracts: number): string {
 export default function TradeScreen() {
   const { apiBaseUrl } = useApp();
   const [trade,     setTrade]     = useState<CurrentTrade | null>(null);
+  const [price,     setPrice]     = useState<number | null>(null); // live last price for TP progress
   const [loading,   setLoading]   = useState(true);
   const [refreshing,setRefreshing]= useState(false);
   const [clearing,  setClearing]  = useState(false);
@@ -102,11 +105,28 @@ export default function TradeScreen() {
 
   const fetchTrade = useCallback(async (showRefresh = false) => {
     if (showRefresh) setRefreshing(true);
-    try { const r = await fetch(`${apiBaseUrl}/api/trade/current`); const d = await r.json(); setTrade(d.trade ?? null); } catch {}
+    try {
+      const r = await fetch(`${apiBaseUrl}/api/trade/current`);
+      const d = await r.json();
+      const tr: CurrentTrade | null = d.trade ?? null;
+      setTrade(tr);
+      // Live price for the "points / % to next TP" readout.
+      if (tr) {
+        try {
+          const pr = await fetch(`${apiBaseUrl}/api/live/bar/${encodeURIComponent(tr.symbol)}`);
+          const pd = await pr.json();
+          const p = typeof pd?.price === 'number' ? pd.price : (typeof pd?.bar?.close === 'number' ? pd.bar.close : null);
+          if (p != null) setPrice(p);
+        } catch {}
+      } else {
+        setPrice(null);
+      }
+    } catch {}
     setLoading(false); setRefreshing(false);
   }, [apiBaseUrl]);
 
-  useEffect(() => { fetchTrade(); const t = setInterval(() => fetchTrade(), 5000); return () => clearInterval(t); }, [fetchTrade]);
+  // Poll trade + price every 3s (price moves fast; keep the TP progress responsive).
+  useEffect(() => { fetchTrade(); const t = setInterval(() => fetchTrade(), 3000); return () => clearInterval(t); }, [fetchTrade]);
 
   useEffect(() => {
     if (!trade || trade.status !== 'open') { setElapsed(0); return; }
@@ -137,7 +157,7 @@ export default function TradeScreen() {
       <ScrollView contentContainerStyle={s.scroll}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchTrade(true)} tintColor={Trading.accent} />}>
         {loading ? <LoadingCard /> : !trade ? <NoTrade /> : (
-          <TradeCard trade={trade} isLong={isLong!} elapsed={elapsed} apiBaseUrl={apiBaseUrl} />
+          <TradeCard trade={trade} isLong={isLong!} elapsed={elapsed} price={price} apiBaseUrl={apiBaseUrl} />
         )}
       </ScrollView>
     </SafeAreaView>
@@ -163,7 +183,7 @@ function NoTrade() {
   );
 }
 
-function TradeCard({ trade, isLong, elapsed, apiBaseUrl }: { trade: CurrentTrade; isLong: boolean; elapsed: number; apiBaseUrl: string }) {
+function TradeCard({ trade, isLong, elapsed, price, apiBaseUrl }: { trade: CurrentTrade; isLong: boolean; elapsed: number; price: number | null; apiBaseUrl: string }) {
   const slPts  = Math.abs(trade.entry - trade.sl);
   const tp1Pts = Math.abs(trade.entry - trade.tp1);
   const tp2Pts = Math.abs(trade.entry - trade.tp2);
@@ -172,50 +192,57 @@ function TradeCard({ trade, isLong, elapsed, apiBaseUrl }: { trade: CurrentTrade
   const sc     = statusColor(trade.status);
   const elapsedStr = elapsed > 0 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : '';
 
+  const isOpen = trade.status === 'open';
+
   return (
     <>
       {/* ── Position header ─────────────────────────────────────────────────── */}
-      <View style={t.headerCard}>
-        <View style={[t.dirBadge, { backgroundColor: (isLong ? Trading.long : Trading.short) + '20', borderColor: (isLong ? Trading.long : Trading.short) + '60' }]}>
-          <Text style={[t.dirText, { color: isLong ? Trading.long : Trading.short }]}>
-            {isLong ? '▲ LONG' : '▼ SHORT'}
-          </Text>
-          <Text style={[t.dirContracts, { color: isLong ? Trading.long : Trading.short }]}>
-            {trade.contracts}× {trade.symbol}
-          </Text>
-        </View>
+      <Animated.View entering={FadeInDown.springify().damping(16)}>
+        <GlowPulse color={isOpen ? sc : (isLong ? Trading.long : Trading.short)} active={isOpen} radius={18}>
+          <View style={t.headerCard}>
+            <View style={[t.dirBadge, { backgroundColor: (isLong ? Trading.long : Trading.short) + '20', borderColor: (isLong ? Trading.long : Trading.short) + '60' }]}>
+              <Text style={[t.dirText, { color: isLong ? Trading.long : Trading.short }]}>
+                {isLong ? '▲ LONG' : '▼ SHORT'}
+              </Text>
+              <Text style={[t.dirContracts, { color: isLong ? Trading.long : Trading.short }]}>
+                {trade.contracts}× {trade.symbol}
+              </Text>
+            </View>
 
-        <View style={{ alignItems: 'flex-end', gap: 6 }}>
-          <View style={[t.statusBadge, { backgroundColor: sc + '20', borderColor: sc + '60' }]}>
-            <Text style={[t.statusText, { color: sc }]}>{statusLabel(trade.status)}</Text>
+            <View style={{ alignItems: 'flex-end', gap: 6 }}>
+              <View style={[t.statusBadge, { backgroundColor: sc + '20', borderColor: sc + '60' }]}>
+                {isOpen && <LivePulse color={sc} size={7} />}
+                <Text style={[t.statusText, { color: sc }]}>{statusLabel(trade.status)}</Text>
+              </View>
+              <TierBadge level={trade.riskLevel} size="sm" />
+              {elapsedStr ? <Text style={t.elapsed}>{elapsedStr}</Text> : null}
+            </View>
           </View>
-          <TierBadge level={trade.riskLevel} size="sm" />
-          {elapsedStr ? <Text style={t.elapsed}>{elapsedStr}</Text> : null}
-        </View>
-      </View>
+        </GlowPulse>
+      </Animated.View>
 
       {/* ── Levels — 3-column display ─────────────────────────────────────── */}
-      <View style={t.levelsCard}>
+      <Animated.View entering={FadeInDown.springify().damping(16).delay(80)} style={t.levelsCard}>
         <Text style={t.sectionLabel}>TRADE LEVELS</Text>
         <View style={t.levelsRow}>
           {/* Stop */}
           <View style={t.levelCol}>
             <Text style={[t.levelTag, { color: Trading.short }]}>STOP</Text>
-            <Text style={[t.levelPrice, { color: Trading.short, fontFamily: Fonts?.mono }]}>{trade.sl.toFixed(2)}</Text>
+            <AnimatedNumber value={trade.sl} decimals={2} style={[t.levelPrice, { color: Trading.short, fontFamily: Fonts?.mono }]} />
             <Text style={[t.levelSub, { fontFamily: Fonts?.mono }]}>{slPts.toFixed(1)} pts</Text>
             <Text style={t.levelDol}>{ptsUsd(slPts, trade.contracts)}</Text>
           </View>
           {/* Entry */}
           <View style={[t.levelCol, t.levelColCenter]}>
             <Text style={[t.levelTag, { color: Trading.textSecondary }]}>ENTRY</Text>
-            <Text style={[t.levelPrice, { color: Trading.text, fontFamily: Fonts?.mono }]}>{trade.entry.toFixed(2)}</Text>
+            <AnimatedNumber value={trade.entry} decimals={2} style={[t.levelPrice, { color: Trading.text, fontFamily: Fonts?.mono }]} />
             <Text style={[t.levelSub, { color: Trading.muted }]}>@ {fmtTime(trade.firedAt)}</Text>
             <Text style={t.levelDol}>{trade.interval} · {trade.contracts}c</Text>
           </View>
           {/* Target */}
           <View style={t.levelCol}>
             <Text style={[t.levelTag, { color: Trading.long }]}>TARGET</Text>
-            <Text style={[t.levelPrice, { color: Trading.long, fontFamily: Fonts?.mono }]}>{trade.tp1.toFixed(2)}</Text>
+            <AnimatedNumber value={trade.tp1} decimals={2} style={[t.levelPrice, { color: Trading.long, fontFamily: Fonts?.mono }]} />
             <Text style={[t.levelSub, { fontFamily: Fonts?.mono }]}>{tp1Pts.toFixed(1)} pts</Text>
             <Text style={t.levelDol}>{ptsUsd(tp1Pts, trade.contracts)}</Text>
           </View>
@@ -228,14 +255,62 @@ function TradeCard({ trade, isLong, elapsed, apiBaseUrl }: { trade: CurrentTrade
           )}
           {trade.tp1Only && <Text style={[t.rrText, { color: Trading.risky }]}>TP1-only mode</Text>}
         </View>
-      </View>
+      </Animated.View>
+
+      {/* ── Next-target progress (points + % to next TP) ────────────────────── */}
+      {(trade.status === 'open' || trade.status === 'tp1_hit') && (
+        <Animated.View entering={FadeInDown.springify().damping(16).delay(120)}>
+          <NextTargetCard trade={trade} isLong={isLong} price={price} />
+        </Animated.View>
+      )}
 
       {/* ── Horizontal price track ──────────────────────────────────────────── */}
-      <PositionTrack trade={trade} isLong={isLong} />
+      <Animated.View entering={FadeInDown.springify().damping(16).delay(160)}>
+        <PositionTrack trade={trade} isLong={isLong} />
+      </Animated.View>
 
       {/* ── Mini chart ──────────────────────────────────────────────────────── */}
-      <MiniChart trade={trade} apiBaseUrl={apiBaseUrl} />
+      <Animated.View entering={FadeIn.duration(500).delay(240)}>
+        <MiniChart trade={trade} apiBaseUrl={apiBaseUrl} />
+      </Animated.View>
     </>
+  );
+}
+
+// ── Next-target progress: points + % from entry toward the next TP ─────────────
+function NextTargetCard({ trade, isLong, price }: { trade: CurrentTrade; isLong: boolean; price: number | null }) {
+  const tp1Hit = trade.status === 'tp1_hit' || trade.status === 'tp2_hit';
+  const targetingTp2 = tp1Hit && !trade.tp1Only;
+  const nextTp = targetingTp2 ? trade.tp2 : trade.tp1;
+  const nextLabel = targetingTp2 ? 'TP2' : 'TP1';
+  const cur = price ?? trade.entry;
+  // Progress measured from ENTRY → next TP (full leg), clamped 0–100.
+  const legTotal = Math.abs(nextTp - trade.entry) || 1;
+  const traveled = isLong ? (cur - trade.entry) : (trade.entry - cur);
+  const pct = Math.max(0, Math.min(100, (traveled / legTotal) * 100));
+  const ptsRemaining = isLong ? (nextTp - cur) : (cur - nextTp);
+  const reached = ptsRemaining <= 0;
+  const col = reached ? Trading.long : Trading.accent;
+
+  return (
+    <View style={nt.card}>
+      <View style={nt.head}>
+        <Text style={nt.label}>NEXT TARGET · {nextLabel}</Text>
+        <Text style={[nt.target, { fontFamily: Fonts?.mono }]}>{nextTp.toFixed(2)}</Text>
+      </View>
+      <View style={nt.row}>
+        <View style={{ flex: 1 }}>
+          <Text style={nt.bigLabel}>{reached ? 'TARGET REACHED' : `${ptsRemaining.toFixed(2)} pts to ${nextLabel}`}</Text>
+          <Text style={nt.sub}>
+            {price == null ? 'waiting for live price…' : `now ${cur.toFixed(2)}  ·  entry ${trade.entry.toFixed(2)}`}
+          </Text>
+        </View>
+        <Text style={[nt.pct, { color: col }]}>{pct.toFixed(0)}%</Text>
+      </View>
+      <View style={nt.barTrack}>
+        <View style={[nt.barFill, { width: `${pct}%` as any, backgroundColor: col }]} />
+      </View>
+    </View>
   );
 }
 
@@ -365,7 +440,7 @@ const t = StyleSheet.create({
   dirBadge: { paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10, borderWidth: 1.5, gap: 2 },
   dirText:  { fontSize: 20, fontWeight: '900', letterSpacing: 0.5 },
   dirContracts: { fontSize: 11, fontWeight: '700' },
-  statusBadge: { paddingHorizontal: 12, paddingVertical: 5, borderRadius: 6, borderWidth: 1 },
+  statusBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 5, borderRadius: 6, borderWidth: 1 },
   statusText:  { fontSize: 12, fontWeight: '800', letterSpacing: 1 },
   elapsed:     { color: Trading.muted, fontSize: 11 },
 
@@ -402,4 +477,18 @@ const pt = StyleSheet.create({
 const m = StyleSheet.create({
   card:  { backgroundColor: Trading.surface, borderRadius: 12, borderWidth: 1, borderColor: Trading.border, padding: 14, gap: 10 },
   label: { color: Trading.muted, fontSize: 9, fontWeight: '700', letterSpacing: 2 },
+});
+
+// Next-target progress
+const nt = StyleSheet.create({
+  card:     { backgroundColor: Trading.surface, borderRadius: 12, borderWidth: 1, borderColor: Trading.border, padding: 16, gap: 12 },
+  head:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  label:    { color: Trading.muted, fontSize: 9, fontWeight: '700', letterSpacing: 2 },
+  target:   { color: Trading.long, fontSize: 14, fontWeight: '800' },
+  row:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', gap: 12 },
+  bigLabel: { color: Trading.text, fontSize: 16, fontWeight: '800' },
+  sub:      { color: Trading.muted, fontSize: 11, marginTop: 2 },
+  pct:      { fontSize: 26, fontWeight: '900', letterSpacing: 0.5 },
+  barTrack: { height: 8, borderRadius: 4, backgroundColor: Trading.surfaceAlt, overflow: 'hidden' },
+  barFill:  { height: 8, borderRadius: 4 },
 });

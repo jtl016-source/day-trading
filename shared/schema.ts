@@ -81,6 +81,9 @@ export const signalHistory = sqliteTable("signal_history", {
   outcome: text("outcome"),
   patternBars: integer("pattern_bars"),
   footprintReading: text("footprint_reading"),
+  // JSON {milkOk, milkPts, vecOk, secondaryVecOk, secondaryVecCount} — lets the iPhone
+  // render the exact confirmation breakdown the PC computed (MilkZone/Vector/Footprint chips).
+  confirmations: text("confirmations"),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 }, (t) => [
   uniqueIndex("signal_history_sym_iv_ts_dir").on(t.symbol, t.interval, t.timestamp, t.direction),
@@ -183,6 +186,21 @@ export const tradeJournal = sqliteTable("trade_journal", {
   createdAt:    text("created_at").default(sql`(datetime('now'))`),
 });
 
+// FOOTPRINT-STRATEGY: durable per-candle footprint store. The footprint engine builds bid/ask
+// ladders in RAM (capped, lost on restart); this table persists each finalized + forming candle
+// as a JSON blob so past sessions survive restarts and the 50-candle in-memory cap.
+export const footprintCandles = sqliteTable("footprint_candles", {
+  id:        integer("id").primaryKey({ autoIncrement: true }),
+  symbol:    text("symbol").notNull(),
+  interval:  text("interval").notNull(),
+  time:      integer("time").notNull(),            // bucket start, unix seconds
+  complete:  integer("complete").notNull().default(0),
+  data:      text("data").notNull(),               // JSON.stringify(FootprintCandle)
+  updatedAt: text("updated_at").default(sql`(datetime('now'))`),
+}, (t) => [
+  uniqueIndex("footprint_candles_sym_iv_time").on(t.symbol, t.interval, t.time),
+]);
+
 export type CachedCandle      = typeof cachedCandles.$inferSelect;
 export type DownloadStatus    = typeof downloadStatus.$inferSelect;
 export type SignalHistory      = typeof signalHistory.$inferSelect;
@@ -191,3 +209,4 @@ export type DiscordSignal     = typeof discordSignals.$inferSelect;
 export type LearningSession   = typeof learningSessions.$inferSelect;
 export type StrategyProposal  = typeof strategyProposals.$inferSelect;
 export type TradeJournalEntry = typeof tradeJournal.$inferSelect;
+export type FootprintCandleRow = typeof footprintCandles.$inferSelect;

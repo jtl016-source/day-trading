@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "DayTrading",
+    "name": "Baxter: Trading Platform",
     "slug": "DayTrading",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,8 +8,21 @@
     "scheme": "daytrading",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "updates": {
+      "url": "https://u.expo.dev/9e4d6cae-5352-43c0-bfbe-ad178abff6e8"
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.jacksonlems.DayTrading",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -38,7 +51,8 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": true,

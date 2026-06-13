@@ -62,13 +62,21 @@ interface VectorSignal {
   tp1: number; tp2: number; stopInitial: number;
 }
 
-// ── RTH helper — Mon-Fri, 13:30–20:00 UTC (9:30 AM – 4:00 PM ET) ────────────
+// ── RTH helper — Mon-Fri, 9:30 AM – 4:00 PM ET (DST-safe via Intl) ───────────
+// Must use America/New_York, NOT a hardcoded UTC offset: 9:30 ET is 13:30 UTC in summer
+// (EDT) but 14:30 UTC in winter (EST), so a fixed 13:30–20:00 UTC window is an hour off
+// for ~5 months of the year.
+const _rthWeekdayFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
+});
 function isRTH(timestampSec: number): boolean {
-  const d = new Date(timestampSec * 1000);
-  const day = d.getUTCDay();
-  if (day === 0 || day === 6) return false;
-  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return mins >= 13 * 60 + 30 && mins < 20 * 60; // 9:30 AM – 4:00 PM ET (EDT = UTC-4)
+  const parts = _rthWeekdayFmt.formatToParts(new Date(timestampSec * 1000));
+  const wd = parts.find(p => p.type === "weekday")?.value ?? "";
+  if (wd === "Sat" || wd === "Sun") return false;
+  const h = parseInt(parts.find(p => p.type === "hour")?.value ?? "0", 10);
+  const m = parseInt(parts.find(p => p.type === "minute")?.value ?? "0", 10);
+  const mins = h * 60 + m;
+  return mins >= 9 * 60 + 30 && mins < 17 * 60; // 9:30 AM – 5:00 PM ET
 }
 
 // Reuse a single Intl formatter — creating one per call is very expensive in hot loops
@@ -83,6 +91,13 @@ function isMarketBreak(timestampSec: number): boolean {
   const col = et.indexOf(":");
   const etMins = parseInt(et.slice(0, col)) * 60 + parseInt(et.slice(col + 1));
   return etMins >= 16 * 60 + 30 && etMins < 18 * 60;
+}
+/** User rule: no signals at or after 3:15 PM ET — too risky into the RTH close. */
+function isAfter315ET(timestampSec: number): boolean {
+  const et = _etFmt.format(new Date(timestampSec * 1000));
+  const col = et.indexOf(":");
+  const etMins = parseInt(et.slice(0, col)) * 60 + parseInt(et.slice(col + 1));
+  return etMins >= 15 * 60 + 15; // 3:15 PM ET
 }
 
 
@@ -829,17 +844,22 @@ const DRAWING_TOOLS: { id: DrawingTool; icon: React.ElementType; label: string }
 const IVAL_SEC: Record<string, number> = { "1m": 60, "5m": 300, "15m": 900, "60m": 3600 };
 
 // ── MW color tokens ────────────────────────────────────────────────────────
+// ── Midnight Glow palette ─────────────────────────────────────────────────
+// Deep navy with electric-blue glow accents. Drives all chrome (inline styles).
+// Chart rendering uses CHART_THEMES separately, so this is cosmetic-only.
 const MW = {
-  bg:       "#05080d",   // chart background — MW exact near-black
-  panel:    "#090d14",   // panel backgrounds
-  toolbar:  "#0b1018",   // toolbar
-  border:   "#111a26",   // borders
-  text:     "#b8c8d8",   // primary text
-  muted:    "#4a6080",   // secondary text
-  accent:   "#1a72d4",   // accent blue
-  accentHov:"#2080e8",
-  up:       "#2196f3",   // MotiveWave blue
-  down:     "#c62828",   // MotiveWave red
+  bg:       "#060b14",   // app/chrome background — deep navy-black
+  panel:    "#0a1322",   // panel backgrounds — navy
+  toolbar:  "#0b1626",   // toolbar — slightly lifted navy
+  border:   "#18293f",   // borders — soft navy
+  text:     "#cdd9ea",   // primary text — cool light
+  muted:    "#647fa6",   // secondary text — slate-blue (more readable)
+  accent:   "#2f9bff",   // electric blue accent
+  accentHov:"#54b3ff",
+  accent2:  "#38e0ff",   // cyan glow companion
+  glow:     "rgba(47,155,255,0.45)", // accent glow for box-shadows
+  up:       "#2196f3",   // up / long — MotiveWave blue
+  down:     "#ef4444",   // down / short — vivid red
 };
 
 // ── Page component ────────────────────────────────────────────────────────
@@ -851,7 +871,7 @@ export default function MarketPage() {
   const urlTime     = parseInt(urlParams.get("time") ?? "0") || null;
   const urlPadding  = parseInt(urlParams.get("padding") ?? "30") || 30;
 
-  const [selectedSymbol, setSelectedSymbol] = useState(() => urlSymbol ?? getPersistedSetting("selectedSymbol", "SPY"));
+  const [selectedSymbol, setSelectedSymbol] = useState(() => urlSymbol ?? getPersistedSetting("selectedSymbol", "MES"));
   const [symbolDropdownOpen, setSymbolDropdownOpen] = useState(false);
   const [symbolSearch, setSymbolSearch] = useState("");
   const [showVector, setShowVector]         = useState(() => getPersistedSetting("showVector", true));
@@ -867,6 +887,10 @@ export default function MarketPage() {
   const [useTrailer,    setUseTrailer]     = useState(() => getPersistedSetting("useTrailer", false));
   const [trailerOffset, setTrailerOffset]  = useState(() => getPersistedSetting("trailerOffset", 2.0));
   const [useZoneTargets, setUseZoneTargets] = useState(() => getPersistedSetting("useZoneTargets", false));
+  // Feature: take EVERY vector side-entry as a Long, exiting with the vector's exit strategy.
+  // When on, these become first-class signals (chart + panel + persisted + iPhone) and are
+  // auto-trade eligible (explicit override of the safe/safe+ auto-trade gate — see fire logic).
+  const [takeSideEntries, setTakeSideEntries] = useState(() => getPersistedSetting("takeSideEntries", false));
   const [showSignalsPanel, setShowSignalsPanel] = useState(false);
   const [showLabels,    setShowLabels]    = useState(() => getPersistedSetting("showLabels", true));
   const [autoScale,     setAutoScale]     = useState(true);
@@ -877,10 +901,17 @@ export default function MarketPage() {
   const [showZoneList,  setShowZoneList]  = useState(false);
   const [startDayIdx, setStartDayIdx] = useState(0);
   const [endDayIdx,   setEndDayIdx]   = useState(59);
-  const [windowSize,  setWindowSize]  = useState(() => getPersistedSetting("windowSize", 60));
+  // Default window = 90 days so the initial load is fast & reliable. Loading "ALL"
+  // (2yr of 5m ≈ 100k candles ≈ 10MB / 12s) is too heavy to fetch on first paint and
+  // leaves the chart blank — the user can still pick a larger window from the dropdown
+  // (incl. ALL) to pull deep history on demand. Key bumped v3→v4 to clear the stale
+  // 9999/ALL value some browsers cached.
+  const [windowSize,  setWindowSize]  = useState(() => getPersistedSetting("windowSize_v4", 90));
   const [interval, setInterval] = useState<"1m" | "5m" | "15m" | "60m">(() => {
     if ((["1m","5m","15m","60m"] as const).includes(urlInterval as any)) return urlInterval as "1m"|"5m"|"15m"|"60m";
-    return getPersistedSetting<"1m"|"5m"|"15m"|"60m">("interval", "5m");
+    // Default to 15m: native 15m history loads ~4x faster than 5m (fewer bars over the
+    // same window) and is the primary interval for this strategy.
+    return getPersistedSetting<"1m"|"5m"|"15m"|"60m">("interval", "15m");
   });
   const [activeTool,  setActiveTool]  = useState<DrawingTool>("cursor");
   const [drawings,    setDrawings]    = useState<Drawing[]>([]);
@@ -1010,10 +1041,38 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   useEffect(() => {
     fetch("/api/trade/settings")
       .then(r => r.ok ? r.json() : null)
-      .then((d: { enabled?: boolean } | null) => {
-        if (d && typeof d.enabled === "boolean") {
+      .then((d: { enabled?: boolean; intervals?: string[]; riskLevels?: string[]; direction?: "both" | "long" | "short"; contracts?: number; contractType?: "MES" | "ES"; tp1Only?: boolean } | null) => {
+        if (!d) return;
+        if (typeof d.enabled === "boolean") {
           setAutoTradeEnabled(d.enabled);
           autoTradeEnabledRef.current = d.enabled;
+        }
+        if (Array.isArray(d.intervals)) {
+          const s = new Set<string>(d.intervals);
+          setAutoTradeIntervals(s);
+          autoTradeIntervalRef.current = s;
+        }
+        if (Array.isArray(d.riskLevels)) {
+          const s = new Set<string>(d.riskLevels);
+          setAutoTradeRiskLevels(s);
+          autoTradeRiskRef.current = s;
+        }
+        if (d.direction === "both" || d.direction === "long" || d.direction === "short") {
+          setAutoTradeDirection(d.direction);
+          autoTradeDirectionRef.current = d.direction;
+        }
+        if (typeof d.contracts === "number" && d.contracts >= 1) {
+          const n = Math.floor(d.contracts);
+          setAutoTradeContracts(n);
+          autoTradeContractsRef.current = n;
+        }
+        if (d.contractType === "MES" || d.contractType === "ES") {
+          setAutoTradeContractType(d.contractType);
+          autoTradeContractTypeRef.current = d.contractType;
+        }
+        if (typeof d.tp1Only === "boolean") {
+          setAutoTradeTp1Only(d.tp1Only);
+          autoTradeTp1OnlyRef.current = d.tp1Only;
         }
       })
       .catch(() => {});
@@ -1059,9 +1118,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // Clear Discord unread badge when navigating to the feed
   useEffect(() => { if (location === "/discord") setDiscordUnread(0); }, [location]);
 
-  // Poll AutoTrader Java study connection status every 5s
+  // Poll AutoTrader Java study connection status every 5s.
+  // cache:"no-store" — otherwise the browser revalidates and a 304 (empty body) makes r.json()
+  // throw, leaving the connection flag stale ("disconnected" while the study is actually connected).
   useEffect(() => {
-    const poll = () => fetch("/api/trade/status").then(r => r.json())
+    const poll = () => fetch("/api/trade/status", { cache: "no-store" }).then(r => r.json())
       .then(d => setAutoTradeConnected(!!d.connected)).catch(() => {});
     poll();
     const t = window.setInterval(poll, 5000);
@@ -1093,7 +1154,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       localStorage.setItem("mwb_settings", JSON.stringify({
         selectedSymbol, themeKey, customTheme,
         showVector, showMlZones, showMilkZones, showETH, showLabels,
-        chartRiskLevel, exitStrategy, windowSize, interval,
+        chartRiskLevel, exitStrategy, windowSize_v4: windowSize, interval,
         autoTradeEnabled,
         autoTradeContracts, autoTradeContractType,
         autoTradeRiskLevels: [...autoTradeRiskLevels],
@@ -1103,11 +1164,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         useTrailer,
         trailerOffset,
         useZoneTargets,
+        takeSideEntries,
       }));
     } catch {}
   }, [selectedSymbol, themeKey, customTheme, showVector, showMlZones, showMilkZones, showETH, showLabels,
       chartRiskLevel, exitStrategy, windowSize, interval, autoTradeEnabled, autoTradeContracts, autoTradeContractType,
-      autoTradeRiskLevels, autoTradeIntervals, autoTradeTp1Only, autoTradeDirection, useTrailer, trailerOffset, useZoneTargets]);
+      autoTradeRiskLevels, autoTradeIntervals, autoTradeTp1Only, autoTradeDirection, useTrailer, trailerOffset, useZoneTargets, takeSideEntries]);
 
   // When exit strategy changes, clear all non-DB-locked signal levels so they recompute
   // with the new TP/SL parameters. DB-locked signals are re-applied on the next render.
@@ -1142,6 +1204,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   });
   const alertDismissTimer   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const signalVerifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // One-shot guard: which `${time}_${direction}` signals have already alerted Discord (prevents
+  // a tier-upgrade or recompute from re-sending an alert for the same fired signal).
+  const discordSentRef = useRef<Set<string>>(new Set());
   // Ref so fireSignalNotification always sees latest discordWebhook without stale closure
   const discordWebhookRef = useRef<string>("");
 
@@ -1455,10 +1520,40 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             return;
           }
           if (msg.type === "auto_trade_state") {
-            // Another client (e.g. iPhone) toggled auto-trade — mirror the authoritative state.
+            // The server is the authoritative source for auto-trade config. The terminal/iPhone
+            // write it; this hidden engine MIRRORS it live so firing uses the right interval/tier.
             if (typeof msg.enabled === "boolean") {
               setAutoTradeEnabled(msg.enabled);
               autoTradeEnabledRef.current = msg.enabled;
+            }
+            if (Array.isArray(msg.intervals)) {
+              const s = new Set<string>(msg.intervals);
+              setAutoTradeIntervals(s);
+              autoTradeIntervalRef.current = s;
+            }
+            if (Array.isArray(msg.riskLevels)) {
+              // SAFETY: the engine's fire-gate independently requires safe/safeplus, so even if a
+              // bad tier slipped in here it could never auto-execute — but keep the set clean too.
+              const s = new Set<string>(msg.riskLevels);
+              setAutoTradeRiskLevels(s);
+              autoTradeRiskRef.current = s;
+            }
+            if (msg.direction === "both" || msg.direction === "long" || msg.direction === "short") {
+              setAutoTradeDirection(msg.direction);
+              autoTradeDirectionRef.current = msg.direction;
+            }
+            if (typeof msg.contracts === "number" && msg.contracts >= 1) {
+              const n = Math.floor(msg.contracts);
+              setAutoTradeContracts(n);
+              autoTradeContractsRef.current = n;
+            }
+            if (msg.contractType === "MES" || msg.contractType === "ES") {
+              setAutoTradeContractType(msg.contractType);
+              autoTradeContractTypeRef.current = msg.contractType;
+            }
+            if (typeof msg.tp1Only === "boolean") {
+              setAutoTradeTp1Only(msg.tp1Only);
+              autoTradeTp1OnlyRef.current = msg.tp1Only;
             }
           }
           if (msg.type === "discord_message") {
@@ -1646,8 +1741,8 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
   scrubberStateRef.current = { total: sortedDays.length, windowSize };
 
-  // Fallback: when no DB days loaded yet, use last 90 days so the query always fires
-  const fallbackFromTs = useMemo(() => Math.floor(Date.now() / 1000) - 90 * 86400, []);
+  // Fallback: when no DB days loaded yet, use last 730 days so the query always fires
+  const fallbackFromTs = useMemo(() => Math.floor(Date.now() / 1000) - 730 * 86400, []);
   // toTs is always "now + 24h" — stable (computed once on mount), always covers today's session
   // regardless of how long the user keeps the app open.
   // Using windowedDays last date for toTs would exclude today's bars if today isn't yet in the
@@ -1659,10 +1754,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return Math.min(stableToTs, nowTs); // never request bars dated in the future
   }, [stableToTs]);
 
-  const fetchInterval = interval === "60m" ? "60m" : interval === "1m" ? "1m" : "5m";
+  const fetchInterval = interval === "60m" ? "60m" : interval === "1m" ? "1m" : interval === "15m" ? "15m" : "5m";
 
   const { data: rawCandleData, isLoading: candlesLoading, error: candleError } = useQuery<{
-    symbol: string; interval: string; candles: CandleBar[]; source: string;
+    symbol: string; interval: string; candles: CandleBar[]; source: string; resolution?: string;
   }>({
     queryKey: ["/api/data/cached-continuous", selectedSymbol, fetchInterval, fromTs, toTs],
     queryFn: async () => {
@@ -1691,19 +1786,31 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const candleData = useMemo(() => {
     if (!rawCandleData?.candles?.length) return rawCandleData;
     if (interval === "15m") {
-      // Pre-filter bad 5m bars before aggregating — a doji-wick 5m bar (e.g. low=6272 stuck value)
-      // can produce a 15m bar with a large enough body to slip through the post-aggregation filter.
-      const clean5m = rawCandleData.candles.filter(c => {
+      // The server serves NATIVE 15m bars (resolution "15") when available and only
+      // falls back to 5m aggregation when no 15m bars exist. Aggregating already-15m
+      // data with agg5mTo15m re-buckets it AND merges live forming bars (which arrive at
+      // non-15m-aligned timestamps with volume 0) into adjacent real bars — corrupting the
+      // most recent candles. So: if the data is already 15m, pass it through (cleaned +
+      // aligned); only aggregate when the server fell back to 5m.
+      const isNative15m = rawCandleData.resolution === "15";
+      // Pre-filter bad bars (doji-wick spikes / corrupt wicks) before use/aggregation.
+      const clean = rawCandleData.candles.filter(c => {
         if (!isFinite(c.open) || !isFinite(c.high) || !isFinite(c.low) || !isFinite(c.close)) return false;
-        if (c.high <= c.low) return false;
+        if (c.high <= c.low) return false; // drops flat zero-range forming "dot" bars
         const range = c.high - c.low;
         if (range / c.close > 0.015 && Math.abs(c.open - c.close) / range < 0.10) return false;
-        // Reject bars where any wick exceeds 1.5% of price — spike even with a real body
         const bL = Math.min(c.open, c.close), bH = Math.max(c.open, c.close);
         if ((bL - c.low) / c.close > 0.015 || (c.high - bH) / c.close > 0.015) return false;
         return true;
       });
-      return { ...rawCandleData, candles: agg5mTo15m(clean5m) };
+      if (isNative15m) {
+        // Keep only true 15m-aligned bars — removes the live forming bars that the relay
+        // persists at raw (non-900-aligned) timestamps and that would otherwise appear as
+        // stray candles at the right edge.
+        const aligned = clean.filter(c => c.time % 900 === 0);
+        return { ...rawCandleData, candles: aligned };
+      }
+      return { ...rawCandleData, candles: agg5mTo15m(clean) };
     }
     return rawCandleData;
   }, [rawCandleData, interval]);
@@ -2217,7 +2324,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       const day = d.getUTCDay(); // FOOTPRINT-SIZE-FIX:
       if (day === 0 || day === 6) return false; // FOOTPRINT-SIZE-FIX:
       const m = d.getUTCHours() * 60 + d.getUTCMinutes(); // FOOTPRINT-SIZE-FIX:
-      return m >= 13 * 60 + 30 && m < 20 * 60; // RTH: 9:30 AM – 4:00 PM ET
+      return m >= 13 * 60 + 30 && m < 21 * 60; // RTH: 9:30 AM – 5:00 PM ET (EDT)
     }; // FOOTPRINT-SIZE-FIX:
 
     const buildAggregate = (candles: typeof windowedCandles, anchorTime: number, label: string): FootprintCandle | null => { // FOOTPRINT-SIZE-FIX:
@@ -2370,44 +2477,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return updateMitigation(zones, candlesAfterSession); // FOOTPRINT-RULE: close-only mitigation check
   }, [baseCandles]); // FOOTPRINT-RULE: PERF: baseCandles only — not windowedCandles
 
-  // Auto-detected Milk zones (FVG/OB/Structural) removed — only uploaded Discord/MWML zones are used.
-
-  // Discord zones — exact levels posted by Milk in Discord (highest authority).
-  // Fetched for a generous window (30 days back so weekly/multi-day zones show up).
-  const discordZoneFromTs = fromTs > 0 ? fromTs - 30 * 86400 : 0;
-  const { data: discordZonesData } = useQuery<{ zones: Array<{ posted_at: number; top: number; bottom: number; is_bull: boolean; zone_type: string; label_raw: string }> }>({
-    queryKey: ["/api/discord-zones", discordZoneFromTs, toTs, selectedSymbol],
-    queryFn: async () => {
-      const sym = selectedSymbol.toUpperCase().replace(/[A-Z]\d+$/, "").replace("=F", "");
-      const r = await fetch(`/api/discord-zones?from_ts=${discordZoneFromTs}&to_ts=${toTs}&symbol=${sym}`);
-      if (!r.ok) throw new Error("Failed");
-      return r.json();
-    },
-    enabled: toTs > 0,
-    staleTime: 5 * 60_000,
-  });
-
-  // Primary zones for signal computation: Discord zones > uploaded MWML/PNG zones > nothing.
-  // Auto-detected zones (clientMilkZones) are intentionally NOT used here — signals must only
-  // fire against zones the user explicitly provided, not zones inferred from candle data.
-  const activeZones = useMemo((): ZoneBand[] => {
-    if (discordZonesData?.zones?.length) {
-      return discordZonesData.zones.map(z => {
-        const settle = rthSettleOfDay(z.posted_at);
-        const toTime = settle > z.posted_at ? settle : rthSettleOfDay(z.posted_at + 86400);
-        return {
-          topPrice:    z.top,
-          bottomPrice: z.bottom,
-          fromTime:    z.posted_at,
-          toTime,
-          color:       z.is_bull ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)",
-          label:       z.label_raw,
-        };
-      });
-    }
-    // Use uploaded zones (MWML/PNG) if present; otherwise signals run without zone confluence
-    return parsedZones;
-  }, [discordZonesData, parsedZones]);
+  // ── Milk zones for signal confluence ──────────────────────────────────────
+  // RULE (user): a signal may only claim milk-zone confluence when the zones were
+  // uploaded by the user via PNG (→ parsedZones). NOT auto-read Discord zones, and
+  // NOT synthetic/auto-detected zones. Before a PNG upload there are zero milk zones,
+  // so no trade/signal reasoning can include "Milk Zone". The Discord-zone auto-fetch
+  // was intentionally removed here — it was firing milk confluence without any upload.
+  const activeZones = useMemo((): ZoneBand[] => parsedZones, [parsedZones]);
 
 
   // ── Confluence signals — all risk levels ──────────────────────────────────
@@ -2428,6 +2504,21 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const permanentSignalLevelsRef = useRef<Map<string, LockVal>>(new Map());
   // Loaded from DB — DB values permanently win over freshly computed c.close
   const [dbSignalHistory, setDbSignalHistory] = useState<Map<string, LockVal>>(new Map());
+
+  // ── SIGNAL TIER LOCK ──────────────────────────────────────────────────────
+  // THE risk factor (tier) is decided ONCE — the first time a signal fires for a bar+direction —
+  // and frozen here. Without this, every live tick re-reads footprint / milk-zone / vector and
+  // re-derives the tier, so the SAME signal flickers RISKIEST→RISKY→SAFE as data arrives, which
+  // corrupts auto-trade decisions. Key: `${time}_${direction}`. Stores the locked tier plus the
+  // exact confirmation breakdown captured at fire time. Loaded from the DB on mount so the tier
+  // survives reloads, and cleared on symbol/interval change.
+  type LockTier = {
+    riskLevel: "safeplus" | "safe" | "risky" | "riskiest";
+    confirmations: { milkOk: boolean; milkPts?: number; vecOk: boolean; secondaryVecOk: boolean; secondaryVecCount?: number };
+    footprintReading?: string;
+    confidence?: number;
+  };
+  const lockedSignalTierRef = useRef<Map<string, LockTier>>(new Map());
   // Break-even tracking: once price reaches entry ± 3pts, SL moves to entry (once per signal)
   const beTriggeredRef   = useRef<Set<string>>(new Set());
   const [beVersion, setBeVersion] = useState(0); // increments to force allConfluenceSignals recompute
@@ -2438,7 +2529,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     time: number; price: number; high: number; low: number; direction: "Long" | "Short";
     tp1: number; tp2: number; sl: number; toTime: number;
     riskLevel: "safeplus" | "safe" | "risky" | "riskiest";
-    confirmations: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean; secondaryVecCount?: number };
+    confirmations: { milkOk: boolean; milkPts?: number; vecOk: boolean; secondaryVecOk: boolean; secondaryVecCount?: number };
     reclassifyReason?: string;
     outcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
     /** True when dated milk zones (fromTime > 0) were loaded at signal compute time */
@@ -2449,6 +2540,8 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     confidence?: number;
     /** FIX: interval at signal creation — used to filter SignalsPanel by current interval */
     interval?: string;
+    /** Signal source — "vector-side-entry" marks the take-every-side-entry-as-Long feature (auto-trade eligible). */
+    signalType?: string;
   };
 
   const allConfluenceSignals = useMemo((): CSig[] => {
@@ -2495,6 +2588,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     let fpPtr = 0; // advances through sortedFpCandles as we scan sorted candles in order // PERF:
 
     const raw: CSig[] = [];
+    // Vector side-entry longs collected during the scan (outcome computed via the closure
+    // `walkForward`, so they MUST be built inside the loop); merged into `raw` after the loop.
+    const sideEntryRaw: CSig[] = [];
     const COOLDOWN_BARS   = 10;
     const ETH_COOLDOWN    = 20;
     const PROX_PTS        = 5.0;
@@ -2573,6 +2669,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
       if (isMarketBreak(c.time)) continue;
       if (lb == null) continue;
+      // USER RULE: no signals (confluence OR side-entry) in the RTH-close window 3:15–5:00 PM ET —
+      // too risky into the close. ETH side-entries (outside RTH) are unaffected.
+      if (rthC && isAfter315ET(c.time)) continue;
 
       // Compute milk-zone bonuses for both directions in a single pass.
       // Scoring:
@@ -2698,6 +2797,40 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       // Advance footprint pointer past current candle time (amortised O(1) across the loop)
       while (fpPtr < sortedFpCandles.length && sortedFpCandles[fpPtr].time < c.time) fpPtr++;
 
+      // ── Vector side-entry longs (feature: take EVERY side entry as a Long) ───
+      // Side entry = price closed below the vector last bar and back above it this bar, on a
+      // flat/declining vector (same definition as computeVectorSignals). The bracket IS the
+      // vector's exit strategy: stop = vector − VEC_STOP_BELOW (capped at VEC_MAX_STOP risk),
+      // targets entry + VEC_TP1 / VEC_TP2. Outcome via the shared walk-forward (honours the
+      // trailer toggle exactly like confluence signals). Levels are locked on first fire so the
+      // live forming bar can't drift them. Persisted + auto-trade eligible via signalType.
+      if (takeSideEntries) {
+        const sePrev   = i > 0 ? sorted[i - 1] : undefined;
+        const sePrevLb = sePrev ? vecMap.get(sePrev.time) : undefined;
+        if (sePrev && sePrevLb != null && sePrev.close < sePrevLb && c.close > lb && (lb - sePrevLb) < 0) {
+          const seKey = `${c.time}_Long_SE`;
+          let seLock = lockedSignalLevelsRef.current.get(seKey);
+          if (!seLock) {
+            const seEntry = c.close;
+            const seSl    = Math.max(lb - VEC_STOP_BELOW, seEntry - VEC_MAX_STOP);
+            seLock = { price: seEntry, tp1: seEntry + VEC_TP1, tp2: seEntry + VEC_TP2, sl: seSl };
+            lockedSignalLevelsRef.current.set(seKey, seLock);
+          }
+          const { outcome: seOutcome, toTime: seToTime } = walkForward(seLock.tp1, seLock.tp2, seLock.sl, true);
+          sideEntryRaw.push({
+            time: c.time, price: seLock.price, high: c.high, low: c.low, direction: "Long",
+            tp1: seLock.tp1, tp2: seLock.tp2, sl: seLock.sl, toTime: seToTime,
+            riskLevel: "risky",
+            confirmations: { milkOk: false, milkPts: 0, vecOk: true, secondaryVecOk: false, secondaryVecCount: 0 },
+            outcome: seOutcome, interval, signalType: "vector-side-entry", confidence: 50,
+          });
+        }
+      }
+
+      // USER RULE: confluence signals (milk/vector/footprint) are RTH-only. During ETH only the
+      // vector side-entry above may fire — skip the rest of this bar's evaluation when not RTH.
+      if (!rthC) continue;
+
       // ── LONG signal evaluation ──────────────────────────────────────────────
       if (c.close > lb) {
         const fpCandleL: FootprintCandle = fpByTime.get(c.time) ?? buildProxyFootprintCandle(c);
@@ -2751,24 +2884,40 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           const vecPtsL  = vecTestedL ? 2 : 0;
           const totalPtsL = fpPtsL + milkPtsL + vecPtsL;
 
-          if (totalPtsL >= 1) {
-            const rawLevelL: "safeplus" | "safe" | "risky" | "riskiest" =
-              (fpOnMilkZoneL || totalPtsL >= 8) ? "safeplus" : totalPtsL >= 4 ? "safe" : totalPtsL >= 3 ? "risky" : "riskiest";
-            // FIX 3: partial FP on zone floors at SAFE
-            const level: "safeplus" | "safe" | "risky" | "riskiest" =
-              rawLevelL === "safeplus" ? "safeplus" :
-              fpPartialOnZoneL ? "safe" :
-              rawLevelL;
-            const _wrL = signalWinRates[`${level}:Long`];
-            const confL = (_wrL && _wrL.sampleCount >= 5) ? Math.round(_wrL.winRate * 100) : (level === "safeplus" ? 100 : level === "safe" ? 75 : level === "risky" ? 50 : 10);
+          // SINGLE-TIER: a signal only fires when the setup clears the SAFE quality bar — the
+          // same conditions that used to produce "safe"/"safeplus": ≥4 confluence pts, or a
+          // footprint on/at a milk zone. Weaker setups (the old "risky"/"riskiest", 1–3 pts) are
+          // no longer signals at all. Every signal that fires is labeled "safe" — no categories.
+          const lockKey = `${c.time}_Long`;
+          const existingTierL = lockedSignalTierRef.current.get(lockKey);
+          const safeQualityL = totalPtsL >= 4 || fpOnMilkZoneL || fpPartialOnZoneL;
+          const cdL = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
+          // FIRE-LOCK: a NEW signal fires only if it clears the safe bar + HOD/cooldown gates.
+          // An ALREADY-FIRED signal (existingTierL is set) re-emits UNCONDITIONALLY on every
+          // recompute, so once a dot is on the chart it can NEVER disappear — even if late-arriving
+          // footprint/milk/vector data would no longer qualify it. Fired = locked, permanently.
+          const newFireL = safeQualityL && !nearHodLong && (i - (rthC ? lastLongBar : lastLongEthBar) >= cdL);
+          if (existingTierL || newFireL) {
+            const level = "safe" as const;
+            const _wrL = signalWinRates[`safe:Long`];
+            const confL = (_wrL && _wrL.sampleCount >= 5) ? Math.round(_wrL.winRate * 100) : 75;
+            // Advance the cooldown anchor on every emit (locked re-emit too) so new signals stay spaced.
+            if (rthC) lastLongBar = i; else lastLongEthBar = i;
 
-            if (!nearHodLong && !(rthC && utcH >= 20 && level !== "safe" && level !== "safeplus")) {
-              const cd = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
-              if (i - (rthC ? lastLongBar : lastLongEthBar) >= cd) {
-                if (rthC) lastLongBar = i; else lastLongEthBar = i;
-
-                const lockKey = `${c.time}_Long`;
-                const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
+            // First fire → lock the risk factor + the exact footprint/milk/vector reading.
+            let tierL = existingTierL;
+            if (!tierL) {
+              tierL = {
+                riskLevel: level,
+                confirmations: { milkOk: milkBullOk, milkPts: milkPtsL, vecOk: vecTestedL, secondaryVecOk: secLongOk, secondaryVecCount: secLongCount },
+                footprintReading: fpReadingL ? JSON.stringify(fpReadingL) : undefined,
+                confidence: confL,
+              };
+              lockedSignalTierRef.current.set(lockKey, tierL);
+            }
+            // Tier is always "safe" now → exits use the safe profile; the lock only freezes
+            // the confirmation breakdown so the chips don't flicker as data loads.
+            const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
                 const dbLock = dbSignalHistory.get(lockKey);
                 if (dbLock) { lockedSignalLevelsRef.current.set(lockKey, dbLock); }
                 else if (!lockedSignalLevelsRef.current.has(lockKey)) {
@@ -2799,9 +2948,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 const tp1 = locked.tp1, tp2 = locked.tp2, sl = entryClose - slF;
 
                 const { outcome, toTime } = walkForward(tp1, tp2, sl, true);
-                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Long", tp1, tp2, sl, toTime, riskLevel: level, confirmations: { milkOk: milkBullOk, vecOk: vecTestedL, secondaryVecOk: secLongOk, secondaryVecCount: secLongCount }, zonesLoaded: hasDatedZones, outcome, footprintReading: fpReadingL ? JSON.stringify(fpReadingL) : undefined, interval, confidence: confL });
-              }
-            }
+                // Always "safe" — confirmations/footprint frozen on first fire (lock) so the chips
+                // don't flicker; confidence falls back to the freshly computed safe win-rate.
+                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Long", tp1, tp2, sl, toTime, riskLevel: level, confirmations: tierL.confirmations, zonesLoaded: hasDatedZones, outcome, footprintReading: tierL.footprintReading, interval, confidence: tierL.confidence ?? confL });
           }
         }
       }
@@ -2858,23 +3007,34 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           const vecPtsS  = vecTestedS ? 2 : 0;
           const totalPtsS = fpPtsS + milkPtsS + vecPtsS;
 
-          if (totalPtsS >= 1) {
-            const rawLevelS: "safeplus" | "safe" | "risky" | "riskiest" =
-              (fpOnMilkZoneS || totalPtsS >= 8) ? "safeplus" : totalPtsS >= 4 ? "safe" : totalPtsS >= 3 ? "risky" : "riskiest";
-            const level: "safeplus" | "safe" | "risky" | "riskiest" =
-              rawLevelS === "safeplus" ? "safeplus" :
-              fpPartialOnZoneS ? "safe" :
-              rawLevelS;
-            const _wrS = signalWinRates[`${level}:Short`];
-            const confS = (_wrS && _wrS.sampleCount >= 5) ? Math.round(_wrS.winRate * 100) : (level === "safeplus" ? 100 : level === "safe" ? 75 : level === "risky" ? 50 : 10);
+          // SINGLE-TIER (Short): fire only when the setup clears the SAFE quality bar (≥4 pts or
+          // footprint on/at a milk zone). Weaker setups are no longer signals. Every signal = "safe".
+          const lockKey = `${c.time}_Short`;
+          const existingTierS = lockedSignalTierRef.current.get(lockKey);
+          const safeQualityS = totalPtsS >= 4 || fpOnMilkZoneS || fpPartialOnZoneS;
+          const cdS = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
+          // FIRE-LOCK: a NEW short fires only if it clears the safe bar + LOD/cooldown gates. An
+          // ALREADY-FIRED short (existingTierS) re-emits unconditionally so it never disappears.
+          const newFireS = safeQualityS && !nearLodShort && (i - (rthC ? lastShortBar : lastShortEthBar) >= cdS);
+          if (existingTierS || newFireS) {
+            const level = "safe" as const;
+            const _wrS = signalWinRates[`safe:Short`];
+            const confS = (_wrS && _wrS.sampleCount >= 5) ? Math.round(_wrS.winRate * 100) : 75;
+            if (rthC) lastShortBar = i; else lastShortEthBar = i; // spacing anchor on every emit
 
-            if (!nearLodShort && !(rthC && utcH >= 20 && level !== "safe" && level !== "safeplus")) {
-              const cd = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
-              if (i - (rthC ? lastShortBar : lastShortEthBar) >= cd) {
-                if (rthC) lastShortBar = i; else lastShortEthBar = i;
-
-                const lockKey = `${c.time}_Short`;
-                const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
+            // First fire → lock the risk factor + the exact footprint/milk/vector reading.
+            let tierS = existingTierS;
+            if (!tierS) {
+              tierS = {
+                riskLevel: level,
+                confirmations: { milkOk: milkBearOk, milkPts: milkPtsS, vecOk: vecTestedS, secondaryVecOk: secShortOk, secondaryVecCount: secShortCount },
+                footprintReading: fpReadingS ? JSON.stringify(fpReadingS) : undefined,
+                confidence: confS,
+              };
+              lockedSignalTierRef.current.set(lockKey, tierS);
+            }
+            // Tier is always "safe" → exits use the safe profile; lock only freezes the chips.
+            const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
                 const dbLock = dbSignalHistory.get(lockKey);
                 if (dbLock) { lockedSignalLevelsRef.current.set(lockKey, dbLock); }
                 else if (!lockedSignalLevelsRef.current.has(lockKey)) {
@@ -2905,19 +3065,27 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 const tp1 = locked.tp1, tp2 = locked.tp2, sl = entryClose + slF;
 
                 const { outcome, toTime } = walkForward(tp1, tp2, sl, false);
-                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Short", tp1, tp2, sl, toTime, riskLevel: level, confirmations: { milkOk: milkBearOk, vecOk: vecTestedS, secondaryVecOk: secShortOk, secondaryVecCount: secShortCount }, zonesLoaded: hasDatedZones, outcome, footprintReading: fpReadingS ? JSON.stringify(fpReadingS) : undefined, interval, confidence: confS });
-              }
-            }
+                // Always "safe" — confirmations/footprint frozen on first fire; confidence falls
+                // back to the freshly computed safe win-rate.
+                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Short", tp1, tp2, sl, toTime, riskLevel: level, confirmations: tierS.confirmations, zonesLoaded: hasDatedZones, outcome, footprintReading: tierS.footprintReading, interval, confidence: tierS.confidence ?? confS });
           }
         }
       }
 
     }
 
+    // Merge vector side-entry longs, skipping bars where a confluence Long already fired
+    // (a confluence Long takes priority and avoids the (symbol,interval,time,direction) DB
+    // unique-key collision since both persist as direction "Long").
+    if (sideEntryRaw.length) {
+      const longTimes = new Set(raw.filter(s => s.direction === "Long").map(s => s.time));
+      for (const se of sideEntryRaw) if (!longTimes.has(se.time)) raw.push(se);
+    }
+
     // Sort by time so the panel shows signals in chronological order
     return raw.sort((a, b) => a.time - b.time);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowedCandles, vectorLine, interval, extraVecSignalLines, activeZones, dbSignalHistory, exitStrategy, useTrailer, trailerOffset, beVersion, fpCompletedVersion, useZoneTargets, signalWinRates]); // PERF: fpCompletedVersion replaces latestFootprintCandle+footprintCandles — increments only on new complete bar
+  }, [windowedCandles, vectorLine, interval, extraVecSignalLines, activeZones, dbSignalHistory, exitStrategy, useTrailer, trailerOffset, beVersion, fpCompletedVersion, useZoneTargets, signalWinRates, takeSideEntries]); // PERF: fpCompletedVersion replaces latestFootprintCandle+footprintCandles — increments only on new complete bar
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
@@ -2928,22 +3096,20 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   }, [allConfluenceSignals]);
 
   // Show signals at or above the selected quality threshold, keeping all visible levels
-  const confluenceSignals = useMemo(() => {
-    if (chartRiskLevel === "all") return allConfluenceSignals;
-    const minQ = RISK_QUALITY[chartRiskLevel] ?? 0;
-    return allConfluenceSignals.filter(s => (RISK_QUALITY[s.riskLevel] ?? 0) >= minQ);
-  }, [allConfluenceSignals, chartRiskLevel]);
+  // Every signal is a single "safe" tier now — no risk categories, so no tier filtering.
+  const confluenceSignals = useMemo(() => allConfluenceSignals, [allConfluenceSignals]);
 
   // ── Signal persistence: load from DB into state so allConfluenceSignals can depend on it ──
   // DB values are the permanent truth — they always win over freshly computed c.close locks.
   useEffect(() => {
     // Clear stale locks from the previous symbol/interval immediately
     lockedSignalLevelsRef.current.clear();
+    lockedSignalTierRef.current.clear(); // TIER LOCK: reset frozen risk factors on symbol/interval switch
     beTriggeredRef.current.clear();
     setDbSignalHistory(new Map());
     fetch(`/api/signals/history/${encodeURIComponent(selectedSymbol)}/${interval}`)
       .then(r => r.json())
-      .then((data: { signals?: Array<{ timestamp: number; direction: string; entry: number; tp1: number; tp2: number; sl: number }> }) => {
+      .then((data: { signals?: Array<{ timestamp: number; direction: string; entry: number; tp1: number; tp2: number; sl: number; riskLevel?: string; confirmations?: string; footprintReading?: string }> }) => {
         if (!data.signals?.length) return;
         const newMap = new Map<string, LockVal>();
         for (const s of data.signals) {
@@ -2952,6 +3118,15 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           newMap.set(`${s.timestamp}_${s.direction}`, val);
           newMap.set(`${s.timestamp}_Pure${s.direction}`, val);
           newMap.set(`${s.timestamp}_Side${s.direction}`, val);
+          // TIER LOCK: restore the risk factor the PC locked when the signal first fired, so a
+          // reload re-uses the SAME tier instead of re-deriving (and possibly flickering) it.
+          if (s.riskLevel === "safeplus" || s.riskLevel === "safe" || s.riskLevel === "risky" || s.riskLevel === "riskiest") {
+            let conf: LockTier["confirmations"] = { milkOk: false, vecOk: false, secondaryVecOk: false };
+            try { if (s.confirmations) conf = { ...conf, ...JSON.parse(s.confirmations) }; } catch { /* keep default */ }
+            lockedSignalTierRef.current.set(`${s.timestamp}_${s.direction}`, {
+              riskLevel: s.riskLevel, confirmations: conf, footprintReading: s.footprintReading,
+            });
+          }
         }
         // Also sync into lockedSignalLevelsRef so in-session locking stays consistent
         newMap.forEach((val, key) => lockedSignalLevelsRef.current.set(key, val));
@@ -2961,13 +3136,19 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       .catch(() => {});
   }, [selectedSymbol, interval]);
 
-  // ── Persist newly computed signals to DB (debounced, only completed signals) ──
+  // ── Persist newly computed signals to DB ─────────────────────────────────────
+  // Signals are written in TWO passes:
+  //   1. On first fire (outcome="open") — terminal sees the signal immediately.
+  //   2. On outcome resolution (win/loss/tp1/tp2) — server upserts to update outcome.
+  // The dedup key includes the outcome so both writes fire; the server handles idempotency.
+  // Previously this skipped outcome="open", meaning live signals never appeared in the
+  // terminal until they had already closed — which is too late.
   const persistedSignalKeysRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!allConfluenceSignals.length) return;
     const toSave = allConfluenceSignals.filter(s => {
-      if (s.outcome === "open") return false; // don't persist live/forming signals
-      const key = `${selectedSymbol}_${interval}_${s.time}_${s.direction}`;
+      // Key includes outcome so a signal is persisted both when first open AND when it closes.
+      const key = `${selectedSymbol}_${interval}_${s.time}_${s.direction}_${s.outcome ?? "open"}`;
       if (persistedSignalKeysRef.current.has(key)) return false;
       persistedSignalKeysRef.current.add(key);
       return true;
@@ -2988,7 +3169,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           tp2: s.tp2,
           sl: s.sl,
           outcome: s.outcome,
+          signalType: s.signalType, // e.g. "vector-side-entry" — keeps the source visible on iPhone
           footprintReading: s.footprintReading, // FOOTPRINT-TIER:
+          confirmations: JSON.stringify(s.confirmations), // PARITY: iPhone chip breakdown
         })),
       }),
     }).catch(() => {});
@@ -3052,9 +3235,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; time: number;
       riskLevel?: string; confidence?: number;
       confirmations?: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
-      footprintReading?: string;
+      footprintReading?: string; signalType?: string;
     },
     ivLabel: string,
+    autoTradeEligible = true,
   ) => {
     // Build human-readable score breakdown from confirmation fields
     const parts: string[] = [];
@@ -3085,6 +3269,37 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       // Re-seed into lockedSignalLevelsRef so any immediate recompute also uses the frozen values
       lockedSignalLevelsRef.current.set(vSigKey, frozen);
     }, 3000);
+
+    // Discord alert — fire ONLY after the signal survives 3s (a REAL fired signal). Firing
+    // immediately spammed Discord for forming-bar signals that vanish as the bar updates. Uses a
+    // standalone per-signal timer (NOT the shared verify ref) so concurrent Long+Short both alert,
+    // and a one-shot guard so a tier upgrade on the same bar doesn't double-send.
+    if (discordWebhookRef.current && !discordSentRef.current.has(vSigKey)) {
+      setTimeout(() => {
+        if (!latestSignalsRef.current.has(vSigKey)) return;     // vanished — transient noise, no alert
+        if (discordSentRef.current.has(vSigKey)) return;        // already alerted this bar+direction
+        discordSentRef.current.add(vSigKey);
+        if (discordSentRef.current.size > 500) discordSentRef.current.clear(); // bound memory
+        const lv = permanentSignalLevelsRef.current.get(vSigKey)
+          ?? lockedSignalLevelsRef.current.get(vSigKey)
+          ?? { price: sig.price, tp1: sig.tp1, tp2: sig.tp2, sl: sig.sl };
+        fetch("/api/discord/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: selectedSymbol,
+            direction: sig.direction,
+            interval: ivLabel,
+            riskLevel: sig.riskLevel ?? "unknown",
+            confidence: sig.confidence ?? 0,
+            scoreLabel,
+            price: lv.price, tp1: lv.tp1, tp2: lv.tp2, sl: lv.sl,
+          }),
+        }).then(r => {
+          if (!r.ok) r.json().then(d => console.warn("[Discord] Send failed:", d.error)).catch(() => {});
+        }).catch(e => console.warn("[Discord] Network error:", e));
+      }, 3000);
+    }
 
     const tierLabel = sig.riskLevel === "safeplus" ? "SAFE+" : (sig.riskLevel ?? "").toUpperCase();
     if (typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
@@ -3127,12 +3342,20 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     // Auto-trade execution — only when enabled + passes filters.
     // Signal must remain confirmed for 3 seconds before the order is sent.
     // If it disappears within that window (transient tick noise), the order is cancelled.
+    // autoTradeEligible=false for background signals (computeBgSignals) — they do NOT
+    // persist to DB and would fire trades with no visible signal dot on the chart.
+    if (!autoTradeEligible) {
+      console.log(`[auto-trade] BG SIGNAL — not eligible for auto-trade (no DB entry): ${sig.direction} ${ivLabel} @ ${sig.price}`);
+    }
     if (!autoTradeEnabledRef.current) {
       console.log(`[auto-trade] DISABLED — signal missed: ${sig.direction} ${ivLabel} @ ${sig.price}`);
     }
-    if (autoTradeEnabledRef.current) {
+    if (autoTradeEligible && autoTradeEnabledRef.current) {
+      // Vector side-entry longs are an explicit, opt-in auto-trade type: they bypass the
+      // safe/safe+ tier gate (per user config) but still honour interval + direction filters.
+      const isSideEntry = sig.signalType === 'vector-side-entry';
       const isPermanentRisk = sig.riskLevel === 'safe' || sig.riskLevel === 'safeplus';
-      const riskOk = isPermanentRisk && autoTradeRiskRef.current.has(sig.riskLevel ?? "");
+      const riskOk = isSideEntry || (isPermanentRisk && autoTradeRiskRef.current.has(sig.riskLevel ?? ""));
       const ivOk   = autoTradeIntervalRef.current.has(ivLabel);
       const dirFilter = autoTradeDirectionRef.current;
       const dirOk  = dirFilter === "both"
@@ -3144,7 +3367,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         autoTradeToastTimer.current = setTimeout(() => setAutoTradeToast(null), 8000);
       };
       if (!riskOk || !ivOk || !dirOk) {
-        showToast(false, `Filtered out (risk=${sig.riskLevel ?? "?"} iv=${ivLabel} dir=${sig.direction}) — check Auto Trade filters`);
+        const reason = !ivOk ? `interval ${ivLabel} not in filter (${[...autoTradeIntervalRef.current].join(",")})` : !riskOk ? `risk level "${sig.riskLevel ?? "?"}" not in filter` : `direction ${sig.direction} blocked by "${autoTradeDirectionRef.current}" filter`;
+        console.warn(`[auto-trade] FILTERED — ${sig.direction} ${ivLabel} @ ${sig.price}: ${reason}`);
+        showToast(false, `Filtered: ${reason}`);
       } else {
         const sigKey = `${sig.time}_${sig.direction}`;
         // Cancel any prior pending order — new signal supersedes it
@@ -3203,28 +3428,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         pendingAutoTradeRef.current = { timer, key: sigKey };
       }
     }
-
-    // Discord alert — only if webhook is configured
-    if (discordWebhookRef.current) {
-      fetch("/api/discord/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          symbol: selectedSymbol,
-          direction: sig.direction,
-          interval: ivLabel,
-          riskLevel: sig.riskLevel ?? "unknown",
-          confidence: sig.confidence ?? 0,
-          scoreLabel,
-          price: sig.price,
-          tp1: sig.tp1,
-          tp2: sig.tp2,
-          sl: sig.sl,
-        }),
-      }).then(r => {
-        if (!r.ok) r.json().then(d => console.warn("[Discord] Send failed:", d.error)).catch(() => {});
-      }).catch(e => console.warn("[Discord] Network error:", e));
-    }
+    // (Discord alert moved into the 3s-verify callback above — only fires for confirmed signals.)
   };
 
   // Risk level rank — higher number = better confirmation. Used to detect zone upgrades.
@@ -3265,7 +3469,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       }
       lastNotifiedRef.current[notifyKey] = latest.time;
       lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
-      fireSignalNotification(latest, ivLabel);
+      // Background signals: notifications/Discord only — NOT auto-trade eligible
+      // (they are not saved to DB and would produce trades with no chart signal dot).
+      fireSignalNotification(latest, ivLabel, false);
     }
   };
 
@@ -3378,6 +3584,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       // Re-read MotiveWave bar files from disk → refresh DB (futures only)
       if (isFutures) {
         await fetch("/api/admin/reload-mw", { method: "POST" }).catch(() => {});
+        // Also kick off a Yahoo Finance historical backfill in the background.
+        // ON CONFLICT DO NOTHING so MW relay data is never overwritten.
+        fetch("/api/data/yahoo-backfill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: selectedSymbol }),
+        }).catch(() => {});
       }
       // Refetch all candle + day data from DB. Await completion before touching anything else.
       // (Clearing liveCandles BEFORE this would blank the chart during the refetch.)
@@ -3526,32 +3739,19 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       // Today's RTH open: 9:30 AM ET on the current ET calendar date.
       const todayRthOpen = etToUtc(etYear, etMonth, etDay, 9, 30);
 
-      // Today's OVN open: 6:00 PM ET on the PREVIOUS calendar day.
-      // (The OVN that leads into today's RTH: Sunday 6 PM → Monday RTH, Monday 6 PM → Tuesday RTH, etc.)
-      const prevUtc = new Date(Date.UTC(etYear, etMonth - 1, etDay - 1));
-      const todayOvnOpen = etToUtc(prevUtc.getUTCFullYear(), prevUtc.getUTCMonth() + 1, prevUtc.getUTCDate(), 18, 0);
+      const todayRthClose = todayRthOpen + 23400; // +6.5 h = 4:00 PM ET RTH close (one session)
 
-      const todayRthSettle = todayRthOpen + 25200; // +7 h = 4:30 PM ET (CME settle)
-
-      // Pick session start based on zone scope/label.
-      // OVN zones (overnight levels) start at yesterday's 6 PM ET.
-      // RTH zones (intraday levels) start at today's 9:30 AM ET.
-      function zoneFromTime(z: { label?: string; zoneScope?: "ovn" | "rth" }): number {
-        if (z.zoneScope === "ovn") return todayOvnOpen;
-        if (z.zoneScope === "rth") return todayRthOpen;
-        const l = (z.label ?? "").toLowerCase();
-        if (/ovn|overnight|max[\s_]?range|iv[\s_]?wall|iv[\s_]?overflow|splice|weekly|mon[\s_]?fri|buyers?[\s_]?soft|sellers?[\s_]?soft|secondary[\s_]?pivot|avg[\s_]?range|normal[\s_]?range|support.*bottom|top.*ave|session[\s_]?cap|gex[\s_]?wall|gex[\s_]?flip|splice[\s_]?band|spy[\s_]?(ceiling|floor)|\bceiling\b|\bfloor\b|max[\s_]?for[\s_]?day|min[\s_]?for[\s_]?day|apex|e[\s_]?vector|s[\s_]?vector|options?[\s_]?ledge|pivot[\s_]?macro|ultimate[\s_]?target|soft[\s_]?target/i.test(l))
-          return todayOvnOpen;
-        return todayRthOpen;
-      }
-
+      // RULE (user): a milk zone is valid for ONE RTH session only — never the overnight or
+      // multiple days. Every uploaded zone is time-bounded to today's RTH session (9:30 AM ET
+      // open → 4:00 PM ET close) so it charts at the correct time and never extends farther
+      // than a single session.
       const zoneBands: ZoneBand[] = displayZones.map(z => ({
         topPrice:    z.topPrice,
         bottomPrice: z.bottomPrice,
         color:       z.fillColor,
         label:       z.label,
-        fromTime:    zoneFromTime(z),
-        toTime:      todayRthSettle,
+        fromTime:    todayRthOpen,
+        toTime:      todayRthClose,
       }));
 
       setUploadedZones([]);
@@ -3602,8 +3802,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       {/* ── Top toolbar ───────────────────────────────────────────────── */}
       <header
         className="flex items-center gap-2 px-3 flex-shrink-0"
-        style={{ height: 44, background: MW.toolbar, borderBottom: `1px solid ${MW.border}` }}
+        style={{ height: 44, position: "relative", background: "linear-gradient(180deg, #0d1a30 0%, #0a1322 100%)", borderBottom: `1px solid ${MW.border}`, boxShadow: "0 8px 24px -16px rgba(47,155,255,0.55)" }}
       >
+        {/* Animated flowing accent line beneath the toolbar */}
+        <div className="mg-accent-bar" style={{ position: "absolute", left: 0, right: 0, bottom: 0, pointerEvents: "none" }} />
 
         {/* Symbol selector */}
         <div className="relative" ref={symbolDropdownRef}>
@@ -3617,7 +3819,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             }}
             onClick={() => { setSymbolDropdownOpen(o => !o); setSymbolSearch(""); }}
           >
-            <span style={{ color: MW.accent }}>{selectedSymbol}</span>
+            <span className="mg-accent-text" style={{ fontWeight: 800, letterSpacing: 0.3 }}>{selectedSymbol}</span>
             <span style={{ color: MW.muted, fontWeight: 400, fontSize: 11, maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {selectedName}
             </span>
@@ -3820,23 +4022,8 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           Footprint
         </button>
 
-        {/* Signal quality threshold — controls minimum risk level shown on chart */}
-        <select
-          value={chartRiskLevel}
-          onChange={e => setChartRiskLevel(e.target.value as "safe" | "risky" | "riskiest" | "all")}
-          title="Minimum signal quality to show on chart (All = every signal with risk label on click)"
-          style={{
-            height: 28, padding: "0 8px", fontSize: 11, borderRadius: 4, cursor: "pointer",
-            background: chartRiskLevel === "safe" ? "rgba(38,200,122,0.12)" : chartRiskLevel === "risky" ? "rgba(245,158,11,0.12)" : chartRiskLevel === "riskiest" ? "rgba(239,68,68,0.12)" : "rgba(148,163,184,0.12)",
-            color:      chartRiskLevel === "safe" ? "#26c87a"               : chartRiskLevel === "risky" ? "#f59e0b"               : chartRiskLevel === "riskiest" ? "#ef4444"               : "#94a3b8",
-            border: `1px solid ${chartRiskLevel === "safe" ? "rgba(38,200,122,0.4)" : chartRiskLevel === "risky" ? "rgba(245,158,11,0.4)" : chartRiskLevel === "riskiest" ? "rgba(239,68,68,0.4)" : "rgba(148,163,184,0.4)"}`,
-          }}
-        >
-          <option value="safe">Safe</option>
-          <option value="risky">Risky</option>
-          <option value="riskiest">Riskiest</option>
-          <option value="all">All Signals</option>
-        </select>
+        {/* Risk-level dropdown removed — there are no signal categories anymore. Every signal
+            is a single "safe" tier, so there is nothing to filter by. */}
 
         {/* Zone upload */}
         <input
@@ -3932,13 +4119,14 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         <Select value={String(windowSize)} onValueChange={v => handleWindowSizeChange(Number(v))}>
           <SelectTrigger
             className="h-7 border-0 focus:ring-0 text-xs"
-            style={{ background: MW.panel, border: `1px solid ${MW.border}`, color: MW.muted, width: 68 }}
+            style={{ background: MW.panel, border: `1px solid ${MW.border}`, color: MW.muted, width: 72 }}
             data-testid="select-window-size"
           >
             <SelectValue />
           </SelectTrigger>
           <SelectContent style={{ background: MW.panel, border: `1px solid ${MW.border}`, color: MW.text }}>
-            {[5,10,20,40,60,120].map(n => <SelectItem key={n} value={String(n)}>{n}d</SelectItem>)}
+            {[20,40,60,90,180,365,730].map(n => <SelectItem key={n} value={String(n)}>{n}d</SelectItem>)}
+            <SelectItem value="9999">ALL</SelectItem>
           </SelectContent>
         </Select>
 
@@ -4002,13 +4190,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         {/* ── Signals panel overlay ───────────────────────────────────── */}
         {showSignalsPanel && (
           <div
-            className="absolute right-0 top-0 bottom-0 z-50 flex flex-col"
-            style={{ width: "min(760px, 88vw)", background: "#05080d", borderLeft: "1px solid #1a2535", boxShadow: "-6px 0 24px rgba(0,0,0,0.5)" }}
+            className="absolute right-0 top-0 bottom-0 z-50 flex flex-col mg-fade-in"
+            style={{ width: "min(760px, 88vw)", background: MW.bg, borderLeft: `1px solid ${MW.border}`, boxShadow: "-12px 0 40px -12px rgba(0,0,0,0.6), -1px 0 0 0 rgba(47,155,255,0.18)" }}
           >
             <SignalsPanel
               defaultSymbol={selectedSymbol}
               defaultInterval={interval}
-              defaultRiskLevel={chartRiskLevel}
+              defaultRiskLevel="all"
               externalSignals={allConfluenceSignals as ExternalSignal[]}
               milkZones={activeZones}
               allCandles={candleData?.candles}
@@ -4209,6 +4397,24 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                   style={{ width: 38, height: 22, borderRadius: 11, border: "none", cursor: "pointer", background: useZoneTargets ? "#a855f7" : "#2a3a4a", position: "relative", flexShrink: 0, transition: "background 0.2s" }}
                 >
                   <span style={{ position: "absolute", top: 3, left: useZoneTargets ? 18 : 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+                </button>
+              </div>
+
+              {/* Take every side entry as a Long (vector exit) toggle */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", marginTop: 6, borderRadius: 5, background: takeSideEntries ? "#26a69a12" : "rgba(255,255,255,0.02)", border: `1px solid ${takeSideEntries ? "#26a69a55" : MW.border}` }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: takeSideEntries ? "#26a69a" : MW.text }}>Side-Entry Longs</div>
+                  <div style={{ fontSize: 9, color: MW.muted, marginTop: 2 }}>
+                    {takeSideEntries
+                      ? "Every vector side entry fires a Long (vector exit: stop −3.5, TP +7.5/+26) · auto-trade eligible"
+                      : "Take every vector side entry as a Long with the vector's exit strategy"}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setTakeSideEntries(v => !v)}
+                  style={{ width: 38, height: 22, borderRadius: 11, border: "none", cursor: "pointer", background: takeSideEntries ? "#26a69a" : "#2a3a4a", position: "relative", flexShrink: 0, transition: "background 0.2s" }}
+                >
+                  <span style={{ position: "absolute", top: 3, left: takeSideEntries ? 18 : 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
                 </button>
               </div>
             </div>
@@ -5171,14 +5377,16 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                   : "linear-gradient(135deg,rgba(40,8,8,0.97),rgba(20,4,4,0.97))";
               return (
                 <div
+                  className="mg-lift"
                   style={{
                     position: "absolute", top: 50, right: 12, zIndex: 50,
                     background: bgGrad,
                     border: `1.5px solid ${borderColor}`,
-                    borderRadius: 8, padding: "14px 18px", minWidth: 240,
-                    boxShadow: `0 0 24px ${glowColor}`,
+                    borderRadius: 10, padding: "14px 18px", minWidth: 240,
+                    boxShadow: `0 0 30px ${glowColor}, 0 18px 44px -22px rgba(0,0,0,0.75)`,
+                    backdropFilter: "blur(8px)", WebkitBackdropFilter: "blur(8px)",
                     fontFamily: "'Trebuchet MS', monospace",
-                    animation: "fadeInRight 0.25s ease",
+                    animation: "fadeInRight 0.34s cubic-bezier(.2,.8,.2,1)",
                   }}
                 >
                   {/* Header */}
@@ -5813,9 +6021,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
             {/* Loading overlay — shown on top of chart while data loads */}
             {(daysLoading || (candlesLoading && windowedCandles.length === 0)) && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(5,8,13,0.75)", zIndex: 5 }}>
+              <div className="mg-backdrop mg-fade-in" style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(6,11,20,0.72)", zIndex: 5 }}>
                 <div className="flex flex-col items-center gap-3" style={{ color: MW.muted }}>
-                  <div className="w-6 h-6 border-2 rounded-full animate-spin" style={{ borderColor: `${MW.accent} transparent transparent transparent` }} />
+                  <div className="w-7 h-7 border-2 rounded-full animate-spin" style={{ borderColor: `${MW.accent} transparent transparent transparent`, boxShadow: `0 0 18px -4px ${MW.glow}` }} />
                   <span className="text-sm">{daysLoading ? "Loading..." : "Loading candles..."}</span>
                 </div>
               </div>
@@ -6079,9 +6287,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     )}
     {/* ── Zone paste modal ─────────────────────────────────────────────── */}
     {showZonePaste && (
-      <div style={{ position: "fixed", inset: 0, zIndex: 10000, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.65)" }}
+      <div className="mg-backdrop mg-fade-in" style={{ position: "fixed", inset: 0, zIndex: 10000, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(3,7,14,0.66)" }}
         onClick={e => { if (e.target === e.currentTarget) setShowZonePaste(false); }}>
-        <div style={{ background: "#090d14", border: "1px solid #1a2535", borderRadius: 10, padding: 20, width: 520, maxWidth: "90vw", boxShadow: "0 8px 40px rgba(0,0,0,0.7)" }}>
+        <div className="mg-pop-in" style={{ background: MW.panel, border: `1px solid ${MW.border}`, borderRadius: 12, padding: 20, width: 520, maxWidth: "90vw", boxShadow: "0 0 0 1px rgba(47,155,255,0.12), 0 24px 60px -24px rgba(0,0,0,0.8), 0 0 40px -16px rgba(47,155,255,0.4)" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
             <div>
               <div style={{ fontSize: 13, fontWeight: 700, color: "#c8d8e8" }}>Paste Milk's Pre-Market Zones</div>

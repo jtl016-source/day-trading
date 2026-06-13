@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.*;
 @StudyHeader(
   namespace      = "com.custom",
   id             = "AUTO_TRADER",
-  name           = "Auto Trader",
+  name           = "AutoTrader",
   label          = "AutoTrader",
   desc           = "Receives order commands from Milks Yellow Box app and places bracket orders via MotiveWave",
   overlay        = true,
@@ -56,6 +56,15 @@ public class AutoTrader extends Study {
   private volatile boolean      trailerArmed       = false; // true once price crossed tp1Activation
   private volatile double       trailPeak          = 0;     // highest (long) or lowest (short) since arming
   private volatile boolean      nativeTrailActive  = false; // true if MW trailing stop order was submitted
+
+  // ── OCO bracket state — identifies exit fills by price so the sibling can be cancelled ──
+  // Set in submitBracket(), read in onOrderFilled(). Order IDs change after submission, so we
+  // match the filled order by its stop/limit PRICE (stable) instead.
+  private volatile double  bracketStopPrice = 0;
+  private volatile double  bracketTp1Price  = 0;
+  private volatile double  bracketTp2Price  = 0;
+  private volatile boolean bracketTp1Only   = false;
+  private volatile boolean bracketActive    = false; // true while a non-trailer bracket is live
 
   private static void logFile(String msg) {
     try {
@@ -175,11 +184,61 @@ public class AutoTrader extends Study {
   public void onPositionClosed(OrderContext ctx) {
     logFile("onPositionClosed — cancelling remaining orders, staying active for next signal");
     cancelAllOrders(ctx);   // cancel TP1/TP2 limits that may still be open after SL fills
+    bracketActive = false;
     pendingTrade.set(null);
     resetTrailerState();
     sendMsg("{\"type\":\"position_closed\"}");
     // Do NOT deactivate — strategy stays live so it can receive the next order_command
     // without requiring a manual reload of the study in MotiveWave.
+  }
+
+  /**
+   * OCO enforcement. MotiveWave's SDK cannot create a native OCO bracket (Order has no
+   * link/group method), so we link the legs here: when one exit fills, cancel its sibling.
+   *   - Stop fills            → cancel the remaining TP limit(s)            (position is flat)
+   *   - Final TP fills        → cancel the stop                            (position is flat)
+   *       (final = TP1 in tp1Only mode, else TP2)
+   *   - TP1 fills in 2-TP mode → partial close; leave the stop to protect the runner
+   * Orders are matched by price because the broker reassigns order IDs after submission.
+   */
+  @Override
+  public void onOrderFilled(OrderContext ctx, Order order) {
+    if (!bracketActive) return;
+    try {
+      double stopP = readOrderDouble(order, "getStopPrice");
+      double limP  = readOrderDouble(order, "getLimitPrice");
+      boolean isStopFill = stopP > 0 && Math.abs(stopP - bracketStopPrice) < 0.125;
+      boolean isLimFill  = limP > 0;
+
+      if (isStopFill) {
+        logFile(String.format("OCO: STOP filled @ %.2f → cancelling TP order(s)", stopP));
+        cancelAllOrders(ctx);
+        bracketActive = false;
+      } else if (isLimFill) {
+        boolean isFinalTp = bracketTp1Only
+          ? Math.abs(limP - bracketTp1Price) < 0.125
+          : Math.abs(limP - bracketTp2Price) < 0.125;
+        if (isFinalTp) {
+          logFile(String.format("OCO: final TP filled @ %.2f → cancelling stop", limP));
+          cancelAllOrders(ctx);
+          bracketActive = false;
+        } else {
+          logFile(String.format("OCO: partial TP1 filled @ %.2f → stop stays for runner", limP));
+        }
+      }
+    } catch (Exception e) {
+      logFile("onOrderFilled OCO error: " + e.getMessage());
+    }
+  }
+
+  /** Reflection read of a no-arg double getter on an Order (getStopPrice / getLimitPrice). */
+  private static double readOrderDouble(Object order, String method) {
+    try {
+      java.lang.reflect.Method m = order.getClass().getMethod(method);
+      Object v = m.invoke(order);
+      if (v instanceof Number) return ((Number) v).doubleValue();
+    } catch (Exception ignored) {}
+    return 0;
   }
 
   @Override
@@ -394,6 +453,26 @@ public class AutoTrader extends Study {
 
     // Build order list — useTrailer skips TP1/TP2 limits (trailing logic fires in onBarUpdate).
     // tp1Only puts all contracts at TP1; otherwise split half/half at TP1 and TP2.
+    //
+    // OCO BRACKET: stop and the FINAL exit are linked as OCO so hitting the target automatically
+    // cancels the stop (and vice versa), preventing the stop from triggering a phantom reversal
+    // after the position has already been closed by a TP fill.
+    //   tp1Only: stop(full) <-> tp1(full)  — true single bracket
+    //   standard: stop(full) <-> tp2(final exit) — stop is OCO with the last exit.
+    //             TP1 is a standalone partial fill; Rithmic/Apex automatically shrink the stop
+    //             quantity to match remaining position when TP1 partially closes the trade.
+    // ── OCO bracket tracking ──────────────────────────────────────────────────
+    // MotiveWave's SDK has NO native OCO/bracket creation — Order has no link/group
+    // method (confirmed by reflection: only getStopPrice/getLimitPrice/cancel exist).
+    // So OCO is enforced in onOrderFilled(): when an exit fills, the sibling is cancelled.
+    // We identify the filled order by its STOP price vs LIMIT price (stable; order IDs
+    // change after submission so they can't be matched).
+    bracketStopPrice = sl;
+    bracketTp1Price  = tp1;
+    bracketTp2Price  = tp2;
+    bracketTp1Only   = tp1Only;
+    bracketActive    = !useTrailer; // trailer manages its own exit in onBarUpdate
+
     java.util.List<Object> orders = new java.util.ArrayList<>();
     orders.add(entryOrder);
     orders.add(stopOrder);
@@ -406,7 +485,7 @@ public class AutoTrader extends Study {
       Object lmAll = toNum(limitP[2], qty);
       Object tp1OrderFull = mkLimit.invoke(ctx, exitAction, gtc, lmAll, tp1Arg);
       orders.add(tp1OrderFull);
-      logFile(String.format("submitOrders tp1Only: %s entry=%.2f tp1=%.2f sl=%.2f qty=%d",
+      logFile(String.format("submitOrders tp1Only (OCO via onOrderFilled): %s entry=%.2f tp1=%.2f sl=%.2f qty=%d",
         isLong ? "LONG" : "SHORT", entry, tp1, sl, qty));
     } else {
       int half = Math.max(1, qty / 2);
@@ -418,7 +497,7 @@ public class AutoTrader extends Study {
       Object tp2Order = mkLimit.invoke(ctx, exitAction, gtc, lmRest, tp2Arg);
       orders.add(tp1Order);
       orders.add(tp2Order);
-      logFile(String.format("submitOrders: %s entry=%.2f tp1=%.2f tp2=%.2f sl=%.2f qty=%d",
+      logFile(String.format("submitOrders 2-TP (OCO via onOrderFilled): %s entry=%.2f tp1=%.2f tp2=%.2f sl=%.2f qty=%d",
         isLong ? "LONG" : "SHORT", entry, tp1, tp2, sl, qty));
     }
 

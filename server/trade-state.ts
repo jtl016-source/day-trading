@@ -52,7 +52,7 @@ export const tradeSettings: AutoTradeSettings = {
   direction: 'both',
   contractType: 'MES',
   riskLevels: ['safe'],
-  intervals: ['5m'],
+  intervals: ['1m', '5m', '15m', '60m'],
   exitStrategy: 'standard',
 };
 

@@ -70,6 +70,17 @@ let mwSyncSymbol = "";
 let mwSyncBarsReceived = 0;
 let mwSyncStartedAt: number | null = null;
 
+// Highest bar timestamp already persisted per `${symbol}:${resolution}`. The MW study
+// re-dumps its ENTIRE history on every (re)connect, and it reconnects constantly — without
+// this guard the server re-writes 80k+ bars per dump in a tight loop, blocking the
+// synchronous SQLite event loop and making every HTTP request crawl (the root cause of the
+// chart never loading). We only persist bars NEWER than the highest already seen, so the
+// first dump writes everything and subsequent re-dumps of old bars become cheap no-ops.
+const lastDumpMaxTs = new Map<string, number>();
+
+// Throttle "bar without resolution" warnings — the study emits a forming bar every tick.
+const noResWarnAt = new Map<string, number>();
+
 export function getMWSyncStatus() {
   return { status: mwSyncStatus, symbol: mwSyncSymbol, barsReceived: mwSyncBarsReceived, startedAt: mwSyncStartedAt };
 }
@@ -235,8 +246,16 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           // timestamp: a 1m bar whose start lands on a 5m/60m boundary would be mislabeled,
           // corrupting higher-TF charts and leaving gaps on the 1m chart.
           const res = ((msg as any).resolution as string | undefined)?.replace("m", "") ?? "5";
+          // Throttle this warning to once per 30s per symbol — the study sends a forming bar
+          // without resolution on every tick, which otherwise floods the log (GBs/hour) and
+          // wastes I/O. One warning is enough to surface the condition.
           if (!(msg as any).resolution) {
-            console.warn(`[mw-feed] bar without resolution for ${bar.symbol} t=${bar.time} — defaulting to 5m (study should always send resolution)`);
+            const wkey = `nores:${bar.symbol}`;
+            const nowMs = Date.now();
+            if (nowMs - (noResWarnAt.get(wkey) ?? 0) > 30_000) {
+              noResWarnAt.set(wkey, nowMs);
+              console.warn(`[mw-feed] bar without resolution for ${bar.symbol} t=${bar.time} — defaulting to 5m (study should always send resolution)`);
+            }
           }
 
           // CATCH-UP CANDLE FIX: validate individual live bars before broadcasting/persisting.
@@ -282,6 +301,31 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           const res = rawRes.replace("m", "");
           const bars = bulk.bars as Array<{ t: number; o: number; h: number; l: number; c: number; v: number }> | undefined;
           if (!sym || !Array.isArray(bars) || bars.length === 0) return;
+
+          // ── Fast re-dump rejection (BEFORE expensive validation) ─────────────────────
+          // The study re-dumps its full history constantly. Compute the batch's newest
+          // timestamp cheaply; if we already have everything up to it, drop the batch
+          // immediately — no normalization, no per-bar spike/anomaly filtering, no DB write.
+          // This keeps the event loop free for HTTP requests (chart loads). The high-water
+          // mark is seeded lazily from the DB so even the first post-restart dump is skipped.
+          {
+            const dumpKey = `${sym}:${res}`;
+            if (!lastDumpMaxTs.has(dumpKey)) {
+              let dbMax = 0;
+              try {
+                const row = db.$client.prepare(
+                  `SELECT MAX(timestamp) AS mx FROM cached_candles WHERE symbol = ? AND resolution = ?`
+                ).get(sym, res) as { mx: number | null } | undefined;
+                dbMax = row?.mx ?? 0;
+              } catch { /* DB unavailable — treat as 0 so we persist normally */ }
+              lastDumpMaxTs.set(dumpKey, dbMax);
+            }
+            const wm = lastDumpMaxTs.get(dumpKey) ?? 0;
+            // Cheap scan for the batch's max timestamp (handles ms or s without allocating).
+            let rawMax = 0;
+            for (const b of bars) { const t = b.t > 10_000_000_000 ? Math.floor(b.t / 1000) : b.t; if (t > rawMax) rawMax = t; }
+            if (rawMax <= wm) return; // pure re-dump of known history — drop instantly
+          }
 
           // Normalize timestamps: MW may send ms (13-digit) or s (10-digit) — always store as seconds.
           const normalizedBars = bars.map(b => ({
@@ -332,12 +376,36 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           const bodySkipped = sortedBatch.length - cleanBars.length;
           if (bodySkipped > 0) console.log(`[mw-feed] bulk_bars: rejected ${bodySkipped} body-anomaly bars for ${sym} res=${res}`);
 
+          // ── Re-dump guard: only persist bars NEWER than the high-water mark ──────────
+          // The study re-dumps its full history on every reconnect (constantly). Persist
+          // only bars we don't already have, so repeated dumps become near-instant no-ops
+          // instead of re-writing 80k rows and starving the event loop. Initialize the
+          // high-water mark lazily from the DB so even the first dump after a restart skips
+          // already-stored bars (no startup flood).
+          const dumpKey = `${sym}:${res}`;
+          if (!lastDumpMaxTs.has(dumpKey)) {
+            let dbMax = 0;
+            try {
+              const row = db.$client.prepare(
+                `SELECT MAX(timestamp) AS mx FROM cached_candles WHERE symbol = ? AND resolution = ?`
+              ).get(sym, res) as { mx: number | null } | undefined;
+              dbMax = row?.mx ?? 0;
+            } catch { /* DB unavailable — treat as 0 so we persist normally */ }
+            lastDumpMaxTs.set(dumpKey, dbMax);
+          }
+          const watermark = lastDumpMaxTs.get(dumpKey) ?? 0;
+          const newBars = cleanBars.filter(b => b.t > watermark);
+          // Advance the high-water mark to the newest bar seen in this batch.
+          const batchMax = cleanBars.reduce((m, b) => (b.t > m ? b.t : m), watermark);
+          if (batchMax > watermark) lastDumpMaxTs.set(dumpKey, batchMax);
+          if (newBars.length === 0) return; // pure re-dump of known history — skip entirely
+
           // Track sync state
           if (mwSyncStatus === "pending") { mwSyncStatus = "syncing"; mwSyncStartedAt = Date.now(); }
           mwSyncSymbol = sym;
-          mwSyncBarsReceived += cleanBars.length;
+          mwSyncBarsReceived += newBars.length;
           broadcast({ type: "mw_sync_progress", symbol: sym, barsReceived: mwSyncBarsReceived });
-          persistBulk(sym, res, cleanBars)
+          persistBulk(sym, res, newBars)
             .then(() => {
               mwSyncStatus = "done";
               broadcast({ type: "data_updated", symbol: sym });

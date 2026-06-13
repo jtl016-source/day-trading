@@ -98,7 +98,7 @@ function isRTH(ts: number): boolean {
   const day = d.getUTCDay();
   if (day === 0 || day === 6) return false;
   const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return mins >= 13 * 60 + 30 && mins < 20 * 60; // 9:30 AM – 4:00 PM ET
+  return mins >= 13 * 60 + 30 && mins < 21 * 60; // 9:30 AM – 5:00 PM ET (EDT)
 }
 
 function buildMilkZoneSets(candles: CandleBar[]): { bull: Set<number>; bear: Set<number> } {
@@ -653,23 +653,13 @@ export default function TimestampsPage() {
     if (!candles.length) return null;
     const sorted = [...candles].sort((a, b) => a.time - b.time);
     const vecMap = computeVectorLine(sorted);
-    // Build milkBull/milkBear from detectMilkZones — same logic as market.tsx allConfluenceSignals
-    const milkZones = detectMilkZones(sorted, 0, 0);
+    // RULE (user): milk zones only count when uploaded via PNG. This page has no PNG-upload
+    // mechanism, so there are no milk zones here — NEVER synthesize them from candle price
+    // action (detectMilkZones). milkBull/milkBear stay empty so no signal reasoning claims
+    // milk-zone confluence without an actual upload.
+    const milkZones: ZoneBand[] = [];
     const milkBull = new Set<number>();
     const milkBear = new Set<number>();
-    for (const z of milkZones) {
-      if (!z.fromTime || !z.toTime) continue;
-      const lbl = (z.label ?? "").toLowerCase();
-      const isBull = lbl === "imbalance" || lbl === "absorption" || lbl === "structural support";
-      const isBear = lbl === "resist imbalance" || lbl === "resistive" || lbl === "structural resist";
-      for (const c of sorted) {
-        if (c.time > z.toTime) break;
-        if (c.time >= z.fromTime) {
-          if (isBull) milkBull.add(c.time);
-          if (isBear) milkBear.add(c.time);
-        }
-      }
-    }
     return { sorted, vecMap, milkBull, milkBear, milkZones };
   }, [candles]);
 

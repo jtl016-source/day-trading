@@ -3,18 +3,21 @@ import { type CandleBar, type ZoneBand } from "@/components/CandlestickChart";
 // ── Constants ─────────────────────────────────────────────────────────────────
 export const VEC_LENGTH = 20;
 
-// ── MW color tokens (MotiveWave dark theme — canonical source of truth) ───────
+// ── MW color tokens (Midnight Glow theme — canonical source of truth) ─────────
+// Deep navy + electric-blue glow. Used by all secondary pages' chrome.
 export const MW = {
-  bg:        "#05080d",
-  panel:     "#090d14",
-  toolbar:   "#0b1018",
-  border:    "#111a26",
-  text:      "#b8c8d8",
-  muted:     "#4a6080",
-  accent:    "#1a72d4",
-  accentHov: "#2080e8",
+  bg:        "#060b14",
+  panel:     "#0a1322",
+  toolbar:   "#0b1626",
+  border:    "#18293f",
+  text:      "#cdd9ea",
+  muted:     "#647fa6",
+  accent:    "#2f9bff",
+  accentHov: "#54b3ff",
+  accent2:   "#38e0ff",
+  glow:      "rgba(47,155,255,0.45)",
   up:        "#2196f3",
-  down:      "#c62828",
+  down:      "#ef4444",
 };
 
 // ── DST-safe RTH helpers ──────────────────────────────────────────────────────
@@ -26,7 +29,7 @@ const _nyDayFmt = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", weekday: "short",
 });
 
-/** Returns true if the Unix timestamp (seconds) falls within RTH: Mon–Fri, 9:30am–4:00pm ET.
+/** Returns true if the Unix timestamp (seconds) falls within RTH: Mon–Fri, 9:30am–5:00pm ET.
  *  Uses Intl.DateTimeFormat for correct DST handling (EDT = UTC-4, EST = UTC-5). */
 export function isRTH(timestampSec: number): boolean {
   const d = new Date(timestampSec * 1000);
@@ -35,7 +38,7 @@ export function isRTH(timestampSec: number): boolean {
   const et = _nyTimeFmt.format(d);
   const col = et.indexOf(":");
   const etMins = parseInt(et.slice(0, col)) * 60 + parseInt(et.slice(col + 1));
-  return etMins >= 9 * 60 + 30 && etMins < 16 * 60;
+  return etMins >= 9 * 60 + 30 && etMins < 17 * 60; // 9:30 AM – 5:00 PM ET
 }
 
 /** Returns the Unix timestamp of 21:00 UTC (RTH close) on the same calendar day as `ts`. */

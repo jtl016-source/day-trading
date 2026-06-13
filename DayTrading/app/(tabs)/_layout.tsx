@@ -1,75 +1,26 @@
 import { Tabs } from 'expo-router';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import { Trading } from '@/constants/theme';
+import { CustomTabBar } from '@/components/custom-tab-bar';
 
+// 4 primary tabs: Market / Signals / Trade / Settings
+// journal, backtest, autotrader, explore stay routable (href: null) but hidden from the bar.
 export default function TabLayout() {
   return (
     <Tabs
+      tabBar={(props) => <CustomTabBar {...props} />}
       screenOptions={{
         headerShown: false,
-        tabBarStyle: {
-          backgroundColor: Trading.surface,
-          borderTopColor: Trading.border,
-          borderTopWidth: 1,
-          height: 62,
-          paddingBottom: 10,
-          paddingTop: 6,
-        },
-        tabBarActiveTintColor:   Trading.accent,
-        tabBarInactiveTintColor: Trading.muted,
-        tabBarLabelStyle: {
-          fontSize: 10,
-          fontWeight: '600',
-          letterSpacing: 0.5,
-          marginTop: 1,
-        },
+        sceneStyle: { backgroundColor: 'transparent' },
       }}
     >
-      <Tabs.Screen
-        name="index"
-        options={{
-          title: 'Signals',
-          tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="chart.line.uptrend.xyaxis" size={size ?? 22} color={color} />
-          ),
-        }}
-      />
-      <Tabs.Screen
-        name="trade"
-        options={{
-          title: 'Position',
-          tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="arrow.up.arrow.down.circle.fill" size={size ?? 22} color={color} />
-          ),
-        }}
-      />
-      <Tabs.Screen
-        name="journal"
-        options={{
-          title: 'AutoTrader',
-          tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="bolt.fill" size={size ?? 22} color={color} />
-          ),
-        }}
-      />
-      <Tabs.Screen
-        name="settings"
-        options={{
-          title: 'Settings',
-          tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="gearshape.fill" size={size ?? 22} color={color} />
-          ),
-        }}
-      />
-      <Tabs.Screen
-        name="explore"
-        options={{
-          title: 'About',
-          tabBarIcon: ({ color, size }) => (
-            <IconSymbol name="info.circle.fill" size={size ?? 22} color={color} />
-          ),
-        }}
-      />
+      <Tabs.Screen name="index"       options={{ title: 'Market' }} />
+      <Tabs.Screen name="signals"     options={{ title: 'Signals' }} />
+      <Tabs.Screen name="trade"       options={{ title: 'Trade' }} />
+      <Tabs.Screen name="portfolio"   options={{ title: 'Portfolio' }} />
+      <Tabs.Screen name="settings"    options={{ title: 'Settings' }} />
+      <Tabs.Screen name="journal"     options={{ href: null }} />
+      <Tabs.Screen name="backtest"    options={{ href: null }} />
+      <Tabs.Screen name="autotrader"  options={{ href: null }} />
+      <Tabs.Screen name="explore"     options={{ href: null }} />
     </Tabs>
   );
 }

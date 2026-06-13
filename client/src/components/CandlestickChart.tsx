@@ -167,7 +167,7 @@ interface CandlestickChartProps {
     time: number; price: number; direction: "Long" | "Short";
     tp1: number; tp2: number; sl: number; toTime: number;
     riskLevel?: "safeplus" | "safe" | "risky" | "riskiest";
-    signalType?: "confluence" | "trend" | "pure_tabletop" | "side_tabletop";
+    signalType?: string; // "confluence" | "trend" | "pure_tabletop" | "side_tabletop" | "vector-side-entry"
     confirmations?: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
     reclassifyReason?: string;
     /** Side-entry tabletop: the consolidation range that was broken out of */
@@ -1720,117 +1720,77 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           const allAggsFp = [...fpMap.values()]
             .filter(a => a.symbol === "RTH" || a.symbol === "ETH");
 
-          // ── Step 1: Footprint zones — same-bucket imbalance detection ───────
-          // Buy imbalance: ask > bid within the same 2-pt bucket, ratio >= 1.3, net >= 100
-          // Sell imbalance: bid > ask within the same 2-pt bucket, ratio >= 1.3, net >= 100
-          // Stacked = 2+ consecutive same-direction imbalanced buckets (stronger signal)
-          // Single imbalances drawn at reduced opacity; stacked at full opacity.
+          // ── Step 1: Imbalance zones — sized to each stacked imbalance CLUSTER ─
+          // Restored to the pre-UI-change behavior: each zone band spans the cluster's
+          // full price range (cl.startPrice→cl.endPrice) — i.e. the SIZE of the imbalance
+          // as it appears on the ladder — drawn full-width as a support/resistance level.
+          // Rules (applied upstream in market.tsx buildAggregate): a level is imbalanced at
+          // ratio >= 1.3 & net >= 100; a CLUSTER is `stacked` when 2+ consecutive same-side
+          // imbalanced levels — only stacked clusters render as zones.
+          // Current-session zones at full opacity, historical at 28%; historical zones drop
+          // once a later candle CLOSES through the cluster midprice (mitigation).
           {
             const zX1 = cw - 62;
-            const lastCandleT = candlesRef.current.length > 0
-              ? candlesRef.current[candlesRef.current.length - 1].time
-              : Math.floor(Date.now() / 1000);
-            const IMBAL_RATIO = 1.3;
-            const NET_MIN = 100;
-
             if (zX1 > 0) {
               ctx.save();
               ctx.beginPath(); ctx.rect(0, 0, zX1, clipBottom); ctx.clip();
 
-              const sortedFpSess = [...allAggsFp].sort((a, b) => a.time - b.time);
-              const mitigatedSet = mitigatedClustersRef.current;
+              // Pre-sort candles once for the binary-search mitigation check
+              const sortedCans = [...candlesRef.current].sort((a, b) => a.time - b.time);
 
-              for (let si = 0; si < sortedFpSess.length; si++) {
-                const zfp = sortedFpSess[si];
-                if (zfp.time === activeSessionTimeRef.current) continue;
-                if (zfp.levels.length === 0) continue;
-                if (si + 1 >= sortedFpSess.length) continue;
-                const nextSessT = sortedFpSess[si + 1].time;
+              for (const zfp of [...allAggsFp].sort((a, b) => a.time - b.time)) {
+                if (zfp.time === activeSessionTimeRef.current) continue; // active session: ladder only, no zones
+                const xfR2 = ts.timeToCoordinate(zfp.time as any);
+                const isCurZ = xfR2 !== null && (xfR2 as number) >= 0 && (xfR2 as number) <= cw;
+                const aM = isCurZ ? 1.0 : 0.28;
 
-                const xSR = ts.timeToCoordinate(nextSessT as any);
-                const xER = ts.timeToCoordinate(lastCandleT as any);
-                const xS  = xSR !== null ? (xSR as number) : -200;
-                let   xE  = xER !== null ? (xER as number) : cw + 200;
-                if (xE < 0 || xS > zX1) continue;
-                const xL = Math.max(0,   xS);
-                const xR = Math.min(zX1, xE);
-                const zW = xR - xL;
-                if (zW <= 0) continue;
-
-                // Pre-build bucket volume map (same-bucket comparison, no ±2 extension needed)
-                const prices = zfp.levels.map(l => l.price);
-                const minP = Math.min(...prices), maxP = Math.max(...prices);
-                const bktStart = Math.floor(minP / 2) * 2;
-                const bktMap = new Map<number, { bid: number; ask: number }>();
-                for (let bp = bktStart; bp <= maxP + 2; bp += 2) {
-                  const inB = zfp.levels.filter(l => l.price >= bp && l.price < bp + 2);
-                  bktMap.set(bp, {
-                    bid: inB.reduce((s, l) => s + l.bidVol, 0),
-                    ask: inB.reduce((s, l) => s + l.askVol, 0),
-                  });
+                // First candle index strictly after this session (RTH ~6.5h, ETH ~17h → 25000s cutoff)
+                const postSessionStart = zfp.time + 25000;
+                let bsLo = 0, bsHi = sortedCans.length;
+                while (bsLo < bsHi) {
+                  const bsMid = (bsLo + bsHi) >> 1;
+                  if (sortedCans[bsMid].time < postSessionStart) bsLo = bsMid + 1;
+                  else bsHi = bsMid;
                 }
+                const postStart = bsLo;
 
-                // Detect same-bucket imbalances
-                const imbalDir = new Map<number, "buy" | "sell">();
-                for (let bp = bktStart; bp <= maxP; bp += 2) {
-                  const cur = bktMap.get(bp) ?? { bid: 0, ask: 0 };
-                  const net = Math.abs(cur.ask - cur.bid);
-                  if (net < NET_MIN) continue;
-                  const ratio    = cur.bid > 0 ? cur.ask / cur.bid : cur.ask > 0 ? 999 : 0;
-                  const ratioInv = cur.ask > 0 ? cur.bid / cur.ask : cur.bid > 0 ? 999 : 0;
-                  if (cur.ask > cur.bid && ratio    >= IMBAL_RATIO) imbalDir.set(bp, "buy");
-                  else if (cur.bid > cur.ask && ratioInv >= IMBAL_RATIO) imbalDir.set(bp, "sell");
-                }
+                for (const cl of zfp.imbalances) {
+                  if (!cl.stacked) continue; // only strong (stacked) imbalances shown as zones
+                  const lo  = Math.min(cl.startPrice, cl.endPrice);
+                  const hi  = Math.max(cl.startPrice, cl.endPrice);
+                  const buy = cl.direction === "buy";
 
-                // Mark stacked buckets (adjacent same-direction imbalances)
-                const stackedSet = new Set<number>();
-                for (const [bp, dir] of imbalDir) {
-                  if (imbalDir.get(bp - 2) === dir || imbalDir.get(bp + 2) === dir) {
-                    stackedSet.add(bp);
-                    if (imbalDir.get(bp - 2) === dir) stackedSet.add(bp - 2);
-                    if (imbalDir.get(bp + 2) === dir) stackedSet.add(bp + 2);
+                  // Mitigation: skip historical zones whose midprice has been closed through
+                  if (!isCurZ) {
+                    const midPrice = (lo + hi) / 2;
+                    let mitigated = false;
+                    for (let mi = postStart; mi < sortedCans.length; mi++) {
+                      const mc = sortedCans[mi];
+                      if (buy ? mc.close < midPrice : mc.close > midPrice) { mitigated = true; break; }
+                    }
+                    if (mitigated) continue;
                   }
-                }
 
-                // Draw zones — truncate at mitigating candle; extend to right edge if still active
-                for (const [bp, dir] of imbalDir) {
-                  const mitTime = mitigatedSet.get(`${zfp.time}_${bp}`);
+                  const tyR = series.priceToCoordinate(hi + 0.5);
+                  const byR = series.priceToCoordinate(lo - 0.5);
+                  if (tyR === null || byR === null) continue;
+                  const zt = tyR as number;
+                  const zh = Math.max(2, (byR as number) - zt);
 
-                  // x-end: either last candle (active) or the mitigating candle time
-                  let zxE = xE;
-                  if (mitTime !== undefined) {
-                    const xMitR = ts.timeToCoordinate(mitTime as any);
-                    if (xMitR !== null) zxE = Math.min(zxE, xMitR as number);
-                  }
-                  const zxR = Math.min(zX1, zxE);
-                  const zxL = xL;
-                  const zxW = zxR - zxL;
-                  if (zxW <= 0) continue; // zone ended before visible area
-
-                  const yTopR = series.priceToCoordinate(bp + 2);
-                  const yBotR = series.priceToCoordinate(bp);
-                  if (yTopR === null || yBotR === null) continue;
-                  const zt = Math.min(yTopR as number, yBotR as number);
-                  const zh = Math.max(2, Math.abs((yBotR as number) - (yTopR as number)));
-
-                  const isStacked = stackedSet.has(bp);
-                  // Mitigated zones draw at reduced opacity (ghost of where price was)
-                  const isMit = mitTime !== undefined;
-                  const fillA = isMit ? (isStacked ? 0.10 : 0.05) : (isStacked ? 0.42 : 0.18);
-                  const lineA = isMit ? (isStacked ? 0.30 : 0.15) : (isStacked ? 0.95 : 0.48);
-
-                  ctx.fillStyle = dir === "buy"
-                    ? `rgba(34,197,94,${fillA})`
-                    : `rgba(239,68,68,${fillA})`;
-                  ctx.fillRect(zxL, zt, zxW, zh);
-                  ctx.strokeStyle = dir === "buy"
-                    ? `rgba(74,222,128,${lineA})`
-                    : `rgba(248,113,113,${lineA})`;
-                  ctx.lineWidth = isStacked ? 1.5 : 1;
-                  ctx.setLineDash(isMit ? [3, 3] : []);
-                  ctx.beginPath(); ctx.moveTo(zxL, zt);      ctx.lineTo(zxR, zt);      ctx.stroke();
-                  ctx.beginPath(); ctx.moveTo(zxL, zt + zh); ctx.lineTo(zxR, zt + zh); ctx.stroke();
-                  ctx.setLineDash([]);
+                  // Tier-based opacity: tier1=base, tier2=+40%, tier3=+80% of base fill
+                  const tierMult = cl.strengthTier === 3 ? 1.8 : cl.strengthTier === 2 ? 1.4 : 1.0;
+                  const fillA  = Math.min(0.45, 0.18 * aM * tierMult);
+                  const lineA  = Math.min(1.0,  0.75 * aM * tierMult);
+                  ctx.fillStyle = buy
+                    ? `rgba(34,197,94,${fillA.toFixed(3)})`
+                    : `rgba(239,68,68,${fillA.toFixed(3)})`;
+                  ctx.fillRect(0, zt, zX1, zh);
+                  ctx.strokeStyle = buy
+                    ? `rgba(74,222,128,${lineA.toFixed(3)})`
+                    : `rgba(248,113,113,${lineA.toFixed(3)})`;
+                  ctx.lineWidth = cl.strengthTier === 3 ? 1.5 : 1; ctx.setLineDash([]);
+                  ctx.beginPath(); ctx.moveTo(0, zt);      ctx.lineTo(zX1, zt);      ctx.stroke();
+                  ctx.beginPath(); ctx.moveTo(0, zt + zh); ctx.lineTo(zX1, zt + zh); ctx.stroke();
                 }
               }
 
@@ -1874,7 +1834,11 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             }
             const skip     = Math.max(1, Math.ceil(MIN_ROW_H / pixPerLevel));
             const displayH = pixPerLevel * skip;
-            const rows     = visible.filter((lv, i) => i % skip === 0 || lv.price === fp.poc);
+            // Always keep the first (session HIGH/HOD) and last (session LOW/LOD) visible
+            // levels so the ladder spans the full session high→low — the sampler would
+            // otherwise drop the bottom row unless its index happened to land on `skip`.
+            const rows     = visible.filter((lv, i) =>
+              i % skip === 0 || i === visible.length - 1 || lv.price === fp.poc);
 
             ctx.save();
             ctx.beginPath(); ctx.rect(xL, 0, C_TOT, clipBottom); ctx.clip();
@@ -1984,31 +1948,15 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             ctx.restore();
           }; // end renderFpLadder
 
-          // Find the most recent COMPLETED session (not active) — always shown at right edge.
-          // This is the "previous session reference ladder" — like Yellow Box where prior-session
-          // levels are the valid zones for today's trading.
-          // Guard: only show ladder if its price range overlaps the current visible Y-axis.
-          const visPriceTop = series.coordinateToPrice(0) ?? Infinity;
-          const visPriceBot = series.coordinateToPrice(clipBottom) ?? -Infinity;
-          const prevSessionFp = [...allAggsFp]
-            .filter(fp => fp.time !== activeSessionTimeRef.current)
-            .filter(fp => fp.high >= visPriceBot && fp.low <= visPriceTop) // price in visible range
-            .sort((a, b) => b.time - a.time)[0] ?? null;
-
-          // Draw previous session ladder pinned to the right edge (always visible).
-          if (prevSessionFp) {
-            renderFpLadder(prevSessionFp, cw - C_TOT - 2);
-          }
-
-          // Draw each session's ladder anchored at its first candle.
-          // Skip the previous session if its candle-anchored position is off-screen
-          // (it's already shown at the right edge). If it's on-screen, show it there too.
+          // Each session's ladder is anchored to its FIRST candle's x-position.
+          // No right-edge "reference" pin — ladders move with their session's first
+          // candle and disappear when that candle pans off-screen (as the header comment
+          // for this block describes). This restores the on-first-candle behavior.
           for (const fp of allAggsFp) {
             const xfR = ts.timeToCoordinate(fp.time as any);
             if (xfR === null) continue;
             const xf = xfR as number;
-            if (xf < 0 || xf > cw) continue; // first candle off-screen — skip anchored position
-            if (fp.time === prevSessionFp?.time && Math.abs(xf - (cw - C_TOT - 2)) < C_TOT + 10) continue; // skip if on-screen ladder would overlap right-edge pinned one
+            if (xf < 0 || xf > cw) continue; // session's first candle off-screen — skip
             renderFpLadder(fp, xf);
           }
         } // IMBALANCE-FIX: end fpMap.size > 0

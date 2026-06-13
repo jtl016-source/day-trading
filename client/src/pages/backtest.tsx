@@ -94,7 +94,7 @@ function isRTH(ts: number): boolean {
   const day = d.getUTCDay();
   if (day === 0 || day === 6) return false;
   const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return mins >= 13 * 60 + 30 && mins < 20 * 60; // 9:30 AM – 4:00 PM ET
+  return mins >= 13 * 60 + 30 && mins < 21 * 60; // 9:30 AM – 5:00 PM ET (EDT)
 }
 
 function rthSettleOfDay(ts: number): number {
@@ -796,7 +796,10 @@ export default function BacktestPage() {
         : raw;
 
       setCandles(bars);
-      const zones   = detectMilkZones(bars);
+      // RULE (user): milk zones only count when uploaded via PNG. The backtest page has no
+      // PNG-upload mechanism, so milk confluence is unavailable here — NEVER synthesize zones
+      // from candle price action (detectMilkZones). Backtest signals run without milk confluence.
+      const zones: ZoneBand[] = [];
       setMilkZones(zones);
       const profile = EXIT_STRATEGY_PROFILES[exitStrategy];
       const bt      = runBacktest(bars, zones, profile, symbol, interval, exitStrategy, sessionMode);

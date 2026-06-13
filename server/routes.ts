@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import Anthropic from "@anthropic-ai/sdk";
 import { cacheGet, cacheSet, cacheInvalidate, cacheFlushAll, TTL } from "./cache";
+import { XMLParser } from "fast-xml-parser";
 import YahooFinance from "yahoo-finance2";
 import { db } from "./db";
 import { cachedCandles, downloadStatus, newsArticles, appSettings, signalHistory, discordMessages, discordSignals, tradeJournal } from "@shared/schema";
@@ -20,13 +21,12 @@ import { learner } from "./discord-learner";
 
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
 
-// Discord webhook — loaded from DB at startup so signals work before client reconnects
+// Discord webhook — loaded from DB at startup so signals work before client reconnects.
+// Uses the already-imported db/appSettings/eq (better-sqlite3 `.all()` is synchronous) so this
+// stays a plain top-level statement — no top-level `await`, which esbuild's cjs bundle rejects.
 let memDiscordWebhook = "";
 try {
-  const { db: _db } = await import("./db");
-  const { appSettings: _as } = await import("@shared/schema");
-  const { eq: _eq } = await import("drizzle-orm");
-  const rows = _db.select().from(_as).where(_eq(_as.key, "discord_webhook")).all() as any[];
+  const rows = db.select().from(appSettings).where(eq(appSettings.key, "discord_webhook")).all() as any[];
   if (rows[0]?.value) { memDiscordWebhook = rows[0].value; console.log("[discord] Loaded webhook from DB"); }
 } catch { /* non-fatal */ }
 
@@ -132,28 +132,35 @@ const POPULAR_SYMBOLS = {
   ],
 };
 
-// Reuse a single Intl.DateTimeFormat instance across all isRTH calls — constructing
-// it inline per candle is expensive when processing thousands of historical bars.
-const _etFmt = new Intl.DateTimeFormat("en-US", {
-  timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false,
-});
+// ET (America/New_York) UTC offset, memoized per UTC-day. An Intl call PER candle is the
+// dominant cost when building a continuous-candle response (thousands of bars → seconds of
+// CPU, which timed out mobile clients). We do one Intl lookup per calendar day, cache it, then
+// derive ET hour/minute/weekday with pure arithmetic. Offsets only change twice a year, so a
+// per-day granularity is exact except across the ~02:00 DST switch (irrelevant to RTH hours).
+const _etTzFmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", timeZoneName: "short" });
+const _etOffCache = new Map<number, number>(); // utcDay → offset MINUTES (EST=-300, EDT=-240)
+function etOffsetMin(timestampSec: number): number {
+  const day = Math.floor(timestampSec / 86400);
+  let off = _etOffCache.get(day);
+  if (off === undefined) {
+    const tz = _etTzFmt.formatToParts(new Date(timestampSec * 1000)).find(p => p.type === "timeZoneName")?.value;
+    off = tz === "EST" ? -300 : -240;
+    if (_etOffCache.size > 4000) _etOffCache.clear(); // bound memory
+    _etOffCache.set(day, off);
+  }
+  return off;
+}
 
 /**
- * Determine if a UTC timestamp is within Regular Trading Hours (RTH) for US markets.
- * RTH: 9:30 AM – 4:00 PM ET  |  ETH: 6:00 PM – 9:30 AM ET
- * Uses America/New_York for DST-correct boundaries.
+ * Determine if a UTC timestamp is within Regular Trading Hours (RTH): Mon–Fri 9:30 AM – 4:00 PM ET.
+ * DST-correct via the memoized ET offset, ~200x cheaper than an Intl call per candle.
  */
 function isRTH(timestampSec: number): boolean {
-  const d = new Date(timestampSec * 1000);
-  const dayOfWeek = d.getUTCDay();
-  if (dayOfWeek === 0 || dayOfWeek === 6) return false;
-  const etParts = _etFmt.formatToParts(d);
-  let etH = 0, etM = 0;
-  for (const p of etParts) {
-    if (p.type === "hour")   etH = parseInt(p.value);
-    else if (p.type === "minute") etM = parseInt(p.value);
-  }
-  return etH * 60 + etM >= 9 * 60 + 30 && etH * 60 + etM < 16 * 60; // 9:30 AM – 4:00 PM ET
+  const etSec = timestampSec + etOffsetMin(timestampSec) * 60;
+  const etDow = ((Math.floor(etSec / 86400) % 7) + 4) % 7; // 0=Sun; 1970-01-01 (epoch) was a Thursday
+  if (etDow === 0 || etDow === 6) return false;
+  const etMin = ((Math.floor(etSec / 60) % 1440) + 1440) % 1440;
+  return etMin >= 9 * 60 + 30 && etMin < 17 * 60; // 9:30 AM – 5:00 PM ET
 }
 
 function mapQuotes(quotes: any[]): any[] {
@@ -185,6 +192,77 @@ async function fetchChunk(symbol: string, period1: Date, period2: Date, interval
   } catch {
     return [];
   }
+}
+
+// ── Yahoo Finance backfill ───────────────────────────────────────────────────
+// Maps short internal symbols to Yahoo Finance continuous-contract tickers.
+function toYahooSymbol(sym: string): string {
+  const MAP: Record<string, string> = {
+    // Micro contracts → use the standard contract for Yahoo Finance (same price, 1/10 size)
+    MES: "ES=F", MNQ: "NQ=F", MYM: "YM=F", M2K: "RTY=F", MCL: "CL=F", MGC: "GC=F",
+    // Standard contracts
+    ES: "ES=F", NQ: "NQ=F", YM: "YM=F", RTY: "RTY=F", CL: "CL=F", GC: "GC=F",
+  };
+  return MAP[sym.toUpperCase()] ?? sym;
+}
+
+// Fetches up to 720 days of 60m bars + 59 days of 5m/15m bars from Yahoo Finance
+// and upserts into cached_candles with ON CONFLICT DO NOTHING so MW relay data
+// is never overwritten.  Returns total new bars inserted.
+async function yahooBackfillSymbol(symbol: string): Promise<number> {
+  const ySym  = toYahooSymbol(symbol);
+  const now   = new Date();
+  const nowMs = now.getTime();
+  let totalInserted = 0;
+
+  const CHUNK_DAYS = 240;
+  const MAX_DAYS   = 720;
+
+  // Helper: fetch with logging so failures are visible in the server console.
+  async function fetchLogged(sym: string, from: Date, to: Date, interval: string): Promise<any[]> {
+    try {
+      const bars = await fetchChunk(sym, from, to, interval);
+      console.log(`[yahoo-backfill] ${symbol} ${interval} ${from.toISOString().slice(0,10)}→${to.toISOString().slice(0,10)}: ${bars.length} bars`);
+      return bars;
+    } catch (e: any) {
+      console.error(`[yahoo-backfill] ${symbol} ${interval} fetch error: ${e?.message}`);
+      return [];
+    }
+  }
+
+  // 60m – fetch up to 720 days in 240-day chunks (newest → oldest)
+  for (let offset = 0; offset < MAX_DAYS; offset += CHUNK_DAYS) {
+    const chunkTo   = new Date(nowMs - offset * 86_400_000);
+    const chunkFrom = new Date(nowMs - Math.min(offset + CHUNK_DAYS, MAX_DAYS) * 86_400_000);
+    const bars = await fetchLogged(ySym, chunkFrom, chunkTo, "60m");
+    if (bars.length) {
+      const vals = bars.map((b: any) => ({
+        symbol, resolution: "60",
+        timestamp: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0,
+      }));
+      for (let i = 0; i < vals.length; i += 500)
+        await db.insert(cachedCandles).values(vals.slice(i, i + 500)).onConflictDoNothing();
+      totalInserted += bars.length;
+    }
+  }
+
+  // 5m and 15m – last 59 days (Yahoo's intraday limit for both)
+  for (const { res, yInterval } of [{ res: "5", yInterval: "5m" }, { res: "15", yInterval: "15m" }]) {
+    const fromTs = new Date(nowMs - 59 * 86_400_000);
+    const bars   = await fetchLogged(ySym, fromTs, now, yInterval);
+    if (bars.length) {
+      const vals = bars.map((b: any) => ({
+        symbol, resolution: res,
+        timestamp: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0,
+      }));
+      for (let i = 0; i < vals.length; i += 500)
+        await db.insert(cachedCandles).values(vals.slice(i, i + 500)).onConflictDoNothing();
+      totalInserted += bars.length;
+    }
+  }
+
+  if (totalInserted > 0) cacheInvalidate(symbol);
+  return totalInserted;
 }
 
 /** Fetch all available intraday data, respecting Yahoo Finance limits */
@@ -694,9 +772,12 @@ export async function registerRoutes(
       // Large absolute range
       if (range / c > spikeThreshold) return true;
       // Gap-bar artifact: O≈H and L≈C (bearish session gap) or O≈L and H≈C (bullish session gap).
-      // These bars have O=H and L=C because they span an overnight gap — they appear as
-      // tall full-body bars throughout the chart and corrupt Lowest(low,20).
-      if (range / c > 0.001) {
+      // These bars span an overnight gap — they appear as tall full-body bars and corrupt
+      // Lowest(low,20). Only flag when the range is GENUINELY LARGE (a real gap). The old
+      // `> 0.001` (0.1%) gate dropped legitimate strong directional candles — e.g. a ~12pt
+      // 15m breakout that opens at its low and closes at its high (a normal marubozu). Gate
+      // on half the spike threshold so only abnormally tall full-body bars are rejected.
+      if (range / c > spikeThreshold * 0.5) {
         if ((Math.abs(o - h) < 0.5 && Math.abs(l - c) < 0.5) ||
             (Math.abs(o - l) < 0.5 && Math.abs(h - c) < 0.5)) return true;
       }
@@ -806,7 +887,7 @@ export async function registerRoutes(
             MIN(timestamp) OVER (PARTITION BY DATE(datetime(timestamp, 'unixepoch'))) as day_min,
             MAX(timestamp) OVER (PARTITION BY DATE(datetime(timestamp, 'unixepoch'))) as day_max
           FROM cached_candles
-          WHERE symbol = ? AND resolution IN ('5', '60')
+          WHERE symbol = ? AND resolution IN ('5', '15', '60')
         )
         GROUP BY DATE(datetime(timestamp, 'unixepoch'))
         ORDER BY date DESC
@@ -1158,6 +1239,88 @@ export async function registerRoutes(
       res.json({ articles, total: articles.length });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Scrolling news ticker — free RSS aggregation (no API key) ───────────────
+  // Pulls market-relevant headlines from named sources, upserts into news_articles
+  // (so it survives feed outages), and returns the newest N. Cached 10 min.
+  const RSS_FEEDS: { name: string; url: string }[] = [
+    { name: "Yahoo Finance", url: "https://finance.yahoo.com/news/rssindex" },
+    { name: "NYT Business",   url: "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml" },
+    { name: "NYT Economy",    url: "https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml" },
+    { name: "WSJ Markets",    url: "https://feeds.a.dj.com/rss/RSSMarketsMain.xml" },
+    { name: "CNBC",           url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258" },
+    { name: "MarketWatch",    url: "https://feeds.content.dowjones.io/public/rss/mw_topstories" },
+    { name: "Reuters",        url: "https://news.google.com/rss/search?q=when:1d+site:reuters.com+markets&hl=en-US&gl=US&ceid=US:en" },
+    { name: "Morning Brew",   url: "https://news.google.com/rss/search?q=site:morningbrew.com+when:3d&hl=en-US&gl=US&ceid=US:en" },
+    { name: "Berkshire Hathaway", url: "https://news.google.com/rss/search?q=%22Berkshire+Hathaway%22+when:7d&hl=en-US&gl=US&ceid=US:en" },
+  ];
+  const _rssParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", processEntities: true });
+  const _txt = (v: any): string => {
+    if (v == null) return "";
+    if (typeof v === "string") return v;
+    if (typeof v === "object") return _txt(v["#text"] ?? v["@_href"] ?? "");
+    return String(v);
+  };
+  const _clean = (s: string) => s.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+
+  app.get("/api/news/ticker", async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 40, 100);
+    const cacheKey = "news:ticker";
+    const cached = cacheGet<object>(cacheKey);
+    if (cached) { res.json(cached); return; }
+
+    const serveFromDb = async () => {
+      const rows = await db.select().from(newsArticles).orderBy(desc(newsArticles.publishedAt)).limit(limit);
+      return { articles: rows };
+    };
+
+    try {
+      const collected: { title: string; url: string; source: string; publishedAt: string }[] = [];
+      await Promise.allSettled(RSS_FEEDS.map(async (feed) => {
+        try {
+          const r = await fetch(feed.url, {
+            headers: { "User-Agent": "Mozilla/5.0 (BaxterTerminal news ticker)" },
+            signal: AbortSignal.timeout(7000),
+          });
+          if (!r.ok) return;
+          const doc: any = _rssParser.parse(await r.text());
+          const rawItems = doc?.rss?.channel?.item ?? doc?.feed?.entry ?? [];
+          const items = Array.isArray(rawItems) ? rawItems : [rawItems];
+          for (const it of items.slice(0, 12)) {
+            const title = _clean(_txt(it?.title));
+            const url = _txt(it?.link?.["@_href"] ?? it?.link);
+            if (!title || !url) continue;
+            const src = it?.source ? _clean(_txt(it.source)) || feed.name : feed.name;
+            const pub = it?.pubDate ?? it?.published ?? it?.updated ?? null;
+            const d = pub ? new Date(pub) : new Date();
+            collected.push({
+              title, url: url.trim(), source: src,
+              publishedAt: isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString(),
+            });
+          }
+        } catch { /* skip this feed */ }
+      }));
+
+      // Upsert (url is unique) so the ticker survives a later feed outage.
+      for (const a of collected) {
+        try {
+          await db.insert(newsArticles).values({
+            title: a.title, description: null, content: null, url: a.url,
+            source: a.source, imageUrl: null, publishedAt: a.publishedAt,
+            category: "ticker", searchQuery: "rss",
+          }).onConflictDoNothing();
+        } catch { /* ignore single-row failure */ }
+      }
+
+      const result = await serveFromDb();
+      cacheSet(cacheKey, result, 600); // 10 min
+      res.json(result);
+    } catch (err: any) {
+      // Feed/network failure → serve whatever's already stored.
+      try { res.json(await serveFromDb()); }
+      catch { res.status(500).json({ error: err?.message ?? String(err) }); }
     }
   });
 
@@ -1741,12 +1904,16 @@ export async function registerRoutes(
   // ── Auto Trade routes ─────────────────────────────────────────────────────
 
   // GET /api/trade/status — is AutoTrader Java study connected?
+  // no-store: this is polled every few seconds — an ETag/304 makes clients that gate on res.ok
+  // skip the update and show a stale "disconnected" even though the study is connected.
   app.get("/api/trade/status", (_req, res) => {
+    res.set("Cache-Control", "no-store");
     res.json({ connected: isOrderCommandSocketOpen() });
   });
 
   // GET /api/trade/current — returns the active trade (with live price auto-status) or null
   app.get("/api/trade/current", (_req, res) => {
+    res.set("Cache-Control", "no-store"); // polled — never serve a 304 (see /status note)
     let trade = getCurrentTrade();
     if (trade && trade.status === 'open') {
       const livePrice = getLastTickPrice(trade.symbol);
@@ -1798,10 +1965,21 @@ export async function registerRoutes(
     if (Array.isArray(body.riskLevels)) tradeSettings.riskLevels = body.riskLevels;
     if (Array.isArray(body.intervals)) tradeSettings.intervals = body.intervals;
     if (['current','tight','standard','wide'].includes(body.exitStrategy as string)) tradeSettings.exitStrategy = body.exitStrategy as typeof tradeSettings.exitStrategy;
-    // Broadcast enabled-state change so all connected clients (iPhone) mirror it immediately
-    if (typeof body.enabled === "boolean" && body.enabled !== prevEnabled) {
-      broadcast({ type: "auto_trade_state", enabled: tradeSettings.enabled });
-    }
+    // Broadcast the FULL auto-trade config so the (hidden) MarketPage engine and any other
+    // clients mirror it live — this is how the terminal drives which interval/tiers auto-trade
+    // (the engine fires on these, not on its own stale client-side filters). Always broadcast
+    // so interval/direction/tier changes propagate, not just enable/disable.
+    void prevEnabled;
+    broadcast({
+      type: "auto_trade_state",
+      enabled: tradeSettings.enabled,
+      intervals: tradeSettings.intervals,
+      riskLevels: tradeSettings.riskLevels,
+      direction: tradeSettings.direction,
+      contracts: tradeSettings.contracts,
+      contractType: tradeSettings.contractType,
+      tp1Only: tradeSettings.tp1Only,
+    });
     res.json({ ok: true, settings: tradeSettings });
   });
 
@@ -1841,6 +2019,11 @@ export async function registerRoutes(
       res.status(400).json({ error: `Invalid TP levels: tp1=${tp1} tp2=${tp2} entry=${price} — order rejected` });
       return;
     }
+    // Contract count is the user's AUTHORITATIVE setting (tradeSettings.contracts, kept in sync
+    // by both the terminal AutoTrader card and the classic page). Use it directly rather than
+    // whatever the firing client sent — that eliminates any "fired the wrong amount" race where
+    // the engine's in-memory value lagged a just-changed setting.
+    const orderContracts = Math.max(1, Math.floor(Number(tradeSettings.contracts ?? contracts ?? 1)));
     const sent = broadcastOrderCommand({
       type: "order_command",
       symbol: symbol ?? "MES",
@@ -1851,7 +2034,7 @@ export async function registerRoutes(
       tp1: Number(tp1),
       tp2: Number(tp2),
       sl: Number(sl),
-      contracts: Math.max(1, Math.floor(Number(contracts ?? tradeSettings.contracts))),
+      contracts: orderContracts,
       tp1Only: tp1Only === true,
       useTrailer: useTrailer === true,
       trailingOffset: Number(trailingOffset ?? 2),
@@ -1869,10 +2052,20 @@ export async function registerRoutes(
       tp1: Number(tp1),
       tp2: Number(tp2),
       sl: Number(sl),
-      contracts: Math.max(1, Math.floor(Number(contracts ?? tradeSettings.contracts))),
+      contracts: orderContracts,
       tp1Only: tp1Only === true,
       firedAt: Math.floor(Date.now() / 1000),
       status: 'open',
+    });
+    // Notify all clients (incl. the terminal) so they can show a visible "order placed" toast —
+    // the engine's own toast renders in the hidden MarketPage and is never seen on the terminal.
+    broadcast({
+      type: "auto_trade_fired",
+      symbol: symbol ?? "MES",
+      direction,
+      interval,
+      price: Number(price),
+      contracts: orderContracts,
     });
     res.json({ ok: true });
   });
@@ -2126,8 +2319,15 @@ export async function registerRoutes(
     const sym = normalizeSignalSymbol(req.params.symbol);
     const iv  = req.params.interval;
     try {
+      // Never return FUTURE-dated rows — corrupt signals stamped days ahead (e.g. Jun 17 when
+      // it's the 9th) otherwise pollute every client. Cap at now + 1h (clock-skew tolerance).
+      const maxTs = Math.floor(Date.now() / 1000) + 3600;
       const rows = await db.select().from(signalHistory)
-        .where(and(eq(signalHistory.symbol, sym), eq(signalHistory.interval, iv)));
+        .where(and(
+          eq(signalHistory.symbol, sym),
+          eq(signalHistory.interval, iv),
+          lte(signalHistory.timestamp, maxTs),
+        ));
       res.json({ signals: rows });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -2142,6 +2342,7 @@ export async function registerRoutes(
         riskLevel: string; signalType?: string; entry: number;
         tp1: number; tp2: number; sl: number; outcome?: string; patternBars?: number;
         footprintReading?: string; // FOOTPRINT-STRATEGY: JSON FootprintReading
+        confirmations?: string; // PARITY: JSON {milkOk, milkPts, vecOk, secondaryVecOk}
       }>;
     };
     if (!Array.isArray(signals) || !signals.length) {
@@ -2163,6 +2364,7 @@ export async function registerRoutes(
         outcome:          s.outcome ?? null,
         patternBars:      s.patternBars ?? null,
         footprintReading: s.footprintReading ?? null, // FOOTPRINT-STRATEGY:
+        confirmations:    s.confirmations ?? null, // PARITY: confirmation breakdown for iPhone chips
         updatedAt:        new Date().toISOString(),
       }));
       await db.insert(signalHistory).values(values).onConflictDoUpdate({
@@ -2171,6 +2373,7 @@ export async function registerRoutes(
           riskLevel:        sql`excluded.risk_level`,
           outcome:          sql`excluded.outcome`,
           footprintReading: sql`excluded.footprint_reading`, // FOOTPRINT-STRATEGY:
+          confirmations:    sql`excluded.confirmations`, // PARITY:
           updatedAt:        new Date().toISOString(),
         },
       });
@@ -2461,17 +2664,19 @@ Critical rules:
   // ── Footprint API ─────────────────────────────────────────────────────────── // FOOTPRINT-STRATEGY:
   app.get("/api/footprint/history/:symbol/:interval", async (req, res) => { // FOOTPRINT-STRATEGY:
     try { // FOOTPRINT-STRATEGY:
-      const { getAllCandles, getActivePreview } = await import("./footprint-engine"); // FOOTPRINT-STRATEGY:
+      const { getAllCandles, getActivePreview, loadPersistedCandles } = await import("./footprint-engine"); // FOOTPRINT-STRATEGY:
       const sym = req.params.symbol.toUpperCase(); // FOOTPRINT-STRATEGY:
       const iv  = req.params.interval; // FOOTPRINT-STRATEGY:
-      const stored  = getAllCandles(sym, iv); // FOOTPRINT-STRATEGY:
+      const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? ""), 10) || 600, 1), 5000); // FOOTPRINT-STRATEGY:
+      // Merge DB-persisted history (older sessions, survives restarts + the 50-cap) with the live
+      // in-memory tail (recent candles) and the current forming preview. In-memory wins on time
+      // collisions because it's fresher; dedupe by time, then sort ascending. // FOOTPRINT-STRATEGY:
+      const byTime = new Map<number, any>(); // FOOTPRINT-STRATEGY:
+      for (const c of loadPersistedCandles(sym, iv, limit)) byTime.set(c.time, c); // FOOTPRINT-STRATEGY:
+      for (const c of getAllCandles(sym, iv)) byTime.set(c.time, c); // FOOTPRINT-STRATEGY:
       const preview = getActivePreview(sym, iv); // FOOTPRINT-STRATEGY: current in-progress bucket
-      // Merge: replace last entry if time matches, otherwise append
-      const result = [...stored]; // FOOTPRINT-STRATEGY:
-      if (preview) { // FOOTPRINT-STRATEGY:
-        const idx = result.findIndex(c => c.time === preview.time); // FOOTPRINT-STRATEGY:
-        if (idx >= 0) result[idx] = preview; else result.push(preview); // FOOTPRINT-STRATEGY:
-      } // FOOTPRINT-STRATEGY:
+      if (preview) byTime.set(preview.time, preview); // FOOTPRINT-STRATEGY:
+      const result = [...byTime.values()].sort((a, b) => a.time - b.time); // FOOTPRINT-STRATEGY:
       res.json(result); // FOOTPRINT-STRATEGY:
     } catch (err: any) { // FOOTPRINT-STRATEGY:
       res.status(500).json({ error: err.message }); // FOOTPRINT-STRATEGY:
@@ -2718,6 +2923,28 @@ Critical rules:
       res.status(500).json({ error: "Failed to parse calibration: " + e.message });
     }
   });
+
+  // On-demand Yahoo Finance historical backfill.
+  // POST /api/data/yahoo-backfill  body: { symbol: "MES" }
+  // Returns { ok, symbol, inserted }.  Uses ON CONFLICT DO NOTHING so MW data is never overwritten.
+  app.post("/api/data/yahoo-backfill", async (req, res) => {
+    const sym = ((req.body?.symbol as string) || "MES").toUpperCase();
+    try {
+      const inserted = await yahooBackfillSymbol(sym);
+      res.json({ ok: true, symbol: sym, inserted });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Auto-run Yahoo backfill for MES and ES on every server startup.
+  // Runs in the background — does not block server ready.
+  // ON CONFLICT DO NOTHING means re-running is cheap once the DB is populated.
+  for (const sym of ["MES", "ES"]) {
+    yahooBackfillSymbol(sym)
+      .then(n => { if (n > 0) console.log(`[yahoo-backfill] ${sym}: +${n} bars`); })
+      .catch(err => console.error(`[yahoo-backfill] ${sym} error:`, err?.message ?? err));
+  }
 
   return httpServer;
 }
