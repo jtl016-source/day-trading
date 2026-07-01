@@ -181,6 +181,35 @@ price typically reverses sharply.
 
 ---
 
+## 8b. Fractal Probability Concept (Hurst Regime / Value Area / Scaler) — DISPLAY ONLY
+
+**Source:** `client/src/lib/{hurst,ergodic,multifractal,hurstScaler,fbm}.ts` → snapshot in
+`client/src/lib/probability.ts` → terminal **Probability** panel. Full doc: `strategies/probability/`.
+
+**This is a regime/macro CONTEXT layer — it NEVER fires, gates, or vetoes a trade.** It frames the
+confluence signals (sections 1–8) so the user can size and target them with the prevailing regime in mind.
+
+**What it represents:**
+- **Regime (DFA-Hurst H):** `H ≥ 0.55` = PERSISTENT/trending (moves extend), `H ≤ 0.45` = MEAN-REVERT/chop
+  (moves fade), in between = NEUTRAL/near random-walk. Thresholds are a-priori — never fit to data.
+  Hurst lags by ~½ its window; an H crossing confirms a regime that already began, it is not an entry.
+- **Value area (ergodicity):** long-run POC/VAH/VAL over ~500 bars + where price sits in its realized
+  range. Above VAH = extended high (reversion risk), below VAL = extended low, inside = fair.
+- **Target scaler:** expected range scales as `τ^H` (fBm), not `√τ`. `H<0.5` ⇒ tighten targets,
+  `H>0.5` ⇒ let targets run. Computes the multiplier only; does NOT change live ATR/stop logic.
+- **Multifractal stress:** percentile of the current spectrum width vs trailing windows — high = the
+  tape is more turbulent than its own recent norm.
+
+**Regime stats (6,916 real safe 15m MES signals, 2024–2026):**
+PERSISTENT 39.1% win / PF 1.53 · NEUTRAL 41.4% / PF 1.57 · MEAN-REVERT 44.9% / PF 1.75.
+
+**How the ML should use it:** as a feature/context for grading existing confluence signals — favor
+continuation in PERSISTENT regimes inside value, favor reversion when stretched past the value area in
+MEAN-REVERT regimes, and discount range projections when multifractal stress is high. It must NEVER be
+turned into a standalone trade trigger.
+
+---
+
 ## 9. Rules the ML Must Never Violate
 
 1. **Never compare visual positions** — always compare prices (numbers) to prices

@@ -8,10 +8,20 @@ REM ── Find JDK ────────────────────
 set "JAVAC="
 set "JAR_TOOL="
 
-for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-25*" "C:\Program Files\Java\jdk-25*") do (
+REM Prefer JDK 26 (matches the MW SDK's Java-26 class files exactly — no version warning).
+for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-26*" "C:\Program Files\Java\jdk-26*") do (
     if exist "%%d\bin\javac.exe" (
         set "JAVAC=%%d\bin\javac.exe"
         set "JAR_TOOL=%%d\bin\jar.exe"
+    )
+)
+REM JDK 25 also compiles against the v70 SDK (emits a harmless "major version 70" warning).
+for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-25*" "C:\Program Files\Java\jdk-25*") do (
+    if not defined JAVAC (
+        if exist "%%d\bin\javac.exe" (
+            set "JAVAC=%%d\bin\javac.exe"
+            set "JAR_TOOL=%%d\bin\jar.exe"
+        )
     )
 )
 for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-21*" "C:\Program Files\Java\jdk-21*") do (
@@ -73,12 +83,13 @@ REM ═════════════════════════�
 REM  1. LiveBarRelay
 REM ══════════════════════════════════════════════════════════════════════════════
 echo.
-echo --- Building LiveBarRelay.jar (includes HistoryDumper) ---
+echo --- Building LiveBarRelay.jar ---
 mkdir "%OUT%"
 
-REM Compile LiveBarRelay + HistoryDumper together into one JAR
-REM MW already loads LiveBarRelay.jar — bundling HistoryDumper inside guarantees MW finds both studies
-"%JAVAC%" --release 17 -cp "%SDK%" -d "%OUT%" "com\custom\LiveBarRelay.java" "com\custom\HistoryDumper.java"
+REM Compile LiveBarRelay ALONE. Do NOT bundle HistoryDumper here — it is built as its own jar
+REM below. Bundling it caused com.custom.HistoryDumper to live in TWO jars, so MotiveWave saw the
+REM HISTORY_DUMPER study id twice and dropped it from the Add-Study list (the duplicate-load bug).
+"%JAVAC%" --release 17 -cp "%SDK%" -d "%OUT%" "com\custom\LiveBarRelay.java"
 if errorlevel 1 goto FAIL_LBR
 
 if exist "LiveBarRelay.jar" del "LiveBarRelay.jar"

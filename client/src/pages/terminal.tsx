@@ -29,6 +29,14 @@ import { loadMilkZones, uploadMilkZones, type MilkZone } from "@/lib/milkZones";
 type Tab = "home" | "signals" | "settings" | "info";
 type SideFilter = "All" | "LONG" | "SHORT";
 
+// The four fractal probability concepts, each rendered individually on the chart and toggled on its own.
+const PROB_OVERLAYS: Array<{ key: keyof StrategyToggles; label: string; color: string }> = [
+  { key: "probValueArea", label: "Value Area (POC/VAH/VAL)", color: "#ffb454" },
+  { key: "probRegime",    label: "Regime Ribbon (Hurst)",    color: "#1fd98a" },
+  { key: "probForecast",  label: "Forecast Cone (fBm)",      color: "#2dd4bf" },
+  { key: "probScaler",    label: "Target Levels (scaler)",   color: "#60a5fa" },
+];
+
 export default function TradingTerminal() {
   const [, setLocation] = useLocation(); // PORTFOLIO tab navigates to the isolated /portfolio route
   const [tab, setTab] = useState<Tab>("home");
@@ -203,6 +211,21 @@ export default function TradingTerminal() {
                           </div>
                         </>
                       )}
+                      {/* Probability sub-overlays — each fractal concept shown individually on the chart */}
+                      {s.key === "Probability" && strategies.Probability && (
+                        <div className="tt-dd-suboverlays">
+                          {PROB_OVERLAYS.map((po) => (
+                            <div key={po.key} className="tt-dd-subrow">
+                              <span className="tt-dd-subdot" style={{ background: po.color }} />
+                              <span className="tt-dd-subname">{po.label}</span>
+                              <Toggle
+                                on={strategies[po.key]}
+                                onClick={() => setStrategies((p) => ({ ...p, [po.key]: !p[po.key] }))}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -243,6 +266,8 @@ export default function TradingTerminal() {
       {effectiveStrategies.Footprint && tab === "home" && (
         <FootprintPanel symbol={settings.symbol} interval={interval} />
       )}
+      {/* Probability is now shown as individual ON-CHART overlays (Value Area / Regime / Forecast /
+          Target levels) — the floating numeric panel was removed (it overlapped the dropdown). */}
 
       <Clock />
 

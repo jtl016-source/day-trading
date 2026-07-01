@@ -35,12 +35,12 @@ export function dedupByTime<T extends { time: number }>(arr: T[]): T[] {
   return arr.filter(b => { if (seen.has(b.time)) return false; seen.add(b.time); return true; });
 }
 
-// Aggregate 1m/5m bars up to a coarser interval. 60m uses a 30-min offset so the
-// 9:30 ET RTH open bar starts its own bucket (matches get60mBucket / PC behavior).
+// Aggregate 1m/5m bars up to a coarser interval. 60m aligns to :00 top-of-hour
+// (matches get60mBucket / server agg60mBucket / Yahoo ES=F 60m alignment).
 export function aggToInterval(bars: Candle[], intervalMin: number): Candle[] {
   if (intervalMin <= 1) return bars;
   const intervalSec = intervalMin * 60;
-  const OFFSET = intervalMin === 60 ? 30 * 60 : 0;
+  const OFFSET = 0; // 60m at :00 top-of-hour (no :30 offset)
   const out: Candle[] = [];
   let bucket: Candle | null = null;
   for (const b of bars) {

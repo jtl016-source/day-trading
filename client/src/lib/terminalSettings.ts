@@ -34,9 +34,15 @@ export interface TerminalSettings {
 }
 
 export interface StrategyToggles {
-  MilkZone: boolean;  // → mwb_settings.showMilkZones (engine display)
-  Vector: boolean;    // → mwb_settings.showVector (engine display)
-  Footprint: boolean; // → mwb_settings.showFpPanel (engine display)
+  MilkZone: boolean;     // → mwb_settings.showMilkZones (engine display)
+  Vector: boolean;       // → mwb_settings.showVector (engine display)
+  Footprint: boolean;    // → mwb_settings.showFpPanel (engine display)
+  Probability: boolean;  // master toggle: fractal probability layer (panel + on-chart overlays)
+  // Per-concept on-chart overlays (only active when Probability is on) — each shown individually.
+  probValueArea: boolean; // long-run POC / VAH / VAL horizontal lines
+  probRegime: boolean;    // DFA-Hurst regime ribbon along the bottom
+  probForecast: boolean;  // Hurst-scaled expected-range forecast cone projecting right
+  probScaler: boolean;    // ± target-scaler expected-range levels at the current price
 }
 
 const SETTINGS_KEY = "meridian_settings";
@@ -62,6 +68,11 @@ export const DEFAULT_STRATEGIES: StrategyToggles = {
   MilkZone: false, // upload-driven only — turns on when the user uploads a zone PNG, never by default
   Vector: true,
   Footprint: true,
+  Probability: false, // off by default — opt-in fractal regime/value-area read-out
+  probValueArea: true,
+  probRegime: true,
+  probForecast: true,
+  probScaler: true,
 };
 
 // ── Engine shared store (mwb_settings) ──────────────────────────────────────
@@ -141,6 +152,7 @@ export function loadStrategies(): StrategyToggles {
   if (typeof mwb.showMilkZones === "boolean") merged.MilkZone = mwb.showMilkZones as boolean;
   if (typeof mwb.showVector === "boolean") merged.Vector = mwb.showVector as boolean;
   if (typeof mwb.showFpPanel === "boolean") merged.Footprint = mwb.showFpPanel as boolean;
+  if (typeof mwb.showProbability === "boolean") merged.Probability = mwb.showProbability as boolean;
   return merged;
 }
 
@@ -154,6 +166,7 @@ export function saveStrategies(s: StrategyToggles): void {
     showMilkZones: s.MilkZone,
     showVector: s.Vector,
     showFpPanel: s.Footprint,
+    showProbability: s.Probability,
   });
 }
 

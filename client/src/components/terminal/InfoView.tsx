@@ -7,6 +7,7 @@ const stratColor: Record<string, string> = {
   MilkZone: C.accent,
   Vector: "#a855f7",
   Footprint: C.amber,
+  Probability: C.up,
 };
 
 function Corners() {

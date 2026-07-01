@@ -120,5 +120,11 @@
   },
   "optionalDependencies": {
     "bufferutil": "^4.0.8"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.9.0": true,
+    "bufferutil@4.1.0": true,
+    "esbuild@0.27.2": true,
+    "esbuild@0.25.12": true
   }
 }

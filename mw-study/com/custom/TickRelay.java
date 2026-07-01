@@ -3,7 +3,8 @@ package com.custom;
 import com.motivewave.platform.sdk.common.*;
 import com.motivewave.platform.sdk.common.desc.*;
 import com.motivewave.platform.sdk.study.*;
-import com.motivewave.platform.sdk.study.DataContext;
+// DataContext lives in ...sdk.common (covered by the wildcard above). The old
+// ...sdk.study.DataContext import broke when the SDK moved the class — removed.
 
 import java.net.URI;
 import java.net.http.HttpClient;

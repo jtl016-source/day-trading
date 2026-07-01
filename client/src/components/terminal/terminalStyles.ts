@@ -284,6 +284,13 @@ export const CSS = `
 .tt-dd-upload.busy{ opacity:.6; cursor:wait; }
 .tt-dd-upload-note{ font-size:10px; color:${C.muted}; padding:2px 10px 4px; }
 
+/* probability per-concept sub-overlay toggles (under the Probability strategy row) */
+.tt-dd-suboverlays{ display:flex; flex-direction:column; gap:2px; margin:2px 0 6px; padding:6px 10px;
+  border-radius:8px; background:rgba(45,212,191,0.05); border:1px solid ${C.lineSoft}; }
+.tt-dd-subrow{ display:flex; align-items:center; gap:8px; padding:3px 2px; }
+.tt-dd-subdot{ width:8px; height:8px; border-radius:2px; flex:none; }
+.tt-dd-subname{ flex:1; font-size:11px; color:${C.muted}; font-family:var(--fm); letter-spacing:.3px; }
+
 /* footprint ladder panel (floats left, over the chart) */
 .tt-floating .tt-fp{ pointer-events:auto; }
 .tt-fp{ position:fixed; left:14px; top:88px; bottom:128px; z-index:5; width:206px; display:flex; flex-direction:column;
@@ -307,6 +314,23 @@ export const CSS = `
 .tt-fp-bid i, .tt-fp-ask i{ position:relative; z-index:1; }
 .tt-fp-bar{ position:absolute; top:1px; bottom:1px; right:0; background:rgba(255,77,109,0.22); border-radius:2px; }
 .tt-fp-bar.ask{ left:0; right:auto; background:rgba(31,217,138,0.22); }
+
+/* probability / fractal-regime panel (floats right, over the chart) */
+.tt-floating .tt-prob{ pointer-events:auto; }
+.tt-prob{ position:fixed; right:14px; top:88px; z-index:5; width:224px; max-height:calc(100vh - 168px); overflow-y:auto;
+  background:rgba(8,10,16,0.86); border:1px solid ${C.line}; border-radius:12px; padding:10px 11px 11px;
+  backdrop-filter:blur(12px); box-shadow:0 16px 40px rgba(0,0,0,0.45); }
+.tt-prob::-webkit-scrollbar{ width:5px; }
+.tt-prob::-webkit-scrollbar-thumb{ background:rgba(255,255,255,0.08); border-radius:5px; }
+.tt-prob-head{ display:flex; align-items:baseline; justify-content:space-between; gap:8px; padding-bottom:8px; margin-bottom:8px; border-bottom:1px solid ${C.lineSoft}; }
+.tt-prob-head b{ font-size:10px; letter-spacing:2px; color:${C.text}; }
+.tt-prob-head span{ font-family:var(--fm); font-size:9px; font-weight:700; letter-spacing:1px; }
+.tt-prob-grid{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-bottom:7px; }
+.tt-prob-sec{ font-size:8px; letter-spacing:1.5px; color:${C.dim}; margin:9px 0 6px; padding-top:8px; border-top:1px solid ${C.lineSoft}; }
+.tt-prob-note{ font-size:9.5px; line-height:1.45; color:${C.muted}; margin-bottom:2px; }
+.tt-prob-verdict{ font-family:var(--fm); font-size:10px; font-weight:700; letter-spacing:0.5px; margin-bottom:7px; }
+.tt-prob-bar{ height:6px; border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden; margin-top:2px; }
+.tt-prob-bar-fill{ display:block; height:100%; background:${C.accent}; border-radius:3px; }
 
 /* clickable signal rows + detail modal */
 .tt-trow.clickable{ cursor:pointer; }

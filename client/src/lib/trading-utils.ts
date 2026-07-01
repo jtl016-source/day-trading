@@ -163,14 +163,13 @@ export function detectMilkZones(candles: CandleBar[], historyBars = 234, display
 }
 
 // ── Candle aggregation ────────────────────────────────────────────────────────
-// FIX-3: 60m buckets are offset by 30 min so the RTH open bar (13:30 UTC EDT / 14:30 UTC EST)
-// starts its own bucket instead of falling into the 13:00 UTC bucket.
+// 60m buckets align to :00 top-of-hour — matches Yahoo's ES=F 60m alignment (the deep-history
+// source), the server's agg60mBucket()/aggregate(), and the serving filter `timestamp % 3600 === 0`.
 // All downstream 60m bucket lookups must use get60mBucket() to stay aligned.
-const AGG_60M_OFFSET = 30 * 60; // 1800 s
 
-/** Bucket key for a given timestamp at 60m resolution (offset to :30 boundaries). */
+/** Bucket key for a given timestamp at 60m resolution (:00 top-of-hour boundaries). */
 export function get60mBucket(ts: number): number {
-  return Math.floor((ts - AGG_60M_OFFSET) / 3600) * 3600 + AGG_60M_OFFSET;
+  return Math.floor(ts / 3600) * 3600;
 }
 
 export function aggToInterval(candles: CandleBar[], intervalSec: number): CandleBar[] {

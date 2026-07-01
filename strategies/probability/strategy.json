@@ -1,0 +1,35 @@
+{
+  "id": "probability",
+  "name": "Fractal Probability Concept (Hurst regime / value area / scaler)",
+  "version": "1.0.0",
+  "description": "DISPLAY-ONLY macro/regime context layer. A rolling DFA-Hurst exponent classifies the regime (persistent/neutral/mean-revert), a long-run value area locates price in its realized distribution, a Hurst target scaler implies tighter/wider targets vs the random-walk baseline, and a multifractal stress gauge flags turbulence. Never fires or vetoes a trade — it frames the confluence signals.",
+  "updatedAt": "2026-06-26T00:00:00.000Z",
+  "operatingHours": "rth_and_eth",
+  "displayOnly": true,
+  "neverGatesSignals": true,
+  "gates": {},
+  "rules": {
+    "role": "Regime FILTER and macro context only — NEVER a trade trigger or veto.",
+    "hurst_regime": "DFA-Hurst H of recent log-returns. H >= 0.55 = PERSISTENT (trending, moves extend); H <= 0.45 = MEANREVERT (chop, moves fade); 0.45 < H < 0.55 = NEUTRAL (near random-walk).",
+    "hurst_is_lagging": "A rolling Hurst is backward-looking (effective lag ~= half the window). Never treat an H crossing as an entry — it confirms a regime that already began. Closed bars only.",
+    "value_area": "Long-run POC/VAH/VAL over ~500 closed bars (volume-less TPO approximation). Above VAH = extended high (reversion risk); below VAL = extended low; inside = fair/balanced.",
+    "target_scaler": "Under fBm, expected range over horizon tau scales as tau^H, not sqrt(tau). H < 0.5 -> tighten targets; H > 0.5 -> targets can run wider. COMPUTES the multiplier only; does not change live ATR sizing.",
+    "multifractal_stress": "Percentile of the current multifractal spectrum width (Δα) vs trailing windows. High = tape more turbulent than its own recent norm; treat projections with caution.",
+    "thresholds_are_a_priori": "Regime thresholds (0.45 / 0.55) are fixed a-priori and must NOT be fit to data."
+  },
+  "parameters": {
+    "hurst_window": 100,
+    "persistent_threshold": 0.55,
+    "meanrevert_threshold": 0.45,
+    "value_area_lookback": 500,
+    "value_area_pct": 0.7,
+    "stress_window": 150,
+    "scaler_horizons": [2, 4, 8, 12]
+  },
+  "regimeStats": {
+    "note": "Win-rate and profit-factor measured on 6,916 real safe 15m MES signals (2024-2026). Source: scripts/regime_layer/reports/REPORT.md.",
+    "PERSISTENT": { "win_rate": 39.1, "profit_factor": 1.53 },
+    "NEUTRAL":    { "win_rate": 41.4, "profit_factor": 1.57 },
+    "MEANREVERT": { "win_rate": 44.9, "profit_factor": 1.75 }
+  }
+}

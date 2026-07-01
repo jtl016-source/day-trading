@@ -52,6 +52,24 @@ export const STRATS: StrategyMeta[] = [
     ],
   },
   {
+    key: "Probability",
+    desc: "Fractal regime / value-area context",
+    stat: "regime read",
+    title: "Probability",
+    tagline: "Fractal regime, value area & Hurst target scaling (MERIDIAN probability concept)",
+    how: [
+      "The Probability panel reads the market's CHARACTER, not a single entry. A rolling DFA-Hurst exponent (H) classifies the regime: H ≥ 0.55 = PERSISTENT/trending (moves extend), H ≤ 0.45 = MEAN-REVERT/chop (moves fade), in between = NEUTRAL/near random-walk. Each regime carries the historical win-rate and profit-factor measured on thousands of real MES signals.",
+      "A long-run VALUE AREA (POC / VAH / VAL over the last ~500 bars) shows where price sits in its realized distribution — inside value (fair), above value (extended high, reversion risk), or below value (extended low). The Hurst TARGET SCALER then says whether fBm scaling justifies tighter or wider targets than the random-walk √τ baseline, and a MULTIFRACTAL STRESS gauge flags when the tape is more turbulent than its own recent norm.",
+      "This layer is DISPLAY-ONLY context — a regime filter and macro read. It never fires or vetoes a trade on its own; use it to size and frame the confluence signals the other strategies produce.",
+    ],
+    signals: "There is no 'fire' here. Read it as context: trend-follow and let targets run in a PERSISTENT regime inside value; fade extremes and tighten targets in a MEAN-REVERT regime stretched above/below value; stand down when stress is high.",
+    tips: [
+      "Hurst lags by ~half its window — it confirms a regime that already began; never treat an H crossing as an entry.",
+      "Strongest framing: a confluence signal that AGREES with the regime (long in PERSISTENT, fade in MEAN-REVERT) and isn't fighting the value area.",
+      "High multifractal stress = unstable scaling; expect wider noise and treat target projections with caution.",
+    ],
+  },
+  {
     key: "Footprint",
     desc: "Order-flow bid / ask delta",
     stat: "72% win",
