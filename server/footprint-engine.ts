@@ -1,12 +1,13 @@
 // FOOTPRINT-STRATEGY: created by footprint integration — do not edit manually
 import { db } from "./db";
-import { signalHistory } from "@shared/schema";
-import { and, eq, isNull, or } from "drizzle-orm";
+import { signalHistory, footprintCandles } from "@shared/schema";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 
 // ── Broadcast reference (injected by index.ts) ─────────────────────────────
 let _broadcast: ((msg: object) => void) | null = null;
 export function initFootprintEngine(broadcastFn: (msg: object) => void): void {
   _broadcast = broadcastFn;
+  hydrateFromDb(); // FOOTPRINT-STRATEGY: restore in-memory store from DB so history/signals work post-restart
   // Every 10s push in-progress snapshots so clients don't have to wait for a bucket rollover
   setInterval(() => {
     for (const [key, builder] of builders) {
@@ -112,9 +113,78 @@ function storeKey(symbol: string, interval: string): string {
 function pushCandle(symbol: string, interval: string, candle: FootprintCandle): void {
   const key = storeKey(symbol, interval);
   const arr = candleStore.get(key) ?? [];
-  arr.push(candle);
-  if (arr.length > 50) arr.shift();
+  // Dedupe by time: the 10s preview interval + every footprint_bar both push the CURRENT bucket,
+  // and rollover pushes its finalized version. Replace the same-bucket entry instead of appending,
+  // otherwise the 50-slot cap fills with repeats of one bucket (~15min of history, not ~4h of 5m).
+  const last = arr[arr.length - 1];
+  if (last && last.time === candle.time) {
+    arr[arr.length - 1] = candle; // preview→preview refresh, or preview→complete on rollover
+  } else {
+    arr.push(candle);
+    if (arr.length > 50) arr.shift();
+  }
   candleStore.set(key, arr);
+  persistCandle(candle); // FOOTPRINT-STRATEGY: durably write to DB so it survives restarts + the 50-cap
+}
+
+// ── DB persistence ─────────────────────────────────────────────────────────
+// Every candle that flows through pushCandle (forming previews + finalized candles) is upserted
+// keyed on (symbol, interval, time). Previews get overwritten by the complete candle when the
+// bucket rolls; the last partial candle of a session is retained if MW disconnects before rollover.
+
+function persistCandle(candle: FootprintCandle): void {
+  try {
+    db.insert(footprintCandles).values({
+      symbol:   candle.symbol.toUpperCase(),
+      interval: candle.interval,
+      time:     candle.time,
+      complete: candle.complete ? 1 : 0,
+      data:     JSON.stringify(candle),
+    }).onConflictDoUpdate({
+      target: [footprintCandles.symbol, footprintCandles.interval, footprintCandles.time],
+      set: {
+        complete:  candle.complete ? 1 : 0,
+        data:      JSON.stringify(candle),
+        updatedAt: sql`(datetime('now'))`,
+      },
+    }).run();
+  } catch { /* non-fatal — table may not exist yet on first boot */ }
+}
+
+/** Load persisted footprint candles for a symbol+interval, ascending by time (most recent `limit`). */
+export function loadPersistedCandles(symbol: string, interval: string, limit = 600): FootprintCandle[] {
+  try {
+    const rows = db.select({ data: footprintCandles.data })
+      .from(footprintCandles)
+      .where(and(
+        eq(footprintCandles.symbol, symbol.toUpperCase()),
+        eq(footprintCandles.interval, interval),
+      ))
+      .orderBy(desc(footprintCandles.time))
+      .limit(limit)
+      .all() as { data: string }[];
+    const out: FootprintCandle[] = [];
+    for (const r of rows) {
+      try { out.push(JSON.parse(r.data) as FootprintCandle); } catch { /* skip corrupt row */ }
+    }
+    return out.reverse(); // ascending by time
+  } catch {
+    return [];
+  }
+}
+
+/** Warm the in-memory store from DB at startup so signal analysis works right after a restart. */
+function hydrateFromDb(): void {
+  try {
+    const keys = db.selectDistinct({ symbol: footprintCandles.symbol, interval: footprintCandles.interval })
+      .from(footprintCandles).all() as { symbol: string; interval: string }[];
+    for (const { symbol, interval } of keys) {
+      // Only seed COMPLETE candles so getLatestCandle/getPriorCandles aren't fed a stale preview.
+      const recent = loadPersistedCandles(symbol, interval, 50).filter(c => c.complete);
+      if (recent.length) candleStore.set(storeKey(symbol, interval), recent.slice(-50));
+    }
+    if (keys.length) console.log(`[footprint] hydrated ${keys.length} store(s) from DB`);
+  } catch { /* table may not exist yet */ }
 }
 
 export function getLatestCandle(symbol: string, interval: string): FootprintCandle | null {

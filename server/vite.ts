@@ -22,7 +22,13 @@ export async function setupVite(server: Server, app: Express) {
       ...viteLogger,
       error: (msg, options) => {
         viteLogger.error(msg, options);
-        process.exit(1);
+        // Only exit for fatal Vite errors (module not found, config failure) — not for
+        // client-side TypeScript / transform errors which are recoverable and should NOT
+        // kill the server process (the old `process.exit(1)` here was the primary cause
+        // of the server crashing whenever a client file had a compile-time warning).
+        if (msg.includes("Cannot find module") || msg.includes("failed to load config")) {
+          process.exit(1);
+        }
       },
     },
     server: serverOptions,

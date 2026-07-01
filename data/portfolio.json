@@ -1,0 +1,240 @@
+{
+  "watchlist": [],
+  "holdings": [],
+  "followedPoliticians": [],
+  "coreTargetPct": 70,
+  "coreEtf": "VTI",
+  "dca": {
+    "enabled": true,
+    "mode": "paper",
+    "keyId": "PKDSDMHL6JRBIQGI67PKXIU74R",
+    "secretKey": "DKQgb55wDJTRk4bm8R5MNPcVffzX9yRkrX8R4kvJJiZt",
+    "amountPerRun": 50,
+    "cadence": "weekly",
+    "dayOfWeek": 1,
+    "dayOfMonth": 1,
+    "allocations": [
+      {
+        "ticker": "VOO",
+        "weight": 50
+      },
+      {
+        "ticker": "VTI",
+        "weight": 30
+      },
+      {
+        "ticker": "QQQ",
+        "weight": 20
+      }
+    ],
+    "lastRunISO": "2026-06-22T14:00:08.897Z",
+    "rebalanceEnabled": false,
+    "etfCorePct": 40,
+    "etfCoreTickers": [
+      "VOO",
+      "VTI"
+    ],
+    "minPickScore": 62,
+    "lastRebalanceISO": null
+  },
+  "dcaLog": [
+    {
+      "id": "51a507d0-f7f2-4a65-a5d0-be9e4e8fe0f0",
+      "ts": "2026-06-22T14:00:08.897Z",
+      "ticker": "VOO",
+      "notional": 25,
+      "status": "pending_new",
+      "mode": "paper",
+      "trigger": "scheduled",
+      "orderId": "62d51d87-2cb3-49f3-9f5d-87ece9dbc5df",
+      "filledQty": 0
+    },
+    {
+      "id": "657fe85d-8f75-4665-815b-d4bba77c2991",
+      "ts": "2026-06-22T14:00:08.897Z",
+      "ticker": "VTI",
+      "notional": 15,
+      "status": "pending_new",
+      "mode": "paper",
+      "trigger": "scheduled",
+      "orderId": "1f6a7112-6684-45a2-834d-9b155ac2615e",
+      "filledQty": 0
+    },
+    {
+      "id": "33e41481-9b00-46b4-b454-46ad82178082",
+      "ts": "2026-06-22T14:00:08.897Z",
+      "ticker": "QQQ",
+      "notional": 10,
+      "status": "pending_new",
+      "mode": "paper",
+      "trigger": "scheduled",
+      "orderId": "37ccb64f-65af-434c-9332-4e9361d4ea49",
+      "filledQty": 0
+    },
+    {
+      "id": "c61ad9dd-3135-4539-a41c-7529df500b8f",
+      "ts": "2026-06-15T14:02:45.667Z",
+      "ticker": "VOO",
+      "notional": 25,
+      "status": "pending_new",
+      "mode": "paper",
+      "trigger": "scheduled",
+      "orderId": "5c664d55-b8ba-4866-be6e-65a08821f4aa",
+      "filledQty": 0
+    },
+    {
+      "id": "238270db-c94e-48ae-b7d4-b3fcb70defd2",
+      "ts": "2026-06-15T14:02:45.667Z",
+      "ticker": "VTI",
+      "notional": 15,
+      "status": "pending_new",
+      "mode": "paper",
+      "trigger": "scheduled",
+      "orderId": "4bda2c8c-01b7-4f70-bff6-18a1bc40f0d4",
+      "filledQty": 0
+    },
+    {
+      "id": "397c1ef5-d245-459e-873e-584e9d7908c6",
+      "ts": "2026-06-15T14:02:45.667Z",
+      "ticker": "QQQ",
+      "notional": 10,
+      "status": "pending_new",
+      "mode": "paper",
+      "trigger": "scheduled",
+      "orderId": "cbb5b0ee-bab8-4231-b787-e8f5d09a90b8",
+      "filledQty": 0
+    },
+    {
+      "id": "041cf383-1b67-4616-85f6-b39ba51b4482",
+      "ts": "2026-06-13T18:46:09.758Z",
+      "ticker": "VOO",
+      "notional": 25,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "5f8cb44a-263c-40d5-bbcd-c9c9b5c29e71",
+      "filledQty": 0
+    },
+    {
+      "id": "4df11813-36e0-4b46-a3ee-7b105c575451",
+      "ts": "2026-06-13T18:46:09.758Z",
+      "ticker": "VTI",
+      "notional": 15,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "bf7d4544-ebf5-49a1-9aee-d036c190f93e",
+      "filledQty": 0
+    },
+    {
+      "id": "9620cfa7-c4eb-4bf1-a40d-fd40bfc0e031",
+      "ts": "2026-06-13T18:46:09.758Z",
+      "ticker": "QQQ",
+      "notional": 10,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "8d9d06af-f5f8-4aa2-81a6-95898da09626",
+      "filledQty": 0
+    },
+    {
+      "id": "9bbc6d80-719f-4157-b18d-e77048d33246",
+      "ts": "2026-06-13T18:45:41.400Z",
+      "ticker": "VOO",
+      "notional": 25,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "ef8bb5d9-985a-4ae0-9816-bca74fcd6b49",
+      "filledQty": 0
+    },
+    {
+      "id": "c9e2ae33-77df-4bf4-99bb-4f2742b45370",
+      "ts": "2026-06-13T18:45:41.400Z",
+      "ticker": "VTI",
+      "notional": 15,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "75a3e1a1-b5f1-4ce6-8bb7-7140872fc2e6",
+      "filledQty": 0
+    },
+    {
+      "id": "35aee723-3e66-439f-aafb-3916f27cd828",
+      "ts": "2026-06-13T18:45:41.400Z",
+      "ticker": "QQQ",
+      "notional": 10,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "afd27be4-e79e-4207-8138-3841daa79e71",
+      "filledQty": 0
+    },
+    {
+      "id": "ae59a376-c50f-4921-a226-26d7945136ac",
+      "ts": "2026-06-13T18:45:38.094Z",
+      "ticker": "VOO",
+      "notional": 25,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "242fb117-7894-455f-98f6-015d87ba02a0",
+      "filledQty": 0
+    },
+    {
+      "id": "ed4c71c6-8978-4c1b-b4e0-94e2e62f63d7",
+      "ts": "2026-06-13T18:45:38.094Z",
+      "ticker": "VTI",
+      "notional": 15,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "13d68b49-3581-4faf-bcaa-3cca54474402",
+      "filledQty": 0
+    },
+    {
+      "id": "77961c6d-44bb-4653-8871-5426b384f880",
+      "ts": "2026-06-13T18:45:38.094Z",
+      "ticker": "QQQ",
+      "notional": 10,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "b8bf79e6-7577-463d-aaf7-88d606b81ff7",
+      "filledQty": 0
+    },
+    {
+      "id": "ca725240-33c0-47b3-9bf6-b0ba7eb02141",
+      "ts": "2026-06-13T16:30:46.046Z",
+      "ticker": "VOO",
+      "notional": 25,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "4b454284-e5e5-4bef-ad93-08a84d558677",
+      "filledQty": 0
+    },
+    {
+      "id": "ed0e8c56-c412-4a4c-80e2-09089814b13a",
+      "ts": "2026-06-13T16:30:46.046Z",
+      "ticker": "VTI",
+      "notional": 15,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "b16ba25c-5ea4-4af8-a7e1-8cac73e1e355",
+      "filledQty": 0
+    },
+    {
+      "id": "d5c216cb-0172-4178-b8dd-fc34300a3820",
+      "ts": "2026-06-13T16:30:46.046Z",
+      "ticker": "QQQ",
+      "notional": 10,
+      "status": "accepted",
+      "mode": "paper",
+      "trigger": "manual",
+      "orderId": "45c447ef-3d0f-4a44-adaf-36a2fa44e5fc",
+      "filledQty": 0
+    }
+  ]
+}

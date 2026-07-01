@@ -8,7 +8,6 @@ import {
   type ISeriesApi,
   type CandlestickData,
   type HistogramData,
-  type WhitespaceData,
   type LineData,
   LineStyle,
   ColorType,
@@ -57,7 +56,7 @@ export interface ChartHandle {
   setVisibleLogicalRange: (from: number, to: number) => void;
 }
 
-export type DrawingTool = "cursor" | "pan" | "detail" | "line" | "hline" | "vline" | "rectangle" | "fibonacci";
+export type DrawingTool = "cursor" | "pan" | "detail" | "line" | "hline" | "vline" | "rectangle" | "fibonacci" | "signal";
 
 export interface LineDrawing   { id: string; type: "line";      t1: number; p1: number; t2: number; p2: number; color: string; }
 export interface HLineDrawing  { id: string; type: "hline";     price: number; color: string; style?: "solid" | "dashed"; }
@@ -167,8 +166,8 @@ interface CandlestickChartProps {
   confluenceSignals?: Array<{
     time: number; price: number; direction: "Long" | "Short";
     tp1: number; tp2: number; sl: number; toTime: number;
-    riskLevel?: "safe" | "risky" | "riskiest";
-    signalType?: "confluence" | "trend" | "pure_tabletop" | "side_tabletop";
+    riskLevel?: "safeplus" | "safe" | "risky" | "riskiest";
+    signalType?: string; // "confluence" | "trend" | "pure_tabletop" | "side_tabletop" | "vector-side-entry"
     confirmations?: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
     reclassifyReason?: string;
     /** Side-entry tabletop: the consolidation range that was broken out of */
@@ -192,14 +191,20 @@ interface CandlestickChartProps {
   onClearDrawings?: () => void;
   onUndoDrawing?: () => void;
   onVisibleRangeChange?: (from: number, to: number) => void;
+  /** Called when user clicks a candle while in "signal" tool mode. */
+  onManualSignalClick?: (candle: CandleBar) => void;
   theme?: ChartTheme;
   showLabels?: boolean;
   /** When true: signal dots colored green=win / red=loss, "L"/"S" text, no tier fading */
   backtestMode?: boolean;
   /** Changing this key forces a zoom reset to the last 80 candles (use interval string, e.g. "15m"). */
   intervalKey?: string;
+  /** Increment this to force a full series.setData() even when bar timestamps are unchanged (e.g. after a DB refresh that corrects historical OHLCV). */
+  refreshKey?: number;
   /** When set, renders per-candle footprint bid×ask at each 0.25-tick price level inside each candle. */
   candleFootprints?: Map<number, FootprintCandle>; // FOOTPRINT-RENDER:
+  /** Real MW tick data: per-candle bid×ask volume at 0.25-tick price levels (MW Volume Imprint style). */
+  perCandleFootprints?: Map<number, FootprintCandle>; // FOOTPRINT-PER-CANDLE:
   /** Anchor time (first-candle time) of the currently active/incomplete session.
    *  Imbalance ZONES are suppressed for this session; the ladder still renders. */
   activeSessionTime?: number; // FOOTPRINT-RENDER:
@@ -383,7 +388,7 @@ function renderConfluenceSegment(
     : Math.max(sig.sl, sig.price + 0.25);
 
   const ts = chart.timeScale();
-  const x1 = ts.timeToCoordinate(sig.time   as any);
+  const x1 = ts.timeToCoordinate(sig.time as any);
   // For open signals, toTime may be beyond the visible range — fall back to canvas right edge
   const x2Raw = ts.timeToCoordinate(sig.toTime as any);
   const x2 = x2Raw ?? (cw > 0 ? cw : null);
@@ -475,11 +480,14 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     onDetailClick,
     onClearDrawings, onUndoDrawing,
     onVisibleRangeChange,
+    onManualSignalClick,
     theme = CHART_THEMES.motivewave,
     showLabels = true,
     backtestMode = false,
     intervalKey,
+    refreshKey,
     candleFootprints, // FOOTPRINT-RENDER:
+    perCandleFootprints, // FOOTPRINT-PER-CANDLE:
     activeSessionTime, // FOOTPRINT-RENDER:
     frozenImbalances, // FOOTPRINT-RULE:
   } = {} as CandlestickChartProps, ref) {
@@ -499,6 +507,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const bandOverlaysRef  = useRef<BandOverlay[]>([]);
     const zonesRef         = useRef<ZoneBand[]>([]);
     const candleFootprintsRef    = useRef<Map<number, FootprintCandle>>(new Map()); // FOOTPRINT-RENDER:
+    const perCandleFootprintsRef = useRef<Map<number, FootprintCandle>>(new Map()); // FOOTPRINT-PER-CANDLE:
     const activeSessionTimeRef   = useRef<number | undefined>(undefined); // FOOTPRINT-RENDER:
     const frozenImbalancesRef    = useRef<FrozenImbalanceZone[]>([]); // FOOTPRINT-RULE:
     const candlesRef       = useRef<CandleBar[]>([]);
@@ -506,6 +515,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const prevCandleKeyRef = useRef<string>("");
     const prevLastBarRef   = useRef<string>(""); // key of last bar for update() fast path
     const prevIntervalKeyRef = useRef<string | undefined>(intervalKey); // detect interval switches
+    const prevRefreshKeyRef  = useRef<number | undefined>(refreshKey); // detect forced full reload
     const currentPriceLineRef = useRef<any>(null);
     const panRef         = useRef<{ lastX: number; lastY: number; mode: "pan" | "priceScale" } | null>(null);
     const priceOffsetRef = useRef<number>(0); // cumulative vertical pan in price units
@@ -526,6 +536,8 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const [hoverTooltip, setHoverTooltip] = useState<{ x: number; y: number; time: number; open: number; high: number; low: number; close: number } | null>(null);
     const onSignalClickRef = useRef(onSignalClick);
     useEffect(() => { onSignalClickRef.current = onSignalClick; }, [onSignalClick]);
+    const onManualSignalClickRef = useRef(onManualSignalClick);
+    useEffect(() => { onManualSignalClickRef.current = onManualSignalClick; }, [onManualSignalClick]);
     const hoverTooltipRef = useRef(hoverTooltip);
     useEffect(() => { hoverTooltipRef.current = hoverTooltip; }, [hoverTooltip]);
     // Populated each draw frame — {x,y} screen coords + signal info for click hit-testing
@@ -620,8 +632,14 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
         // ── New bucket: open a fresh bar ────────────────────────────────────
         if (bucketSec !== undefined && bucketSec > last.time) {
+          // For session gaps, seed open from the current tick rather than last.close
+          // to avoid a phantom 300+ point bar. Use price-deviation as the heuristic:
+          // normal bar rollovers have <0.5% jump; session gaps can be 3-5%+.
+          // The authoritative "bar" message corrects the open within ~1 second anyway.
+          const priceDev  = last.close > 0 ? Math.abs(price - last.close) / last.close : 1;
+          const openPrice = priceDev > 0.005 ? price : last.close;
           const newBar: CandleBar = {
-            time: bucketSec, open: last.close,
+            time: bucketSec, open: openPrice,
             high: price, low: price, close: price, volume: 0, rth: last.rth,
           };
           lastCandleRef.current = newBar;
@@ -950,17 +968,19 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           horzLine: { color: "rgba(255,255,255,0.55)", width: 1, style: LineStyle.Dashed, labelBackgroundColor: "#1e3050", labelVisible: true },
         },
         localization: {
-          // Display timestamps in local timezone (not UTC)
-          timeFormatter: (t: number) => new Date(t * 1000).toLocaleString(undefined, {
-            month: "short", day: "numeric",
-            hour: "2-digit", minute: "2-digit", hour12: false,
-          }),
+          timeFormatter: (compT: number) => {
+            return new Date(compT * 1000).toLocaleString("en-US", {
+              month: "short", day: "numeric",
+              hour: "2-digit", minute: "2-digit", hour12: false,
+              timeZone: "America/New_York",
+            });
+          },
         },
         timeScale: {
           borderColor: t.axisBorder, timeVisible: true, secondsVisible: false,
           fixLeftEdge: false, fixRightEdge: false, rightOffset: 30, barSpacing: 6, minBarSpacing: 1.0,
-          tickMarkFormatter: (time: number, type: TickMarkType) => {
-            const d = new Date(time * 1000);
+          tickMarkFormatter: (compT: number, type: TickMarkType) => {
+            const d = new Date(compT * 1000);
             const et = { timeZone: "America/New_York" };
             if (type === TickMarkType.Time || type === TickMarkType.TimeWithSeconds)
               return d.toLocaleTimeString("en-US", { ...et, hour: "2-digit", minute: "2-digit", hour12: false });
@@ -1023,8 +1043,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           onCrosshairMoveRef.current?.(null);
           return;
         }
-        setHoverTooltip({ x: param.point.x, y: param.point.y, time: Number(param.time), open: cd.open, high: cd.high, low: cd.low, close: cd.close });
-        onCrosshairMoveRef.current?.({ time:Number(param.time), open:cd.open, high:cd.high, low:cd.low, close:cd.close, volume:vd?.value });
+        const actualTime = Number(param.time);
+        setHoverTooltip({ x: param.point.x, y: param.point.y, time: actualTime, open: cd.open, high: cd.high, low: cd.low, close: cd.close });
+        onCrosshairMoveRef.current?.({ time: actualTime, open:cd.open, high:cd.high, low:cd.low, close:cd.close, volume:vd?.value });
       });
 
       const ro = new ResizeObserver(() => {
@@ -1115,21 +1136,34 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       if (!candleSeriesRef.current || !chartRef.current) return;
       if (!candles.length) {
         candleSeriesRef.current.setData([]); volumeSeriesRef.current?.setData([]);
-        prevCandleKeyRef.current = ""; prevLastBarRef.current = ""; return;
+        // Do NOT reset prevCandleKeyRef here. Resetting it to "" causes wasFirstLoad=true
+        // on the next non-empty render, which triggers an unwanted zoom-to-fit-80-bars
+        // when the query key changes and placeholder data briefly makes candles empty.
+        prevLastBarRef.current = ""; return;
       }
 
-      const sorted = [...candles].sort((a,b) => a.time-b.time);
+      // Sort + dedup by timestamp (DB should never have duplicates, but guard anyway)
+      const sorted = [...candles].sort((a,b) => a.time-b.time)
+        .filter((c, i, arr) => i === 0 || c.time !== arr[i-1].time);
       const last = sorted[sorted.length - 1];
-      // Structural key: first/last timestamp + count — changes when bars are added/removed
-      const structKey = `${sorted[0].time}-${last.time}-${sorted.length}`;
+      // Structural key: timestamps + count + OHLCV fingerprint of historical bars.
+      // The OHLCV fingerprint detects when a DB refresh updates existing bar prices
+      // without adding/removing bars (same timestamps, same count). Without it,
+      // structChanged=false and the fast path only updates the last bar, silently
+      // ignoring corrected historical data.
+      const midIdx = Math.floor(sorted.length / 2);
+      const ohlcvFingerprint = `${sorted[0]?.open?.toFixed(1)},${sorted[0]?.close?.toFixed(1)},${sorted[midIdx]?.open?.toFixed(1)},${sorted[midIdx]?.close?.toFixed(1)}`;
+      const structKey = `${sorted[0].time}-${last.time}-${sorted.length}-${ohlcvFingerprint}`;
       // Last-bar key: encodes the live OHLCV so we detect tick-level changes
       const lastBarKey = `${last.time}:${last.open}:${last.high}:${last.low}:${last.close}`;
 
-      const structChanged = structKey !== prevCandleKeyRef.current;
+      const refreshKeyChanged = refreshKey !== prevRefreshKeyRef.current;
+      const structChanged = refreshKeyChanged || structKey !== prevCandleKeyRef.current;
       const wasFirstLoad = prevCandleKeyRef.current === "";
 
       prevCandleKeyRef.current = structKey;
       prevLastBarRef.current = lastBarKey;
+      prevRefreshKeyRef.current = refreshKey;
 
       const hasETH = sorted.some(c => c.rth === true || c.rth === false);
       const vecMap = new Map<number, number>();
@@ -1138,18 +1172,13 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       const t = themeRef.current;
 
       function mapCandle(c: CandleBar): CandlestickData {
-        const isUp = c.close >= c.open, isETH = hasETH && c.rth === false;
+        const isUp = c.close >= c.open;
         if (useVec) {
           const lb = vecMap.get(c.time), above = lb == null || c.close >= lb;
-          if (isETH) return { time:c.time as any, open:c.open, high:c.high, low:c.low, close:c.close,
-            color: above ? (isUp ? t.upEth : t.downEth) : (isUp ? t.vecBelowUp+"88" : t.vecBelowDown+"88"),
-            wickColor: above ? (isUp ? t.upEth : t.downEth) : (isUp ? t.vecBelowUp+"88" : t.vecBelowDown+"88") };
           return { time:c.time as any, open:c.open, high:c.high, low:c.low, close:c.close,
             color: above ? (isUp ? t.vecAboveUp : t.vecAboveDown) : (isUp ? t.vecBelowUp : t.vecBelowDown),
             wickColor: above ? (isUp ? t.wickUp : t.wickDown) : (isUp ? t.vecBelowUp : t.vecBelowDown) };
         }
-        if (isETH) return { time:c.time as any, open:c.open, high:c.high, low:c.low, close:c.close,
-          color: isUp ? t.upEth : t.downEth, wickColor: isUp ? t.upEth : t.downEth };
         return { time:c.time as any, open:c.open, high:c.high, low:c.low, close:c.close };
       }
 
@@ -1170,11 +1199,11 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         lastCandleRef.current = activeLast;
         livePriceRef.current = { price: activeLast.close, isUp: activeLast.close >= activeLast.open };
         try {
-          candleSeriesRef.current.update(mapCandle(activeLast));
+          const ml = mapCandle(activeLast);
+          candleSeriesRef.current.update({ ...ml, time: activeLast.time as any });
           if (volumeSeriesRef.current) {
-            const isUp = activeLast.close >= activeLast.open, isETH = hasETH && activeLast.rth === false;
-            const vc = isETH ? (isUp ? t.upEth : t.downEth) : (isUp ? t.up+"88" : t.down+"88");
-            volumeSeriesRef.current.update({ time: activeLast.time as any, value: activeLast.volume ?? 0, color: vc });
+            const isUp = activeLast.close >= activeLast.open;
+            volumeSeriesRef.current.update({ time: activeLast.time as any, value: activeLast.volume ?? 0, color: isUp ? t.up+"88" : t.down+"88" });
           }
           return;
         } catch {
@@ -1186,22 +1215,23 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       lastCandleRef.current = last;
       livePriceRef.current = { price: last.close, isUp: last.close >= last.open };
 
-      // ── Full reload: setData ──────────────────────────────────────────────
-      const candleData: (CandlestickData|WhitespaceData)[] = [];
-      const volData: (HistogramData|WhitespaceData)[] = [];
+      // ── Full reload: setData with real unix timestamps ─────────────────────────
+      const candleData: CandlestickData[] = [];
+      const volData: HistogramData[] = [];
       for (let i = 0; i < sorted.length; i++) {
         const c = sorted[i];
+        if (!Number.isFinite(c.open) || !Number.isFinite(c.high) || !Number.isFinite(c.low) || !Number.isFinite(c.close)) continue;
+        if (c.open <= 0 || c.high <= 0 || c.low <= 0 || c.close <= 0 || c.high <= c.low) continue;
         candleData.push(mapCandle(c));
-        const isUp = c.close >= c.open, isETH = hasETH && c.rth === false;
-        const vc = isETH ? (isUp ? t.upEth : t.downEth) : (isUp ? t.up+"88" : t.down+"88");
-        volData.push({ time:c.time as any, value:c.volume ?? 0, color: vc });
+        const isUp = c.close >= c.open;
+        volData.push({ time: c.time as any, value: c.volume ?? 0, color: isUp ? t.up+"88" : t.down+"88" });
       }
 
       candleSeriesRef.current.setData(candleData);
-      volumeSeriesRef.current?.setData(volData as HistogramData[]);
+      volumeSeriesRef.current?.setData(volData);
       if (structChanged) {
         const ts = chartRef.current.timeScale();
-        const total = sorted.length;
+        const total = candleData.length;
         const VIEW_CANDLES = 80;
         // Detect interval or lookback change (intervalKey encodes both) → reset zoom to last 80 bars
         const intervalChanged = prevIntervalKeyRef.current !== intervalKey;
@@ -1224,7 +1254,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           // else: user has intentionally scrolled to view history — leave range as-is
         }
       }
-    }, [candles, vectorData, showVector, theme]);
+    }, [candles, vectorData, showVector, theme, refreshKey]);
 
     // ── Current price tag on Y axis ──────────────────────────────────────────
     useEffect(() => {
@@ -1319,45 +1349,62 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       // ── Band overlays ─────────────────────────────────────────────────
       ctx.save(); ctx.beginPath(); ctx.rect(0,0,cw,clipBottom); ctx.clip();
-      for (const band of bandOverlaysRef.current) {
-        // Convert prices → y coords; if outside visible range, clamp to edges so zone is still visible
-        const rawTy = series.priceToCoordinate(band.topPrice);
-        const rawBy = series.priceToCoordinate(band.bottomPrice);
-        // priceToCoordinate can return null if scale not ready; fall back to edges
-        const ty = rawTy ?? (band.topPrice > (series.priceToCoordinate(0) ?? 0) ? 0 : clipBottom);
-        const by_ = rawBy ?? (band.bottomPrice < 0 ? clipBottom : 0);
-        // Sentinel values: fromTime=0 means left edge, toTime>=9e9 means right edge
-        const lx = band.fromTime === 0
-          ? 0
-          : (ts.timeToCoordinate(band.fromTime as any) ?? 0);
-        const rx = band.toTime >= 9_000_000_000
-          ? cw
-          : (ts.timeToCoordinate(band.toTime as any) ?? cw);
-        const x=Math.min(lx,rx), w=Math.abs(rx-lx);
-        const y=Math.min(ty,by_), h=Math.abs(by_-ty);
-        if (w>0&&h>0) { ctx.fillStyle=band.fillColor; ctx.fillRect(x,y,w,h); }
+      {
+        // Visible time + price bounds — skip bands that are entirely off-screen to prevent
+        // historical signal bands accumulating to an opaque teal shape via canvas clipping.
+        const visRange  = ts.getVisibleRange();
+        const visTimeLo = visRange ? (visRange.from as unknown as number) : 0;
+        const visTimeHi = visRange ? (visRange.to   as unknown as number) : Number.MAX_VALUE;
+        const visPrHi   = series.coordinateToPrice(0)          ?? Infinity;
+        const visPrLo   = series.coordinateToPrice(clipBottom)  ?? -Infinity;
+        for (const band of bandOverlaysRef.current) {
+          // Skip bands entirely outside the visible time range
+          if (band.toTime > 0 && band.toTime < visTimeLo) continue;
+          if (band.fromTime > 0 && band.fromTime > visTimeHi) continue;
+          // Skip bands entirely outside the visible price range
+          if (band.bottomPrice > visPrHi) continue;
+          if (band.topPrice    < visPrLo) continue;
+          // Convert prices → y coords; if outside visible range, clamp to edges so zone is still visible
+          const rawTy = series.priceToCoordinate(band.topPrice);
+          const rawBy = series.priceToCoordinate(band.bottomPrice);
+          // priceToCoordinate can return null if scale not ready; fall back to edges
+          const ty = rawTy ?? (band.topPrice > (series.priceToCoordinate(0) ?? 0) ? 0 : clipBottom);
+          const by_ = rawBy ?? (band.bottomPrice < 0 ? clipBottom : 0);
+          // Sentinel values: fromTime=0 means left edge, toTime>=9e9 means right edge
+          const lx = band.fromTime === 0
+            ? 0
+            : (ts.timeToCoordinate(band.fromTime as any) ?? 0);
+          const rx = band.toTime >= 9_000_000_000
+            ? cw
+            : (ts.timeToCoordinate(band.toTime as any) ?? cw);
+          const x=Math.min(lx,rx), w=Math.abs(rx-lx);
+          const y=Math.min(ty,by_), h=Math.abs(by_-ty);
+          if (w>0&&h>0) { ctx.fillStyle=band.fillColor; ctx.fillRect(x,y,w,h); }
+        }
       }
       ctx.restore();
 
       // ── Zone rectangles: anchored to zone.fromTime → zone.toTime ────────────
       {
         // Build a pixel-density estimator from the two rightmost visible bars.
-        // This lets us convert ANY unix timestamp → canvas X coordinate even when
+        // Converts any unix timestamp → canvas X coordinate even when
         // timeToCoordinate() returns null (bar outside visible range or future).
         let pxPerSec = 0, refX = 0, refT = 0;
         {
-          const sorted = [...candlesRef.current].sort((a, b) => a.time - b.time);
+          const sorted = sortedCandlesRef.current;
           for (let si = sorted.length - 1; si > 0; si--) {
-            const cx1 = ts.timeToCoordinate(sorted[si - 1].time as any) as number | null;
-            const cx2 = ts.timeToCoordinate(sorted[si].time as any)     as number | null;
-            if (cx1 !== null && cx2 !== null && sorted[si].time !== sorted[si - 1].time) {
-              pxPerSec = (cx2 - cx1) / (sorted[si].time - sorted[si - 1].time);
-              refX = cx2; refT = sorted[si].time;
+            const t1 = sorted[si - 1].time;
+            const t2 = sorted[si].time;
+            const cx1 = ts.timeToCoordinate(t1 as any) as number | null;
+            const cx2 = ts.timeToCoordinate(t2 as any) as number | null;
+            if (cx1 !== null && cx2 !== null && t2 !== t1) {
+              pxPerSec = (cx2 - cx1) / (t2 - t1);
+              refX = cx2; refT = t2;
               break;
             }
           }
         }
-        // estX: try timeToCoordinate first; fall back to linear pixel-density estimate.
+        // estX: map unix timestamp → pixel X.
         const estX = (t: number): number => {
           const c = ts.timeToCoordinate(t as any) as number | null;
           return c !== null ? c : (pxPerSec !== 0 ? refX + (t - refT) * pxPerSec : -1);
@@ -1494,6 +1541,158 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
       // ── Footprint rendering: layers 2-5 (below signals for correct z-order) ─── IMBALANCE-FIX: rendering order per spec Part 5
       {
+        const fmtVol = (v: number): string => {
+          if (v >= 1_000_000) return (v / 1_000_000).toFixed(1) + "M";
+          if (v >= 1_000) return Math.round(v / 1_000) + "k";
+          const r = Math.round(v);
+          if (r === 0 && Math.abs(v) >= 0.05) return v.toFixed(1);
+          return String(r);
+        };
+
+        // ── Per-candle MW Volume Imprint ─────────────────────────────────────
+        {
+          const pcfMap = perCandleFootprintsRef.current;
+          if (pcfMap.size > 0) {
+            // Compute bar width from first two visible candles
+            let barW = 0;
+            const allVisCans: typeof candlesRef.current = [];
+            for (const c of candlesRef.current) {
+              const xr = ts.timeToCoordinate(c.time as any);
+              if (xr === null) continue;
+              const x = xr as number;
+              if (x >= -200 && x <= cw + 200) allVisCans.push(c);
+            }
+            if (allVisCans.length >= 2) {
+              const xa = ts.timeToCoordinate(allVisCans[0].time as any) as number;
+              const xb = ts.timeToCoordinate(allVisCans[1].time as any) as number;
+              barW = Math.abs(xb - xa);
+            }
+
+            if (barW >= 8) {
+              const halfW = Math.max(3, Math.floor(barW / 2) - 1);
+
+              for (const c of allVisCans) {
+                const fp = pcfMap.get(c.time);
+                if (!fp || fp.levels.length === 0) continue;
+
+                const xCr = ts.timeToCoordinate(c.time as any);
+                if (xCr === null) continue;
+                const xC = xCr as number;
+
+                const range = c.high - c.low;
+                if (range <= 0) continue;
+                const yHighR = series.priceToCoordinate(c.high);
+                const yLowR  = series.priceToCoordinate(c.low);
+                if (yHighR === null || yLowR === null) continue;
+                const yHigh = yHighR as number;
+                const yLow  = yLowR  as number;
+
+                const pixPerPoint = Math.abs(yLow - yHigh) / range;
+                const rowH = pixPerPoint * 0.25;
+                if (rowH < 0.5) continue;
+
+                let maxVol = 1;
+                for (const lv of fp.levels) {
+                  if (lv.bidVol + lv.askVol > maxVol) maxVol = lv.bidVol + lv.askVol;
+                }
+
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(xC - halfW - 1, 0, (halfW + 1) * 2, clipBottom);
+                ctx.clip();
+
+                for (const lv of fp.levels) {
+                  const yMidR = series.priceToCoordinate(lv.price + 0.125);
+                  if (yMidR === null) continue;
+                  const yMid   = yMidR as number;
+                  const rowTop = yMid - rowH / 2;
+                  const rH     = Math.max(1, rowH);
+
+                  const isPoc  = lv.price === fp.poc;
+                  const isStkB = fp.imbalances.some(im => im.direction === "buy"  && im.stacked && lv.price >= Math.min(im.startPrice, im.endPrice) - 0.25 && lv.price <= Math.max(im.startPrice, im.endPrice) + 0.25);
+                  const isStkS = fp.imbalances.some(im => im.direction === "sell" && im.stacked && lv.price >= Math.min(im.startPrice, im.endPrice) - 0.25 && lv.price <= Math.max(im.startPrice, im.endPrice) + 0.25);
+
+                  // Cell background highlights:
+                  //   Stacked imbalance → solid colored half-cell (MW style)
+                  //   Single imbalance  → subtle tint
+                  //   POC               → amber tint across full row
+                  if (isPoc) {
+                    ctx.fillStyle = "rgba(146,64,14,0.22)";
+                    ctx.fillRect(xC - halfW, rowTop, halfW * 2, rH);
+                  }
+                  if (isStkS) {
+                    ctx.fillStyle = "rgba(200,40,40,0.28)";
+                    ctx.fillRect(xC - halfW, rowTop, halfW, rH);
+                  } else if (lv.imbalance === "sell") {
+                    ctx.fillStyle = "rgba(180,40,40,0.14)";
+                    ctx.fillRect(xC - halfW, rowTop, halfW, rH);
+                  }
+                  if (isStkB) {
+                    ctx.fillStyle = "rgba(30,190,70,0.28)";
+                    ctx.fillRect(xC, rowTop, halfW, rH);
+                  } else if (lv.imbalance === "buy") {
+                    ctx.fillStyle = "rgba(30,160,60,0.14)";
+                    ctx.fillRect(xC, rowTop, halfW, rH);
+                  }
+
+                  // Bid bar (left half — red shades)
+                  if (lv.bidVol > 0) {
+                    const bW = Math.max(1, Math.round((lv.bidVol / maxVol) * halfW));
+                    ctx.fillStyle = isStkS
+                      ? "rgba(240,60,60,0.90)"
+                      : lv.imbalance === "sell" ? "rgba(180,55,55,0.80)"
+                      : "rgba(120,45,45,0.65)";
+                    ctx.fillRect(xC - bW, rowTop, bW, Math.max(1, rH - 1));
+                  }
+
+                  // Ask bar (right half — green shades)
+                  if (lv.askVol > 0) {
+                    const aW = Math.max(1, Math.round((lv.askVol / maxVol) * halfW));
+                    ctx.fillStyle = isStkB
+                      ? "rgba(50,220,90,0.90)"
+                      : lv.imbalance === "buy" ? "rgba(40,170,65,0.80)"
+                      : "rgba(25,110,45,0.65)";
+                    ctx.fillRect(xC, rowTop, aW, Math.max(1, rH - 1));
+                  }
+
+                  // POC border (amber)
+                  if (isPoc) {
+                    ctx.strokeStyle = "rgba(251,191,36,0.95)";
+                    ctx.lineWidth = 1; ctx.setLineDash([]);
+                    ctx.beginPath(); ctx.moveTo(xC - halfW, rowTop);     ctx.lineTo(xC + halfW, rowTop);     ctx.stroke();
+                    ctx.beginPath(); ctx.moveTo(xC - halfW, rowTop + rH); ctx.lineTo(xC + halfW, rowTop + rH); ctx.stroke();
+                  }
+
+                  // Numbers when zoomed in enough
+                  if (barW >= 60 && rH >= 10) {
+                    const fs = Math.min(10, Math.max(7, rH * 0.65));
+                    ctx.font = `${fs}px 'Trebuchet MS',monospace`;
+                    ctx.textBaseline = "middle";
+                    const tY = rowTop + rH / 2;
+                    if (lv.bidVol > 0) {
+                      ctx.fillStyle = isStkS ? "rgba(255,130,130,1)" : "rgba(210,110,110,0.9)";
+                      ctx.textAlign = "right";
+                      ctx.fillText(fmtVol(lv.bidVol), xC - 1, tY);
+                    }
+                    if (lv.askVol > 0) {
+                      ctx.fillStyle = isStkB ? "rgba(80,240,140,1)" : "rgba(55,190,90,0.9)";
+                      ctx.textAlign = "left";
+                      ctx.fillText(fmtVol(lv.askVol), xC + 1, tY);
+                    }
+                  }
+                }
+
+                // Center divider line
+                ctx.strokeStyle = "rgba(80,100,140,0.35)";
+                ctx.lineWidth = 1; ctx.setLineDash([]);
+                ctx.beginPath(); ctx.moveTo(xC - 0.5, yHigh); ctx.lineTo(xC - 0.5, yLow); ctx.stroke();
+
+                ctx.restore();
+              }
+            }
+          }
+        } // end per-candle footprint
+
         const fpMap = candleFootprintsRef.current; // IMBALANCE-FIX:
         if (fpMap.size > 0) { // IMBALANCE-FIX:
           // Detect bar width for column sizing
@@ -1508,11 +1707,6 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             const xb = ts.timeToCoordinate(visCan2[1].time as any); // FOOTPRINT-SIZE-FIX:
             if (xa !== null && xb !== null) barW = Math.max(4, Math.abs((xb as number) - (xa as number))); // FOOTPRINT-SIZE-FIX:
           } // FOOTPRINT-SIZE-FIX:
-          const fmtVol = (v: number): string => { // FOOTPRINT-SIZE-FIX:
-            if (v >= 1_000_000) return (v / 1_000_000).toFixed(1) + "M"; // FOOTPRINT-SIZE-FIX:
-            if (v >= 1_000) return Math.round(v / 1_000) + "k"; // FOOTPRINT-SIZE-FIX:
-            return String(Math.round(v)); // FOOTPRINT-SIZE-FIX:
-          }; // FOOTPRINT-SIZE-FIX:
 
 
 
@@ -1520,42 +1714,45 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           // Each session ladder is ANCHORED to its first candle's x-position.
           // It only renders when that candle is within the viewport.
           // As you pan/zoom, each ladder moves with its candle and can disappear.
-          const C_TOT    = 175;
-          const C_LEFT   = 120, C_RIGHT = 55;
+          const C_TOT    = 80;
           const MIN_ROW_H = 16;
 
           const allAggsFp = [...fpMap.values()]
             .filter(a => a.symbol === "RTH" || a.symbol === "ETH");
 
-          // ── Step 1: Imbalance zones from ALL sessions (drawn before ladders) ──
-          // Current-session zones at full opacity, historical at 28%.
-          // Merge logic removed — will be re-added once zone invalidation rules are known.
+          // ── Step 1: Imbalance zones — sized to each stacked imbalance CLUSTER ─
+          // Restored to the pre-UI-change behavior: each zone band spans the cluster's
+          // full price range (cl.startPrice→cl.endPrice) — i.e. the SIZE of the imbalance
+          // as it appears on the ladder — drawn full-width as a support/resistance level.
+          // Rules (applied upstream in market.tsx buildAggregate): a level is imbalanced at
+          // ratio >= 1.3 & net >= 100; a CLUSTER is `stacked` when 2+ consecutive same-side
+          // imbalanced levels — only stacked clusters render as zones.
+          // Current-session zones at full opacity, historical at 28%; historical zones drop
+          // once a later candle CLOSES through the cluster midprice (mitigation).
           {
             const zX1 = cw - 62;
             if (zX1 > 0) {
               ctx.save();
               ctx.beginPath(); ctx.rect(0, 0, zX1, clipBottom); ctx.clip();
 
-              // Pre-sort candles once for binary-search mitigation check
+              // Pre-sort candles once for the binary-search mitigation check
               const sortedCans = [...candlesRef.current].sort((a, b) => a.time - b.time);
 
               for (const zfp of [...allAggsFp].sort((a, b) => a.time - b.time)) {
-                if (zfp.time === activeSessionTimeRef.current) continue; // FOOTPRINT-RENDER: skip zones for active (incomplete) session — ladder still renders below
+                if (zfp.time === activeSessionTimeRef.current) continue; // active session: ladder only, no zones
                 const xfR2 = ts.timeToCoordinate(zfp.time as any);
                 const isCurZ = xfR2 !== null && (xfR2 as number) >= 0 && (xfR2 as number) <= cw;
                 const aM = isCurZ ? 1.0 : 0.28;
 
-                // For historical sessions: find first candle index after this session
-                // RTH sessions run ~6.5h (23400s); ETH ~17h (61200s). Use 25000s as cutoff.
+                // First candle index strictly after this session (RTH ~6.5h, ETH ~17h → 25000s cutoff)
                 const postSessionStart = zfp.time + 25000;
-                // Binary search: find first candle index >= postSessionStart
                 let bsLo = 0, bsHi = sortedCans.length;
                 while (bsLo < bsHi) {
                   const bsMid = (bsLo + bsHi) >> 1;
                   if (sortedCans[bsMid].time < postSessionStart) bsLo = bsMid + 1;
                   else bsHi = bsMid;
                 }
-                const postStart = bsLo; // index of first candle strictly after this session
+                const postStart = bsLo;
 
                 for (const cl of zfp.imbalances) {
                   if (!cl.stacked) continue; // only strong (stacked) imbalances shown as zones
@@ -1563,7 +1760,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
                   const hi  = Math.max(cl.startPrice, cl.endPrice);
                   const buy = cl.direction === "buy";
 
-                  // Mitigation: skip historical zones whose midPrice has been closed through
+                  // Mitigation: skip historical zones whose midprice has been closed through
                   if (!isCurZ) {
                     const midPrice = (lo + hi) / 2;
                     let mitigated = false;
@@ -1605,8 +1802,6 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           const renderFpLadder = (fp: FootprintCandle, xFirst: number) => {
             if (fp.levels.length < 1 || fp.high <= fp.low) return;
             const xL   = xFirst;
-            const xDiv = xL + C_LEFT;
-            const xR   = xDiv + C_RIGHT;
 
             const lvSorted = [...fp.levels].sort((a, b) => b.price - a.price);
             const stkBuyFp  = new Set<number>();
@@ -1639,7 +1834,11 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             }
             const skip     = Math.max(1, Math.ceil(MIN_ROW_H / pixPerLevel));
             const displayH = pixPerLevel * skip;
-            const rows     = visible.filter((lv, i) => i % skip === 0 || lv.price === fp.poc);
+            // Always keep the first (session HIGH/HOD) and last (session LOW/LOD) visible
+            // levels so the ladder spans the full session high→low — the sampler would
+            // otherwise drop the bottom row unless its index happened to land on `skip`.
+            const rows     = visible.filter((lv, i) =>
+              i % skip === 0 || i === visible.length - 1 || lv.price === fp.poc);
 
             ctx.save();
             ctx.beginPath(); ctx.rect(xL, 0, C_TOT, clipBottom); ctx.clip();
@@ -1688,9 +1887,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
                 : null;
               if (stripe) { ctx.fillStyle = stripe; ctx.fillRect(xL, rTop, 2, rH); }
 
-              // Column divider + row separator
-              ctx.fillStyle = "rgba(255,255,255,0.05)";
-              ctx.fillRect(xDiv, rTop, 1, rH);
+              // Row separator
               ctx.fillStyle = "rgba(255,255,255,0.03)";
               ctx.fillRect(xL, rTop + rH - 1, C_TOT, 1);
 
@@ -1716,10 +1913,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
                 : isBuy         ? "#4ade80"
                 :                  "rgba(128, 140, 160, 0.88)";
               ctx.fillStyle = tc;
-              ctx.textAlign = "left";
-              ctx.fillText(`${fmtVol(lv.bidVol)} × ${fmtVol(lv.askVol)}`, xL + 7, tY);
               ctx.textAlign = "center";
-              ctx.fillText(fmtVol(lv.bidVol + lv.askVol), xDiv + C_RIGHT / 2, tY);
+              const netDelta = lv.askVol - lv.bidVol;
+              ctx.fillText((netDelta >= 0 ? "+" : "") + fmtVol(netDelta), xL + C_TOT / 2, tY);
             }
 
             // Outer border
@@ -1742,7 +1938,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
               const y = vy as number;
               if (y < 0 || y > clipBottom) return;
               ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.setLineDash([3, 2]);
-              ctx.beginPath(); ctx.moveTo(xL, y); ctx.lineTo(xR, y); ctx.stroke();
+              ctx.beginPath(); ctx.moveTo(xL, y); ctx.lineTo(xL + C_TOT, y); ctx.stroke();
               ctx.setLineDash([]);
               ctx.fillStyle = col; ctx.textAlign = "right";
               ctx.fillText(lbl, xL - 3, y);
@@ -1752,13 +1948,15 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             ctx.restore();
           }; // end renderFpLadder
 
-          // Draw each session's ladder anchored at its first candle
-          // Visibility: first candle must be within [0, cw]
+          // Each session's ladder is anchored to its FIRST candle's x-position.
+          // No right-edge "reference" pin — ladders move with their session's first
+          // candle and disappear when that candle pans off-screen (as the header comment
+          // for this block describes). This restores the on-first-candle behavior.
           for (const fp of allAggsFp) {
             const xfR = ts.timeToCoordinate(fp.time as any);
             if (xfR === null) continue;
             const xf = xfR as number;
-            if (xf < 0 || xf > cw) continue; // first candle off-screen — ladder hidden
+            if (xf < 0 || xf > cw) continue; // session's first candle off-screen — skip
             renderFpLadder(fp, xf);
           }
         } // IMBALANCE-FIX: end fpMap.size > 0
@@ -1795,8 +1993,8 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         const st = sig.signalType as string | undefined;
         // In backtest mode all dots are uniform; otherwise fade risky/riskiest
         const segAlpha = backtestModeRef.current ? 1.0 : (rl === "risky" ? 0.6 : rl === "riskiest" ? 0.35 : 1.0);
-        // Circle radius: backtest=9 always; else safe=9, risky=7, riskiest=5
-        const circleR  = backtestModeRef.current ? 9 : (rl === "risky" ? 7 : rl === "riskiest" ? 5 : 9);
+        // Circle radius: best=11 (largest), safe=9, risky=7, riskiest=5
+        const circleR  = backtestModeRef.current ? 9 : (rl === "safeplus" ? 11 : rl === "risky" ? 7 : rl === "riskiest" ? 5 : 9);
 
         const sx = ts.timeToCoordinate(sig.time as any);
         const sy = series.priceToCoordinate(sig.price);
@@ -1858,6 +2056,21 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           ctx.restore();
         }
 
+        // Stem: thin dashed line from signal price to circle edge
+        {
+          ctx.save();
+          ctx.globalAlpha = segAlpha * 0.6;
+          ctx.strokeStyle = isLong ? "rgba(38,200,122,0.7)" : "rgba(239,83,80,0.7)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 2]);
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(sx, isLong ? cy - circleR : cy + circleR);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.restore();
+        }
+
         ctx.save();
         ctx.globalAlpha = segAlpha;
 
@@ -1891,6 +2104,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             const isOpen = oc === "open";
             fillClr = isWin ? "rgba(38,200,122,0.92)" : isOpen ? "rgba(100,110,120,0.7)" : "rgba(239,83,80,0.92)";
             ringClr = isWin ? "rgba(0,60,30,0.7)"     : isOpen ? "rgba(40,50,60,0.6)"   : "rgba(80,0,0,0.7)";
+          } else if (rl === "safeplus") {
+            fillClr = "rgba(167,139,250,0.95)"; // violet — SAFE+ tier marker
+            ringClr = "rgba(60,30,120,0.7)";
           } else {
             fillClr = isLong ? "rgba(38,200,122,0.92)" : "rgba(239,83,80,0.92)";
             ringClr = isLong ? "rgba(0,60,30,0.7)"     : "rgba(80,0,0,0.7)";
@@ -1969,15 +2185,28 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           if (!isFinite(nativeInterval)) nativeInterval = 60;
           const breakThreshold = nativeInterval * 3;
 
+          // Binary search clip: only iterate points in the visible time range.
+          // This turns an O(n-total) pass into O(n-visible) on every animation frame.
+          const visRange = ts.getVisibleRange();
+          const visFrom = visRange ? (visRange.from as unknown as number) - nativeInterval * 2 : 0;
+          const visTo   = visRange ? (visRange.to   as unknown as number) + nativeInterval * 2 : Infinity;
+          let kStart = 0;
+          { let lo = 0, hi = sorted.length;
+            while (lo < hi) { const mid = (lo + hi) >> 1; if ((sorted[mid].time as number) < visFrom) lo = mid + 1; else hi = mid; }
+            kStart = Math.max(0, lo - 1); }
+          let kEnd = sorted.length;
+          { let lo = kStart, hi = sorted.length;
+            while (lo < hi) { const mid = (lo + hi) >> 1; if ((sorted[mid].time as number) <= visTo) lo = mid + 1; else hi = mid; }
+            kEnd = Math.min(sorted.length, lo + 1); }
+
           ctx.beginPath();
           ctx.strokeStyle = ev.color;
           ctx.lineWidth = 2;
           ctx.globalAlpha = 0.85;
           let started = false;
-          for (let k = 0; k < sorted.length; k++) {
+          for (let k = kStart; k < kEnd; k++) {
             const pt = sorted[k];
-            // Break path at session/overnight boundaries
-            if (k > 0 && pt.time - sorted[k - 1].time > breakThreshold) started = false;
+            if (k > kStart && pt.time - sorted[k - 1].time > breakThreshold) started = false;
             const x = ts.timeToCoordinate(pt.time as any);
             const y = series.priceToCoordinate(pt.value);
             if (x === null || y === null) { started = false; continue; }
@@ -1985,16 +2214,35 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
             else ctx.lineTo(x, y);
           }
           ctx.stroke();
-          // Label at the right end
-          const last = sorted[sorted.length - 1];
-          const lx = ts.timeToCoordinate(last.time as any);
-          const ly = series.priceToCoordinate(last.value);
-          if (lx !== null && ly !== null) {
-            ctx.font = "bold 10px 'Trebuchet MS', monospace";
-            ctx.textAlign = "left";
-            ctx.globalAlpha = 1;
-            ctx.fillStyle = ev.color;
-            ctx.fillText(`Vec ${ev.label}`, lx + 4, ly - 4);
+          // Label: find the rightmost visible point within the canvas (before price scale)
+          {
+            const PRICE_SCALE_W = 68;
+            const rightBound = cw - PRICE_SCALE_W;
+            let lblX: number | null = null;
+            let lblY: number | null = null;
+            for (let k = kEnd - 1; k >= kStart; k--) {
+              const x = ts.timeToCoordinate(sorted[k].time as any);
+              if (x === null) continue;
+              if (x >= 0 && x <= rightBound) {
+                const y = series.priceToCoordinate(sorted[k].value);
+                if (y !== null) { lblX = x; lblY = y; break; }
+              }
+              if (x > rightBound && lblX === null) {
+                const y = series.priceToCoordinate(sorted[k].value);
+                if (y !== null) { lblX = rightBound - 2; lblY = y; }
+              }
+            }
+            if (lblX !== null && lblY !== null) {
+              ctx.font = "bold 10px 'Trebuchet MS', monospace";
+              ctx.globalAlpha = 1;
+              ctx.fillStyle = ev.color;
+              const labelText = `Vec ${ev.label}`;
+              const tw = ctx.measureText(labelText).width;
+              // Clamp so label never overflows into the price scale
+              const finalX = Math.min(lblX + 4, rightBound - tw - 2);
+              ctx.textAlign = "left";
+              ctx.fillText(labelText, finalX, lblY - 4);
+            }
           }
         }
         ctx.globalAlpha = 1;
@@ -2031,6 +2279,19 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     // Keep ref in sync so updateLastBarClose() can schedule a redraw without a stale closure
     drawAllRef.current = drawAll;
 
+    // Sync footprint canvas dimensions when the container resizes (e.g., panel open/close, window resize).
+    // The chart's own ResizeObserver only updates lw-charts — this one keeps the canvas overlay in sync.
+    useEffect(() => {
+      const el = containerRef.current;
+      if (!el) return;
+      const ro = new ResizeObserver(() => {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = requestAnimationFrame(drawAllRef.current);
+      });
+      ro.observe(el);
+      return () => ro.disconnect();
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
     // Extra vectors: sync to ref + schedule redraw (canvas rendering — no LineSeries)
     useEffect(() => {
       extraVectorsRef.current = (extraVectors ?? []).map(ev => ({
@@ -2041,12 +2302,19 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       rafIdRef.current = requestAnimationFrame(drawAll);
     }, [extraVectors, drawAll]);
 
-    // Sync per-candle footprint data to ref and redraw // FOOTPRINT-RENDER:
+    // Sync session-aggregate footprint data to ref and redraw // FOOTPRINT-RENDER:
     useEffect(() => { // FOOTPRINT-RENDER:
       candleFootprintsRef.current = candleFootprints ?? new Map(); // FOOTPRINT-RENDER:
       cancelAnimationFrame(rafIdRef.current); // FOOTPRINT-RENDER:
       rafIdRef.current = requestAnimationFrame(drawAll); // FOOTPRINT-RENDER:
     }, [candleFootprints, drawAll]); // FOOTPRINT-RENDER:
+
+    // Sync real MW per-candle footprint data to ref and redraw // FOOTPRINT-PER-CANDLE:
+    useEffect(() => { // FOOTPRINT-PER-CANDLE:
+      perCandleFootprintsRef.current = perCandleFootprints ?? new Map(); // FOOTPRINT-PER-CANDLE:
+      cancelAnimationFrame(rafIdRef.current); // FOOTPRINT-PER-CANDLE:
+      rafIdRef.current = requestAnimationFrame(drawAll); // FOOTPRINT-PER-CANDLE:
+    }, [perCandleFootprints, drawAll]); // FOOTPRINT-PER-CANDLE:
 
     // Sync active session anchor so zone-draw loop can skip it // FOOTPRINT-RENDER:
     useEffect(() => { // FOOTPRINT-RENDER:
@@ -2080,8 +2348,69 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       rafIdRef.current = requestAnimationFrame(drawAll);
     }, [showLabels, drawAll]);
 
+    // Pre-sorted candles ref — updated when candles change so drawAll never re-sorts per frame
+    const sortedCandlesRef = useRef<CandleBar[]>([]);
+    // Pre-computed mitigation cache — key → unix time of first mitigating candle (zone ends at that point)
+    const mitigatedClustersRef = useRef<Map<string, number>>(new Map());
+
     // Keep candles ref in sync
-    useEffect(() => { candlesRef.current = candles || []; }, [candles]);
+    useEffect(() => {
+      candlesRef.current = candles || [];
+      sortedCandlesRef.current = [...(candles || [])].sort((a, b) => a.time - b.time);
+    }, [candles]);
+
+    // Rebuild mitigation cache — must use identical detection logic as the draw loop:
+    //   same-bucket comparison, 1.3 ratio, net >= 100, zone ends at first mitigating candle.
+    useEffect(() => {
+      const sortedCans = sortedCandlesRef.current;
+      const fpMap = candleFootprintsRef.current;
+      const mitigated = new Map<string, number>(); // key → unix time of first mitigating candle
+      const IMBAL_RATIO = 1.3;
+      const NET_MIN = 100;
+      const sortedSessions = [...fpMap.values()]
+        .filter(a => a.symbol === "RTH" || a.symbol === "ETH")
+        .sort((a, b) => a.time - b.time);
+      for (let si = 0; si < sortedSessions.length; si++) {
+        const zfp = sortedSessions[si];
+        if (zfp.levels.length === 0) continue;
+        if (si + 1 >= sortedSessions.length) continue;
+        const nextSessStart = sortedSessions[si + 1].time;
+        let bsLo = 0, bsHi = sortedCans.length;
+        while (bsLo < bsHi) { const bsMid = (bsLo + bsHi) >> 1; if (sortedCans[bsMid].time < nextSessStart) bsLo = bsMid + 1; else bsHi = bsMid; }
+        const postStart = bsLo;
+
+        // Build bucket map (same-bucket comparison)
+        const prices = zfp.levels.map(l => l.price);
+        const minP = Math.min(...prices), maxP = Math.max(...prices);
+        const bktStart = Math.floor(minP / 2) * 2;
+        const bktMap = new Map<number, { bid: number; ask: number }>();
+        for (let bp = bktStart; bp <= maxP + 2; bp += 2) {
+          const inB = zfp.levels.filter(l => l.price >= bp && l.price < bp + 2);
+          bktMap.set(bp, {
+            bid: inB.reduce((s, l) => s + l.bidVol, 0),
+            ask: inB.reduce((s, l) => s + l.askVol, 0),
+          });
+        }
+
+        for (let bp = bktStart; bp <= maxP; bp += 2) {
+          const cur = bktMap.get(bp) ?? { bid: 0, ask: 0 };
+          const net = Math.abs(cur.ask - cur.bid);
+          if (net < NET_MIN) continue;
+          const ratio    = cur.bid > 0 ? cur.ask / cur.bid : cur.ask > 0 ? 999 : 0;
+          const ratioInv = cur.ask > 0 ? cur.bid / cur.ask : cur.bid > 0 ? 999 : 0;
+          const isBuy  = cur.ask > cur.bid && ratio    >= IMBAL_RATIO;
+          const isSell = cur.bid > cur.ask && ratioInv >= IMBAL_RATIO;
+          if (!isBuy && !isSell) continue;
+          const key = `${zfp.time}_${bp}`;
+          for (let mi = postStart; mi < sortedCans.length; mi++) {
+            const mc = sortedCans[mi];
+            // Require close 1 full point beyond zone boundary — prevents noise from invalidating zones
+            if (isBuy ? mc.close < bp - 1 : mc.close > bp + 3) { mitigated.set(key, mc.time); break; }
+          }
+        }
+      }
+      mitigatedClustersRef.current = mitigated;
+    }, [candles, candleFootprints]);
 
     // Subscribe to chart pan/zoom — redraw overlay + notify parent of range change
     useEffect(() => {
@@ -2111,9 +2440,9 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       if (!chart||!series) return null;
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const x = e.clientX-rect.left, y = e.clientY-rect.top;
-      const time = chart.timeScale().coordinateToTime(x), price = series.coordinateToPrice(y);
-      if (time==null||price==null) return null;
-      return { x, y, time: Number(time), price };
+      const rawTime = chart.timeScale().coordinateToTime(x), price = series.coordinateToPrice(y);
+      if (rawTime==null||price==null) return null;
+      return { x, y, time: Number(rawTime), price };
     }, []);
 
     const scheduleDraw = useCallback(() => {
@@ -2123,6 +2452,26 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
     const handleDrawMouseDown = useCallback((e: React.MouseEvent) => {
       if (activeTool === "cursor") return;
+      // ── Signal placement tool: find nearest candle and call back ─────────
+      if (activeTool === "signal") {
+        const chart = chartRef.current;
+        if (!chart) return;
+        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+        const px = e.clientX - rect.left;
+        const t = chart.timeScale().coordinateToTime(px);
+        if (t != null) {
+          const clickTime = Number(t);
+          const bars = sortedCandlesRef.current;
+          if (bars.length) {
+            let lo = 0, hi = bars.length - 1;
+            while (lo < hi) { const mid = (lo + hi) >> 1; if (bars[mid].time < clickTime) lo = mid + 1; else hi = mid; }
+            const nearest = (lo > 0 && Math.abs(bars[lo - 1].time - clickTime) < Math.abs(bars[lo].time - clickTime))
+              ? bars[lo - 1] : bars[lo];
+            onManualSignalClickRef.current?.(nearest);
+          }
+        }
+        return;
+      }
       // ── Detail tool: report candle info on click ────────────────────────
       if (activeTool === "detail") {
         const coords = getChartCoords(e);
@@ -2235,7 +2584,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
 
     const fillParent = height == null;
     const isDrawing = activeTool !== "cursor";
-    const drawCursor = activeTool==="line"||activeTool==="fibonacci" ? "crosshair" : activeTool==="hline" ? "ns-resize" : activeTool==="vline" ? "ew-resize" : "crosshair";
+    const drawCursor = activeTool==="line"||activeTool==="fibonacci"||activeTool==="signal" ? "crosshair" : activeTool==="hline" ? "ns-resize" : activeTool==="vline" ? "ew-resize" : "crosshair";
     const selRect = dragState?.active ? { left:Math.min(dragState.startX,dragState.curX), top:Math.min(dragState.startY,dragState.curY), width:Math.abs(dragState.curX-dragState.startX), height:Math.abs(dragState.curY-dragState.startY) } : null;
 
     return (

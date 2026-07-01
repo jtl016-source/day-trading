@@ -13,7 +13,7 @@ function isRTH(ts: number): boolean {
   const day = d.getUTCDay();
   if (day === 0 || day === 6) return false;
   const m = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return m >= 13 * 60 + 30 && m < 20 * 60; // 9:30 AM – 4:00 PM ET
+  return m >= 13 * 60 + 30 && m < 21 * 60; // 9:30 AM – 5:00 PM ET (EDT)
 }
 
 function isToday(ts: number): boolean {

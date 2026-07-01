@@ -7,3 +7,21 @@ vite.config.ts.*
 .env
 .env.local
 .env.*
+# Runtime SQLite DB + snapshots (never version — 800MB+, changes constantly)
+data/app.db
+data/app.db-wal
+data/app.db-shm
+data/*.db
+data/*.db-*
+data/*.bak
+data/*.backup-*
+data.db
+# Logs
+*.log
+server-*.log
+# Local editor/runtime state
+.local/
+# Compiled Java artifacts from mw-study
+mw-study/*.jar
+mw-study/out/
+**/*.class

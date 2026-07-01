@@ -2,10 +2,14 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "@shared/schema";
 import path from "path";
-import { fileURLToPath } from "url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, "..", "data", "app.db");
+// DB lives at <projectRoot>/data/app.db. Resolve from cwd — both `npm run dev` (tsx) and the
+// production `node dist/index.cjs` are launched from the project root — with a DB_PATH env
+// override. Avoids import.meta/__dirname, which esbuild leaves empty in the cjs bundle (that
+// previously made fileURLToPath("") throw at startup in production).
+const DB_PATH = process.env.DB_PATH
+  ? path.resolve(process.env.DB_PATH)
+  : path.join(process.cwd(), "data", "app.db");
 
 // Ensure data directory exists
 import fs from "fs";
@@ -149,6 +153,9 @@ for (const col of [
 
 // FOOTPRINT-STRATEGY: add footprint_reading column to signal_history (idempotent)
 try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN footprint_reading TEXT`); } catch {} // FOOTPRINT-STRATEGY:
+// PC↔iPhone parity: persist the confirmation breakdown so the phone shows the same
+// MilkZone/Vector/Footprint chips the PC computed (idempotent).
+try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN confirmations TEXT`); } catch {}
 
 // TRADE-JOURNAL: user trade log table
 sqlite.exec(`
@@ -190,6 +197,37 @@ sqlite.exec(`
     reviewed_at     TEXT
   );
 `); // SELF-LEARNING:
+
+// SIGNAL-LABELS: persistent user feedback on individual signals (ML training data)
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS signal_labels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_key  TEXT NOT NULL UNIQUE,
+    signal_time INTEGER NOT NULL,
+    direction   TEXT NOT NULL,
+    risk_level  TEXT NOT NULL,
+    outcome     TEXT NOT NULL DEFAULT 'Open',
+    is_bad      INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT,
+    note        TEXT,
+    labeled_at  TEXT DEFAULT (datetime('now'))
+  );
+`); // SIGNAL-LABELS:
+
+// FOOTPRINT-STRATEGY: durable footprint candle store — the engine keeps only the last 50 candles
+// per symbol+interval in RAM and loses everything on restart. This table persists them as JSON.
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS footprint_candles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT NOT NULL,
+    interval   TEXT NOT NULL,
+    time       INTEGER NOT NULL,
+    complete   INTEGER NOT NULL DEFAULT 0,
+    data       TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(symbol, interval, time)
+  );
+`); // FOOTPRINT-STRATEGY:
 
 // STORAGE FIX: Do NOT wipe cached_candles on startup.
 // MW's persistBulk/persistBar use onConflictDoUpdate — they overwrite individual rows when

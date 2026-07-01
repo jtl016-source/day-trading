@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "async": true,
+            "command": "$j = [Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = $j.tool_input.file_path; if ($fp -and (Test-Path $fp -PathType Leaf) -and $fp -notlike '*.db' -and $fp -notlike '*.db-shm' -and $fp -notlike '*.db-wal') { $ts = Get-Date -Format 'yyyyMMdd-HHmmss-fff'; $rel = $fp -replace [regex]::Escape('c:\\Users\\Jackson\\OneDrive\\day trading iphone\\'), ''; $dst = 'C:\\Users\\Jackson\\day-trading-backups\\' + $ts + '\\' + $rel; try { New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) -ErrorAction Stop | Out-Null; Copy-Item $fp $dst -Force -ErrorAction Stop } catch {} }"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
+import { registerPortfolioRoutes } from "./portfolio/routes"; // isolated portfolio research module
 import { setupLiveBars, broadcast } from "./live-bars";
 import { setupMWReader } from "./mw-reader";
 import { serveStatic } from "./static";
@@ -55,7 +56,19 @@ app.use((req, res, next) => {
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        // NEVER stringify large array payloads (candles/days/signals can be 10MB+) — doing so
+        // re-serializes the whole response just for logging, flooding the log with GBs and
+        // blocking the event loop, which starves other requests (the chart-won't-load bug).
+        // Log a compact summary instead; only stringify small/plain bodies, capped at 200 chars.
+        const r: any = capturedJsonResponse;
+        let preview: string;
+        if (Array.isArray(r?.candles))      preview = `{candles:${r.candles.length}}`;
+        else if (Array.isArray(r?.days))    preview = `{days:${r.days.length}}`;
+        else if (Array.isArray(r?.signals)) preview = `{signals:${r.signals.length}}`;
+        else if (Array.isArray(r))          preview = `[${r.length} items]`;
+        else { try { preview = JSON.stringify(r); } catch { preview = "[unserializable]"; } }
+        if (preview.length > 200) preview = preview.slice(0, 200) + "…";
+        logLine += ` :: ${preview}`;
       }
 
       log(logLine);
@@ -76,6 +89,7 @@ process.on("unhandledRejection", (reason) => {
 (async () => {
   await strategyGuard.init();
   await registerRoutes(httpServer, app);
+  registerPortfolioRoutes(app); // /api/portfolio/* — isolated, no futures-engine coupling
   setupLiveBars(httpServer, app);
   initFootprintEngine(broadcast); // FOOTPRINT-STRATEGY: wire broadcast so footprint_candle messages reach clients
   setupMWReader(httpServer, app);
@@ -107,7 +121,7 @@ process.on("unhandledRejection", (reason) => {
   // Other ports are firewalled. Default to 5000 if not specified.
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
-  const port = parseInt(process.env.PORT || "5000", 10);
+  const port = parseInt(process.env.PORT || "3000", 10);
   httpServer.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
       console.error(`\n[server] Port ${port} is already in use. Kill the old process and restart.\n  Run: npx kill-port ${port}\n`);

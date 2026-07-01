@@ -1,0 +1,225 @@
+[db] cached_candles intact — historical data preserved across restarts
+[discord] Loaded webhook from DB
+[strategy-guard] Loaded strategy: candle-behavior v1.0
+[strategy-guard] Loaded strategy: data-analysis v2.0.0
+[strategy-guard] Loaded strategy: footprint v1.2.0
+[strategy-guard] Loaded strategy: milks-zones v1.2.0
+[strategy-guard] Loaded strategy: pattern-recognition v1.1.0
+[strategy-guard] Loaded strategy: vector v1.1.0
+[strategy-guard] Guarding 6 strategies
+[discord-reader] Auto-started from saved settings
+[portfolio] routes mounted under /api/portfolio/*
+[footprint] hydrated 1 store(s) from DB
+[mw-reader] Starting — data root: C:\Users\jacks\AppData\Roaming\MotiveWave\historical_data\RITHMIC
+[mw-reader] Scanned MESH6.CME: 27 bar files
+[mw-reader] Scanned MESM6.CME: 28 bar files
+[mw-reader] bulkUpsert: rejected 32 body-anomaly bars for MES res=1
+[live-bars] MW study bridge listening on port 5000 (TickRelay + LiveBarRelay + AutoTrader)
+[order-commands] AutoTrader study connected (total: 1)
+8:11:20 AM [express] serving on port 3001
+[order-commands] AutoTrader study connected (total: 2)
+[order-commands] AutoTrader study connected (total: 3)
+[order-commands] AutoTrader study connected (total: 4)
+[mw-feed] MotiveWave study connected
+[mw-reader] tickRelayConnected → true
+[mw-reader] Cleared in-progress bars — TickRelay is now authoritative
+[mw-feed] MotiveWave study connected
+[mw-feed] MotiveWave study connected
+[mw-feed] MotiveWave study connected
+[mw-feed] MotiveWave study connected
+[mw-feed] MotiveWave study connected
+[yahoo-backfill] MES 60m 2025-10-13→2026-06-10: 3733 bars
+[yahoo-backfill] ES 60m 2025-10-13→2026-06-10: 3733 bars
+[yahoo-backfill] MES 60m 2025-02-15→2025-10-13: 3801 bars
+[yahoo-backfill] ES 60m 2025-02-15→2025-10-13: 3801 bars
+8:11:27 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 26ms :: {candles:2127}
+[yahoo-backfill] MES 60m 2024-06-20→2025-02-15: 3757 bars
+[yahoo-backfill] ES 60m 2024-06-20→2025-02-15: 3757 bars
+[yahoo-backfill] MES 5m 2026-04-12→2026-06-10: 11244 bars
+[yahoo-backfill] ES 5m 2026-04-12→2026-06-10: 11244 bars
+[yahoo-backfill] MES 15m 2026-04-12→2026-06-10: 3767 bars
+[yahoo-backfill] MES: +26302 bars
+[yahoo-backfill] ES 15m 2026-04-12→2026-06-10: 3767 bars
+[yahoo-backfill] ES: +26302 bars
+[mw-reader] bulkUpsert: rejected 31 body-anomaly bars for MES res=5
+[mw-reader] bulkUpsert: rejected 29 body-anomaly bars for MES res=60
+[mw-reader] MES: 55 bar files → 156195 1-min, 34790 5-min, 3720 60-min bars
+[mw-reader] MES seed bar is stale (122m old) — skipping in-progress bar init. First tick will self-seed.
+[mw-reader] C:\Users\jacks\AppData\Roaming\MotiveWave\historical_data\RITHMIC\MESM6.CME contains 47 bar files, 4731 tick files
+[mw-reader] Tick files found: 1781064000000.tick_data, 1781067600000.tick_data, 1781092800000.tick_data
+[mw-reader] Active tick file: 1781092800000.tick_data (219550 bytes)
+[mw-reader] readLastTickRecord returned null — keeping bar close as seed
+[mw-reader] fs.watch active on C:\Users\jacks\AppData\Roaming\MotiveWave\historical_data\RITHMIC\MESM6.CME
+[mw-reader] Tick file size: 219550 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 444640 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 669100 bytes (1781092800000.tick_data)
+8:22:25 AM [express] POST /api/push-token 200 in 36ms :: {"ok":true,"registered":1}
+8:22:27 AM [express] GET /api/signals/history/MES/15m 200 in 315ms :: {signals:8353}
+8:22:27 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 36ms :: {candles:2793}
+8:22:27 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:22:27 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 231ms :: {candles:17644}
+8:22:27 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:28 AM [express] GET /api/data/cached-continuous/MES/1m 200 in 849ms :: {candles:81826}
+8:22:30 AM [express] GET /api/signals/history/MES/15m 200 in 129ms :: {signals:8353}
+[live-bars] browser connected (total: 1)
+8:22:30 AM [express] GET /api/discord-zones 200 in 2ms :: {"zones":[]}
+8:22:31 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7326.75,"volume":0,"symbol":"MES"},"price":7326.75}
+8:22:32 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:32 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:35 AM [express] GET /api/live/bar/MES 304 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7326.75,"volume":0,"symbol":"MES"},"price":7326.75}
+8:22:37 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:37 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:39 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7326.25,"volume":0,"symbol":"MES"},"price":7326.25}
+8:22:42 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:22:42 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:43 AM [express] GET /api/signals/history/MES/15m 200 in 71ms :: {signals:8353}
+8:22:43 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 13ms :: {candles:2793}
+8:22:43 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:22:43 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:43 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325.75,"volume":0,"symbol":"MES"},"price":7325.75}
+8:22:47 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325.25,"volume":0,"symbol":"MES"},"price":7325.25}
+8:22:47 AM [express] GET /api/signals/history/MES/15m 200 in 83ms :: {signals:8353}
+8:22:47 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 28ms :: {candles:2793}
+8:22:47 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:47 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325.25,"volume":0,"symbol":"MES"},"price":7325.25}
+8:22:47 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:48 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:48 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:51 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325.5,"volume":0,"symbol":"MES"},"price":7325.5}
+8:22:51 AM [express] GET /api/live/bar/MES 304 in 8ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325.5,"volume":0,"symbol":"MES"},"price":7325.5}
+8:22:52 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:22:52 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:53 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:22:53 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:22:54 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:54 AM [express] GET /api/portfolio/holdings 200 in 4ms :: {"holdings":[],"totalValue":0,"corePct":0,"coreTargetPct":70,"coreEtf":"VTI","dataStale":false,"asOf":1781094174979}
+8:22:54 AM [express] GET /api/portfolio/screener 200 in 1ms :: {"rows":[],"dataStale":false,"asOf":1781094174984}
+8:22:54 AM [express] GET /api/portfolio/health 200 in 1ms :: {"ok":true,"hasApiKey":true,"budget":{"used":0,"warnAt":200,"hardCap":245,"day":20614},"weights":{"pillars":{"quality":30,"value":20,"momentum":20,"smartMoney":20,"congressInsider":10},"quality":{"roe…
+8:22:55 AM [express] GET /api/live/bar/MES 200 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325.25,"volume":0,"symbol":"MES"},"price":7325.25}
+8:22:55 AM [express] GET /api/trade/settings 200 in 0ms :: {"enabled":false,"contracts":1,"tp1Only":false,"direction":"both","contractType":"MES","riskLevels":["safe"],"intervals":["5m"],"exitStrategy":"standard"}
+8:22:55 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:55 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:55 AM [express] GET /api/discord/settings 304 in 0ms :: {"webhook":"https://discord.com/api/webhooks/1503394969153568879/YkBZzWjFLmaOE_abzqFV6MLWW7lBMHQMd3XYgRdDJG0k3XT6HufKxNqDUqpnjd-SV1wQ"}
+8:22:55 AM [express] GET /api/live/bar/MES 200 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.75,"close":7325,"volume":0,"symbol":"MES"},"price":7325}
+8:22:55 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:55 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:57 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:57 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:22:57 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:22:58 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:22:58 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:22:59 AM [express] GET /api/live/bar/MES 200 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.25,"close":7324.5,"volume":0,"symbol":"MES"},"price":7324.5}
+8:22:59 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.25,"close":7324.5,"volume":0,"symbol":"MES"},"price":7324.5}
+8:23:00 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:00 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:00 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:00 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:00 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:02 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:02 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:03 AM [express] GET /api/signals/history/MES/15m 200 in 89ms :: {signals:8353}
+8:23:03 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 13ms :: {candles:2793}
+8:23:03 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324.25,"close":7324.25,"volume":0,"symbol":"MES"},"price":7324.25}
+8:23:03 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:03 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:03 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:03 AM [express] GET /api/live/bar/MES 200 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7324,"close":7324,"volume":0,"symbol":"MES"},"price":7324}
+8:23:05 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:05 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:05 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:05 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:06 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:07 AM [express] GET /api/live/bar/MES 200 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7323.5,"close":7323.75,"volume":0,"symbol":"MES"},"price":7323.75}
+8:23:07 AM [express] GET /api/signals/history/MES/15m 200 in 86ms :: {signals:8353}
+8:23:07 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 13ms :: {candles:2793}
+8:23:07 AM [express] GET /api/live/bar/MES 304 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7323.5,"close":7323.75,"volume":0,"symbol":"MES"},"price":7323.75}
+8:23:07 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:07 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:08 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:08 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:09 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:10 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:10 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:10 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:10 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:11 AM [express] GET /api/live/bar/MES 200 in 0ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7323.5,"close":7324,"volume":0,"symbol":"MES"},"price":7324}
+8:23:11 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7323.5,"close":7324,"volume":0,"symbol":"MES"},"price":7324}
+8:23:12 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:12 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:12 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:13 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:13 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:15 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7323.5,"close":7324.75,"volume":0,"symbol":"MES"},"price":7324.75}
+8:23:15 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":true}
+8:23:15 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":true}
+8:23:15 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:15 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+8:23:15 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:23:15 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094000,"open":7325,"high":7331.75,"low":7323.5,"close":7324.75,"volume":0,"symbol":"MES"},"price":7324.75}
+[mw-reader] Tick file size: 891715 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 1114555 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 1342795 bytes (1781092800000.tick_data)
+8:31:51 AM [express] GET /api/trade/status 200 in 2ms :: {"connected":true}
+[mw-reader] Tick file size: 1569235 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 1793425 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 2018200 bytes (1781092800000.tick_data)
+[mw-reader] Tick file size: 2214985 bytes (1781092800000.tick_data)
+[mw-feed] MotiveWave study disconnected (remaining: 5)
+[mw-feed] MotiveWave study disconnected (remaining: 4)
+[mw-feed] MotiveWave study disconnected (remaining: 3)
+[mw-feed] MotiveWave study disconnected (remaining: 2)
+[mw-feed] MotiveWave study disconnected (remaining: 1)
+[order-commands] AutoTrader study disconnected (remaining: 3)
+[order-commands] AutoTrader study disconnected (remaining: 2)
+[mw-feed] MotiveWave study disconnected (remaining: 0)
+[mw-reader] tickRelayConnected → false
+[order-commands] AutoTrader study disconnected (remaining: 1)
+[order-commands] AutoTrader study disconnected (remaining: 0)
+[mw-tick] 2026-06-10 12:38:19.328 UTC MES price=7355.25
+8:38:24 AM [express] POST /api/push-token 200 in 2ms :: {"ok":true,"registered":1}
+8:38:27 AM [express] GET /api/signals/history/MES/15m 200 in 381ms :: {signals:8354}
+8:38:27 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 39ms :: {candles:2793}
+8:38:27 AM [express] GET /api/trade/status 200 in 1ms :: {"connected":false}
+8:38:27 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 222ms :: {candles:17644}
+8:38:27 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:29 AM [express] GET /api/data/cached-continuous/MES/1m 200 in 1583ms :: {candles:81825}
+8:38:31 AM [express] GET /api/live/bar/MES 200 in 1ms :: {"bar":{"timeSec":1781094900,"open":7353.5,"high":7361.75,"low":7344.75,"close":7355.25,"volume":0,"symbol":"MES"},"price":7355.25}
+8:38:31 AM [express] GET /api/signals/history/MES/15m 200 in 463ms :: {signals:8354}
+[live-bars] browser connected (total: 1)
+8:38:32 AM [express] GET /api/trade/status 304 in 2ms :: {"connected":false}
+8:38:32 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:32 AM [express] GET /api/discord-zones 200 in 2ms :: {"zones":[]}
+8:38:35 AM [express] GET /api/live/bar/MES 304 in 0ms :: {"bar":{"timeSec":1781094900,"open":7353.5,"high":7361.75,"low":7344.75,"close":7355.25,"volume":0,"symbol":"MES"},"price":7355.25}
+8:38:36 AM [express] GET /api/signals/history/MES/15m 200 in 183ms :: {signals:8354}
+8:38:37 AM [express] GET /api/data/cached-continuous/MES/5m 200 in 27ms :: {candles:2793}
+8:38:37 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":false}
+8:38:37 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:37 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":false}
+8:38:37 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:39 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094900,"open":7353.5,"high":7361.75,"low":7344.75,"close":7355.25,"volume":0,"symbol":"MES"},"price":7355.25}
+8:38:40 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094900,"open":7353.5,"high":7361.75,"low":7344.75,"close":7355.25,"volume":0,"symbol":"MES"},"price":7355.25}
+8:38:41 AM [express] GET /api/trade/status 304 in 0ms :: {"connected":false}
+8:38:41 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:42 AM [express] GET /api/trade/status 304 in 1ms :: {"connected":false}
+8:38:42 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:43 AM [express] GET /api/trade/current 304 in 1ms :: {"trade":null}
+8:38:43 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094900,"open":7353.5,"high":7361.75,"low":7344.75,"close":7355.25,"volume":0,"symbol":"MES"},"price":7355.25}
+8:38:43 AM [express] GET /api/portfolio/holdings 200 in 1ms :: {"holdings":[],"totalValue":0,"corePct":0,"coreTargetPct":70,"coreEtf":"VTI","dataStale":false,"asOf":1781095123618}
+8:38:43 AM [express] GET /api/portfolio/screener 200 in 2ms :: {"rows":[],"dataStale":false,"asOf":1781095123635}
+8:38:43 AM [express] GET /api/portfolio/health 304 in 1ms :: {"ok":true,"hasApiKey":true,"budget":{"used":0,"warnAt":200,"hardCap":245,"day":20614},"weights":{"pillars":{"quality":30,"value":20,"momentum":20,"smartMoney":20,"congressInsider":10},"quality":{"roe…
+8:38:44 AM [express] GET /api/live/bar/MES 304 in 1ms :: {"bar":{"timeSec":1781094900,"open":7353.5,"high":7361.75,"low":7344.75,"close":7355.25,"volume":0,"symbol":"MES"},"price":7355.25}
+8:38:46 AM [express] GET /api/trade/current 304 in 0ms :: {"trade":null}
+[mw-feed] MotiveWave study connected
+[mw-reader] tickRelayConnected → true
+[mw-reader] Cleared in-progress bars — TickRelay is now authoritative
+[order-commands] AutoTrader study connected (total: 1)
+[mw-feed] MotiveWave study connected
+[mw-feed] MotiveWave study connected
+[order-commands] AutoTrader study connected (total: 2)
+[mw-feed] MotiveWave study connected
+[order-commands] AutoTrader study connected (total: 3)
+[order-commands] AutoTrader study connected (total: 4)
+[mw-feed] MotiveWave study connected
+[mw-feed] MotiveWave study connected
+[mw-feed] bulk_bars: persisted 2 bars for MES res=15
+8:40:55 AM [express] GET /api/trade/status 200 in 2ms :: {"connected":true}

@@ -306,3 +306,125 @@
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.35; }
 }
+
+/* ============================================================================
+   MIDNIGHT GLOW — UI theme overhaul (deep navy + electric-blue glow)
+   Cosmetic + animation layer only. No layout/logic changes. Prefixed `mg`.
+   ============================================================================ */
+:root {
+  --mg-bg:       #060b14;
+  --mg-bg-2:     #081020;
+  --mg-panel:    #0a1322;
+  --mg-border:   #18293f;
+  --mg-accent:   #2f9bff;
+  --mg-accent-2: #38e0ff;
+  --mg-glow:     rgba(47, 155, 255, 0.55);
+  --mg-text:     #cdd9ea;
+  --mg-muted:    #647fa6;
+}
+
+/* App background: deep navy with layered static glows for depth */
+html, body, #root {
+  background-color: var(--mg-bg);
+}
+body {
+  background-image:
+    radial-gradient(1200px 620px at 10% -12%, rgba(47, 155, 255, 0.10), transparent 60%),
+    radial-gradient(1000px 700px at 112% -4%, rgba(56, 224, 255, 0.07), transparent 55%),
+    radial-gradient(900px 900px at 50% 122%, rgba(47, 155, 255, 0.06), transparent 60%);
+  background-attachment: fixed;
+}
+
+/* Smooth, consistent micro-interactions across interactive chrome */
+button, [role="button"], a, input, select, textarea {
+  transition: background-color .18s ease, border-color .18s ease,
+              color .18s ease, box-shadow .22s ease, transform .12s ease, filter .18s ease;
+}
+/* Universal subtle brighten/lift on hover — makes the whole UI feel alive */
+button:not(:disabled):hover, [role="button"]:not([aria-disabled="true"]):hover {
+  filter: brightness(1.12) saturate(1.04);
+}
+button:active, [role="button"]:active { transform: translateY(0.5px) scale(0.985); }
+
+/* Electric focus ring + selection */
+::selection { background: rgba(47, 155, 255, 0.32); color: #eaf3ff; }
+:focus-visible { outline: 2px solid var(--mg-accent); outline-offset: 1px; }
+
+/* Custom scrollbars — thin track, glowing blue thumb on hover */
+* { scrollbar-width: thin; scrollbar-color: #20354f transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #20354f, #16243a);
+  border-radius: 9px; border: 2px solid transparent; background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--mg-accent), #1b4f8a);
+  background-clip: padding-box;
+  box-shadow: 0 0 10px -2px var(--mg-glow);
+}
+*::-webkit-scrollbar-corner { background: transparent; }
+
+/* ── Keyframes ─────────────────────────────────────────────────────────────── */
+@keyframes mgGlowPulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(47,155,255,0.22), 0 0 18px -7px var(--mg-glow); }
+  50%      { box-shadow: 0 0 0 1px rgba(47,155,255,0.45), 0 0 34px -4px var(--mg-glow); }
+}
+@keyframes mgGradientShift { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
+@keyframes mgShimmer       { 0% { background-position: -150% 0; } 100% { background-position: 250% 0; } }
+@keyframes mgFadeInUp      { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes mgFadeIn        { from { opacity: 0; } to { opacity: 1; } }
+@keyframes mgFloat         { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+@keyframes mgBorderFlow    { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }
+@keyframes mgPopIn         { 0% { opacity: 0; transform: translateY(8px) scale(.985); } 100% { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes mgSweep         { 0% { transform: translateX(-120%); } 100% { transform: translateX(220%); } }
+
+/* ── Utility classes ──────────────────────────────────────────────────────── */
+.mg-glass {
+  background: linear-gradient(180deg, rgba(14,22,40,0.72), rgba(8,14,26,0.74));
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+.mg-glow        { box-shadow: 0 0 0 1px rgba(47,155,255,0.20), 0 0 22px -8px var(--mg-glow); }
+.mg-glow-pulse  { animation: mgGlowPulse 2.4s ease-in-out infinite; }
+.mg-fade-up     { animation: mgFadeInUp .42s cubic-bezier(.2,.7,.2,1) both; }
+.mg-fade-in     { animation: mgFadeIn .35s ease both; }
+.mg-pop-in      { animation: mgPopIn .3s cubic-bezier(.2,.8,.2,1) both; }
+.mg-float       { animation: mgFloat 4s ease-in-out infinite; }
+
+/* Animated gradient accent text (e.g. titles, live price) */
+.mg-accent-text {
+  background: linear-gradient(90deg, #2f9bff, #38e0ff, #2f9bff);
+  background-size: 200% auto;
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+  animation: mgGradientShift 4s linear infinite;
+}
+
+/* Flowing accent bar — use as a 1px underline beneath toolbars/headers */
+.mg-accent-bar {
+  height: 1px; border: 0;
+  background: linear-gradient(90deg, transparent, var(--mg-accent), var(--mg-accent-2), transparent);
+  background-size: 200% 100%;
+  animation: mgBorderFlow 6s linear infinite;
+}
+
+/* Shimmer overlay for skeletons / loading highlights */
+.mg-shimmer {
+  background: linear-gradient(100deg, transparent 18%, rgba(47,155,255,0.14) 40%, transparent 62%);
+  background-size: 200% 100%;
+  animation: mgShimmer 1.8s linear infinite;
+}
+
+/* Glow on hover for buttons/cards (pair with an existing 1px border) */
+.mg-btn { position: relative; }
+.mg-btn:hover { box-shadow: 0 0 18px -6px var(--mg-glow); border-color: rgba(47,155,255,0.5) !important; }
+.mg-lift:hover { transform: translateY(-1px); }
+
+/* Modal/overlay backdrop blur */
+.mg-backdrop { backdrop-filter: blur(7px) saturate(120%); -webkit-backdrop-filter: blur(7px) saturate(120%); }
+
+/* Respect reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}

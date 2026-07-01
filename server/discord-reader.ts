@@ -11,6 +11,7 @@ import { broadcast, broadcastOrderCommand } from "./live-bars";
 import { parseDiscordMessage, updateContext, type ParsedSignal } from "./discord-parser";
 import { learner } from "./discord-learner";
 import { parseZonesFromMessage } from "./discord-zone-parser";
+import { tradeSettings, pushTokens, sendPushNotifications, resolveExits } from "./trade-state";
 
 export interface ChannelConfig {
   id:               string;
@@ -29,10 +30,6 @@ let _running    = false;
 let _timer:     ReturnType<typeof setTimeout> | null = null;
 const _lastSeen: Record<string, string> = {};
 
-// Auto-execution toggle — off by default, enabled via /api/discord-reader/auto-trade
-let _autoTrade = false;
-export function setAutoTrade(v: boolean) { _autoTrade = v; }
-export function getAutoTrade()           { return _autoTrade; }
 
 const POLL_MS = 30_000;
 const DISCORD = "https://discord.com/api/v9";
@@ -121,10 +118,20 @@ async function checkOpenTrade(symbol: string): Promise<boolean> {
 // ── Auto-execution ────────────────────────────────────────────────────────
 
 async function maybeExecute(sig: ParsedSignal, signalId: number) {
-  if (!_autoTrade || sig.historical) return;
-  if (!sig.sl && !sig.tp1) return; // need at least TP or SL to risk-manage
+  if (!tradeSettings.enabled || sig.historical) return;
+  if (!sig.sl && !sig.tp1) return;
 
-  // Rule d: already in a trade on this symbol
+  // Direction filter
+  if (tradeSettings.direction !== "both") {
+    const sigDir = sig.direction.toLowerCase();
+    if (tradeSettings.direction === "long" && sigDir !== "long" && sigDir !== "buy") return;
+    if (tradeSettings.direction === "short" && sigDir !== "short" && sigDir !== "sell") return;
+  }
+
+  // Risk level filter (Discord signals use sig.confidence as riskLevel)
+  if (tradeSettings.riskLevels.length > 0 && !tradeSettings.riskLevels.includes(sig.confidence)) return;
+
+  // Already in a trade on this symbol
   if (await checkOpenTrade(sig.symbol)) {
     console.log(`[discord-parser] veto — already in open trade on ${sig.symbol}`);
     return;
@@ -136,20 +143,28 @@ async function maybeExecute(sig: ParsedSignal, signalId: number) {
     return;
   }
 
+  const entry  = sig.entryPrice ?? 0;
+  const isLong = sig.direction.toLowerCase() === "long" || sig.direction.toLowerCase() === "buy";
+  const tier: "safe" | "risky" = sig.confidence === "high" ? "safe" : "risky";
+  // Apply exit strategy — overrides signal's own TP/SL when set to anything other than "current"
+  const exits  = (tradeSettings.exitStrategy && tradeSettings.exitStrategy !== "current")
+    ? resolveExits(tradeSettings.exitStrategy, tier, isLong, entry)
+    : { tp1: sig.tp1 ?? (isLong ? entry + 10 : entry - 10), tp2: sig.tp2 ?? (isLong ? entry + 20 : entry - 20), sl: sig.sl ?? (isLong ? entry - 5 : entry + 5) };
+
   const sent = broadcastOrderCommand({
-    type:           "order_command",
-    symbol:         sig.symbol,
-    direction:      sig.direction,
-    interval:       "discord",
-    riskLevel:      sig.confidence,
-    price:          sig.entryPrice ?? 0,
-    tp1:            sig.tp1   ?? (sig.sl ? Math.abs((sig.entryPrice ?? 0) - sig.sl) * 2 + (sig.entryPrice ?? 0) : 0),
-    tp2:            sig.tp2   ?? 0,
-    sl:             sig.sl    ?? 0,
-    contracts:      1,
-    tp1Only:        !sig.tp2,
-    useTrailer:     false,
-    trailingOffset: 2,
+    type:            "order_command",
+    symbol:          sig.symbol,
+    direction:       sig.direction,
+    interval:        "discord",
+    riskLevel:       sig.confidence,
+    price:           entry,
+    tp1:             exits.tp1,
+    tp2:             exits.tp2,
+    sl:              exits.sl,
+    contracts:       tradeSettings.contracts,
+    tp1Only:         tradeSettings.tp1Only,
+    useTrailer:      false,
+    trailingOffset:  2,
     discordSignalId: signalId,
   });
 
@@ -220,6 +235,19 @@ async function processMessage(
     const sigId = await saveSignal(m.id, sig);
     if (sigId !== null && !historical) {
       broadcast({ type: "discord_signal", signal: { ...sig, id: sigId } });
+      // Push notification to mobile app even when closed
+      if (pushTokens.size > 0) {
+        const dir = sig.direction.toUpperCase();
+        sendPushNotifications({
+          title: `${dir} ${sig.symbol} [${sig.confidence}]`,
+          body: [
+            sig.entryPrice ? `Entry ${sig.entryPrice}` : null,
+            sig.tp1 ? `TP ${sig.tp1}` : null,
+            sig.sl ? `SL ${sig.sl}` : null,
+          ].filter(Boolean).join(' · '),
+          data: { signalId: sigId, symbol: sig.symbol, direction: sig.direction },
+        }).catch(() => {});
+      }
       await maybeExecute(sig, sigId);
     }
   }

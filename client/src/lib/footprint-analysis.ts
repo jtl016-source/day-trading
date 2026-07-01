@@ -98,6 +98,7 @@ export interface FootprintReading {
   partial:           boolean;
   vetoed:            boolean;
   vetoReason:        string | null;
+  isProxyData:       boolean; // true when synthesized from OHLCV — no veto, max 2pts
   deltaAgrees:       boolean;
   divergence:        boolean;
   absorption:        AbsorptionEvent | null;
@@ -118,7 +119,8 @@ export function analyzeFootprint(
   zonePrice: number,
 ): FootprintReading {
   const isLong = direction === "Long";
-  const deltaAgrees = isLong ? candle.candleDelta > 0 : candle.candleDelta < 0; // strictly confirmed, zero does not qualify
+  const isProxy = !FOOTPRINT_DATA_CONFIRMED; // synthetic OHLCV data — no veto, max partial
+  const deltaAgrees = isLong ? candle.candleDelta > 0 : candle.candleDelta < 0;
 
   let divergence = false;
   if (priorCandles.length >= 3) {
@@ -130,10 +132,13 @@ export function analyzeFootprint(
     }
   }
 
-  if (divergence) {
+  // Delta divergence veto is suppressed for proxy data — synthetic volumes are not reliable
+  // enough to kill an entire signal based on delta pattern alone.
+  if (divergence && !isProxy) {
     return {
       confirmed: false, partial: false, vetoed: true,
       vetoReason: "Delta divergence on signal candle — buyer/seller exhaustion detected",
+      isProxyData: false,
       deltaAgrees, divergence,
       absorption: null, stackedImbalance: null,
       trappedTraders: null, unfinishedAuction: null,
@@ -145,6 +150,7 @@ export function analyzeFootprint(
   if (!deltaAgrees) {
     return {
       confirmed: false, partial: false, vetoed: false, vetoReason: null,
+      isProxyData: isProxy,
       deltaAgrees, divergence: false,
       absorption: null, stackedImbalance: null,
       trappedTraders: null, unfinishedAuction: null,
@@ -189,8 +195,13 @@ export function analyzeFootprint(
   const hasBonus = absorptionBonus !== null || stackedImbalance !== null ||
                    trappedTraders !== null || foundAuction !== null;
 
+  // Proxy data: bonus features are still detected for display but cannot upgrade to confirmed.
+  // Keeps max footprint contribution at 2 pts (partial) to avoid rewarding synthetic signal strength.
   return {
-    confirmed: hasBonus, partial: !hasBonus, vetoed: false, vetoReason: null,
+    confirmed: isProxy ? false : hasBonus,
+    partial:   isProxy ? true  : !hasBonus,
+    vetoed: false, vetoReason: null,
+    isProxyData: isProxy,
     deltaAgrees, divergence: false,
     absorption: absorptionBonus,
     stackedImbalance,

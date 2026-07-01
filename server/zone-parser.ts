@@ -117,9 +117,15 @@ function parseColor(raw: string, type: string): string {
 
 // ── Attribute parser helpers ──────────────────────────────────────────────────
 
+// Pre-compile attribute regexes keyed by name — MWML parsing calls these in tight
+// loops over thousands of elements; re-compiling the same pattern per call is wasteful.
+const _attrNumRe = new Map<string, RegExp>();
+const _attrStrRe = new Map<string, RegExp>();
+
 function getAttrNum(attrs: string, ...names: string[]): number | null {
   for (const name of names) {
-    const r = new RegExp(`\\b${name}\\s*=\\s*["']?([\\d.eE+\\-]+)["']?`, "i");
+    let r = _attrNumRe.get(name);
+    if (!r) { r = new RegExp(`\\b${name}\\s*=\\s*["']?([\\d.eE+\\-]+)["']?`, "i"); _attrNumRe.set(name, r); }
     const match = r.exec(attrs);
     if (match) { const v = parseFloat(match[1]); if (Number.isFinite(v)) return v; }
   }
@@ -128,16 +134,19 @@ function getAttrNum(attrs: string, ...names: string[]): number | null {
 
 function getAttrStr(attrs: string, ...names: string[]): string {
   for (const name of names) {
-    const r = new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i");
+    let r = _attrStrRe.get(name);
+    if (!r) { r = new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i"); _attrStrRe.set(name, r); }
     const match = r.exec(attrs);
     if (match) return match[1];
   }
   return "";
 }
 
+const _childTextRe = new Map<string, RegExp>();
 function getChildText(inner: string, ...names: string[]): number | null {
   for (const name of names) {
-    const r = new RegExp(`<${name}[^>]*>\\s*([\\d.eE+\\-]+)\\s*<\\/${name}>`, "i");
+    let r = _childTextRe.get(name);
+    if (!r) { r = new RegExp(`<${name}[^>]*>\\s*([\\d.eE+\\-]+)\\s*<\\/${name}>`, "i"); _childTextRe.set(name, r); }
     const match = r.exec(inner);
     if (match) { const v = parseFloat(match[1]); if (Number.isFinite(v)) return v; }
   }
@@ -468,16 +477,27 @@ export function parseMWML(xml: string): ParsedZone[] {
 // ── JSON recovery helper ──────────────────────────────────────────────────────
 // When max_tokens is hit mid-response, the JSON array is truncated.
 // This extracts any complete zone objects even from a partial JSON string.
-function extractPartialZones(text: string): Array<{ topPrice: number; bottomPrice: number; type: string; zone_type?: string; label?: string }> {
-  const zones: Array<{ topPrice: number; bottomPrice: number; type: string; zone_type?: string; label?: string }> = [];
-  // Match individual complete zone objects inside the array
-  const re = /\{\s*"topPrice"\s*:\s*([\d.]+)\s*,\s*"bottomPrice"\s*:\s*([\d.]+)\s*,\s*"type"\s*:\s*"([^"]+)"(?:\s*,\s*"zone_type"\s*:\s*"([^"]*)")?(?:\s*,\s*"label"\s*:\s*"([^"]*)")?\s*\}/g;
+function extractPartialZones(text: string): Array<{ topPrice: number; bottomPrice: number; type: string; zone_type?: string; label?: string; startsAtOvn?: boolean }> {
+  const zones: Array<{ topPrice: number; bottomPrice: number; type: string; zone_type?: string; label?: string; startsAtOvn?: boolean }> = [];
+  // Match complete zone objects from partial JSON; fields may appear in any order
+  const objRe = /\{[^{}]*"topPrice"\s*:\s*([\d.]+)[^{}]*"bottomPrice"\s*:\s*([\d.]+)[^{}]*\}/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = objRe.exec(text)) !== null) {
+    const obj = m[0];
     const top = parseFloat(m[1]), bot = parseFloat(m[2]);
-    if (isFinite(top) && isFinite(bot) && top > bot) {
-      zones.push({ topPrice: top, bottomPrice: bot, type: m[3] ?? "support", zone_type: m[4] || undefined, label: m[5] || undefined });
-    }
+    if (!isFinite(top) || !isFinite(bot) || top <= bot) continue;
+    const typeM      = /"type"\s*:\s*"([^"]+)"/.exec(obj);
+    const zoneTypeM  = /"zone_type"\s*:\s*"([^"]*)"/.exec(obj);
+    const labelM     = /"label"\s*:\s*"([^"]*)"/.exec(obj);
+    const ovnM       = /"startsAtOvn"\s*:\s*(true|false)/.exec(obj);
+    zones.push({
+      topPrice:    top,
+      bottomPrice: bot,
+      type:        typeM?.[1] ?? "support",
+      zone_type:   zoneTypeM?.[1] || undefined,
+      label:       labelM?.[1] || undefined,
+      startsAtOvn: ovnM ? ovnM[1] === "true" : undefined,
+    });
   }
   return zones;
 }
@@ -563,13 +583,33 @@ export async function parseScreenshot(
 
 ${priceContext}
 
-Identify ALL colored rectangular zones/boxes/bands overlaid on the chart (shaded rectangular areas, NOT individual candles or price lines).
+## CRITICAL: Find Every Zone
+Your most important job is to find EVERY colored rectangular band in this image. Do not skip any zone, even if it is small, partially obscured, or overlapping with another zone. Before finalizing your response, scan the image top-to-bottom once more to make sure you have not missed any band. Typical Milk charts have 5–15 zones; if you find fewer than 5, look again.
 
+## Price Reading Instructions
+The price axis is on the RIGHT side of the chart. Read zone edge prices by:
+1. Drawing a horizontal line from the zone's top/bottom edge to the right price axis
+2. Reading the exact numeric value at that point on the axis
+3. Use the nearest labeled axis tick as an anchor and interpolate for unlabeled prices
+4. ES/MES prices typically end in .00, .25, .50, or .75 — round to the nearest quarter point
+5. Report prices to 2 decimal places (e.g., 5847.25, not 5847 or 5847.3)
+6. If the visible price range is given above, use it to calibrate: zones cannot have prices outside that range
+
+## What Counts as a Zone
+INCLUDE: rectangular shaded/filled colored bands that span horizontally across the chart.
+Large zones (spanning 20–100 pts or more) are common and important — do NOT skip them.
+EXCLUDE:
+- Individual candlestick bodies (too narrow and vertical)
+- Horizontal lines (1-pixel thin — not zones)
+- Chart background or grid
+- Price axis labels themselves
+
+## Zone Classification
 For each zone return:
-- topPrice: the price at the top edge of the zone (read from the price axis)
-- bottomPrice: the price at the bottom edge of the zone
-- type: "support" (green/teal zones — buyers defend here) or "resistance" (red/orange/yellow zones — sellers defend here)
-- zone_type: classify using Milk's vocabulary. Choose the BEST match from this list:
+- topPrice: the price at the TOP edge of the zone
+- bottomPrice: the price at the BOTTOM edge of the zone
+- type: "support" (green/teal zones) or "resistance" (red/orange/yellow zones)
+- zone_type: best match from Milk's vocabulary:
     buyer_positioning, buyer_objective, buyer_ultimate_target, buyer_absorb, buyer_value_add,
     seller_positioning, seller_objective, seller_ultimate_target, seller_absorb, seller_soft_target,
     buyer_positioning_strong, seller_positioning_strong,
@@ -581,43 +621,45 @@ For each zone return:
     ovn_spy_ceiling, ovn_spy_floor, spy_ceiling, spy_floor,
     splice_band, gex_wall_long, gex_wall_short, gex_flip,
     e_vector, s_vector, apex, options_ledge, supportive, resistive, unknown
-- label: the text label visible on the zone if any (e.g. "BUYER POSITIONING", "IV WALL", "RTH GAP")
+- label: copy the EXACT text visible on the zone. Include all words (e.g. "CEILING/MAX FOR DAY", "BUYER POSITIONING", "IV WALL", "MAX RANGE DAYS"). Use "" if no text.
+- startsAtOvn: true if the zone starts at the left edge of the chart (OVN-spanning), false if it starts later (RTH-only)
 
-Zone identification rules for Milk's strategy:
-- Green/teal filled bands = bullish/support zones (buyers defending)
-- Red/orange filled bands = bearish/resistance zones (sellers defending)
-- Yellow/gold filled bands = key structural levels (IV WALL, PIVOT, APEX)
-- Purple/violet bands = buyer positioning or GEX walls
-- Brown/tan bands = seller positioning
-- "IV WALL" labels = implied volatility wall, often strongest reversal zone
-- "BUYER POSITIONING" or "BUYERS WILL VALUE ADD" = strong institutional support
-- "SELLER POSITIONING" = strong institutional resistance
-- "NON FAIR VALUE" = price outside normal distribution, usually red/bearish zone
-- "RTH GAP" = gap from previous RTH session, acts as magnet
-- "MAX RANGE DAYS" = max expected daily range (hard cap)
-- "OVN SPY CEILING/FLOOR" = overnight SPY reference levels
-- Text labels on the chart (like "BUYER OBJECTIVE", "SELLER POSITIONING", "IV WALL") directly identify the zone_type
+## Color Guide
+- Green/teal → "support"; zone_type: buyer_positioning or buyer_*
+- Red/orange → "resistance"; zone_type: seller_positioning or seller_*
+- Yellow/gold → "resistance"; zone_type: iv_wall, pivot, or ceiling
+- Purple/violet → "support"; zone_type: buyer_positioning or gex_wall_long
+- Brown/tan → "resistance"; zone_type: seller_positioning
 
-For each zone, also determine:
-- startsAtOvn: boolean — look at the LEFT EDGE of the zone rectangle on the x-axis.
-  * true = the zone starts at or very near the leftmost visible chart area (the overnight session open, around 5-6 PM ET / 17:00-18:00 CT). These zones span from OVN open through RTH close: IV WALL, MAX RANGE DAYS, OVN SPY CEILING/FLOOR, SPLICE BAND, WEEKLY levels, NORMAL RANGE, AVG RANGE, SECONDARY PIVOT, BUYERS/SELLERS SOFT TARGET, SUPPORT BOTTOM, TOP AVE.
-  * false = the zone clearly starts after a visible gap from the left edge (beginning at RTH open, around 9:30 AM ET / 8:30 CT). These are RTH-only zones: NON FAIR VALUE, BUYER/SELLER POSITIONING, PIVOT, RTH GAP.
-  If you cannot determine scope from the x-axis, default to false.
+## Common Zone Labels
+- "IV WALL" / "IV OVERFLOW" → iv_wall / iv_overflow
+- "BUYER POSITIONING" / "BUYERS WILL VALUE ADD" → buyer_positioning
+- "SELLER POSITIONING" / "SELLERS WILL VALUE ADD" → seller_positioning
+- "NON FAIR VALUE" → non_fair_value
+- "RTH GAP" → rth_gap
+- "MAX RANGE DAYS" / "DAILY MAX" / "MAX RANGE" → max_range (startsAtOvn: true)
+- "CEILING" / "CEILING/MAX FOR DAY" / "MAX FOR DAY" → ceiling (startsAtOvn: true)
+- "FLOOR" / "FLOOR/MIN FOR DAY" / "MIN FOR DAY" → floor (startsAtOvn: true)
+- "OVN SPY CEILING" / "OVN SPY FLOOR" → ovn_spy_ceiling / ovn_spy_floor (startsAtOvn: true)
+- "BUYERS SOFT TARGET" / "SELLERS SOFT TARGET" → buyer_soft_target / seller_soft_target (startsAtOvn: true)
+- "BUYERS ULTIMATE TARGET" / "SELLERS ULTIMATE TARGET" → buyer_ultimate_target / seller_ultimate_target (startsAtOvn: true)
+- "NORMAL RANGE HIGH" / "NORMAL RANGE LOW" → normal_range (startsAtOvn: true)
+- "AVG RANGE HIGH" / "AVG RANGE LOW" → avg_range_high / avg_range_low (startsAtOvn: true)
 
-Return ONLY valid JSON in this exact format, no other text:
+Return ONLY valid JSON, no explanatory text:
 {
   "zones": [
-    {"topPrice": 5920.00, "bottomPrice": 5900.00, "type": "support", "zone_type": "buyer_positioning", "label": "BUYER POSITIONING", "startsAtOvn": false},
-    {"topPrice": 5960.00, "bottomPrice": 5945.00, "type": "resistance", "zone_type": "iv_wall", "label": "IV WALL", "startsAtOvn": true}
+    {"topPrice": 5920.25, "bottomPrice": 5900.00, "type": "support", "zone_type": "buyer_positioning", "label": "BUYER POSITIONING", "startsAtOvn": false},
+    {"topPrice": 5960.00, "bottomPrice": 5945.75, "type": "resistance", "zone_type": "iv_wall", "label": "IV WALL", "startsAtOvn": true}
   ]
 }
 
-If you cannot identify any zones, return {"zones": []}.
-Be precise with prices — read them directly from the price axis labels on the chart.`;
+If no zones found: {"zones": []}
+Double-check each price by re-reading the axis. Scan the full image again before finalizing.`;
 
   const response = await getClient().messages.create({
     model:      "claude-opus-4-6",
-    max_tokens: 4096,
+    max_tokens: 8192,
     messages: [{
       role: "user",
       content: [
@@ -641,15 +683,110 @@ Be precise with prices — read them directly from the price axis labels on the 
 
   return (parsed.zones ?? [])
     .filter(z => z.topPrice > z.bottomPrice)
-    .map(z => ({
-      topPrice:    z.topPrice,
-      bottomPrice: z.bottomPrice,
-      fillColor:   milkZoneColor(z.zone_type ?? "", z.type),
-      fromTime:    0,
-      toTime:      9_999_999_999,
-      label:       z.label || z.zone_type || undefined,
-      zoneScope:   z.startsAtOvn === true ? "ovn" as const : z.startsAtOvn === false ? "rth" as const : undefined,
-    }));
+    .map(z => {
+      // Deterministic scope from zone_type takes priority — it is always more reliable
+      // than Claude Vision's visual x-axis inspection (startsAtOvn).
+      // Only fall back to Vision's answer when zone_type is not in the known-scope table.
+      const typeScope   = zoneScopeFromType(z.zone_type ?? "");
+      const labelScope  = zoneScopeFromLabel(z.label ?? "");
+      const visionScope: "ovn" | "rth" | undefined =
+        z.startsAtOvn === true ? "ovn" : z.startsAtOvn === false ? "rth" : undefined;
+      // Priority: deterministic zone_type → label text → Vision x-axis guess
+      const zoneScope = typeScope ?? labelScope ?? visionScope;
+      return {
+        topPrice:    z.topPrice,
+        bottomPrice: z.bottomPrice,
+        fillColor:   milkZoneColor(z.zone_type ?? "", z.type),
+        fromTime:    0,
+        toTime:      9_999_999_999,
+        label:       z.label || z.zone_type || undefined,
+        zoneScope,
+      };
+    });
+}
+
+/**
+ * Deterministically map a Milk zone_type string to its time scope.
+ * Returns undefined only for zone types whose scope is genuinely ambiguous.
+ *
+ * OVN zones span from the overnight open (~22:00 UTC / 5 PM ET).
+ * RTH zones start at the regular-session open (~13:30 UTC / 9:30 AM ET).
+ */
+function zoneScopeFromType(zoneType: string): "ovn" | "rth" | undefined {
+  switch (zoneType) {
+    // ── OVN-spanning: daily structural levels placed pre-market ──────────────
+    case "iv_wall":
+    case "iv_overflow":
+    case "iv_gap":
+    case "max_range":
+    case "max_trend":
+    case "normal_range":
+    case "avg_range_low":
+    case "avg_range_high":
+    case "ovn_spy_ceiling":
+    case "ovn_spy_floor":
+    case "spy_ceiling":
+    case "spy_floor":
+    case "ceiling":
+    case "floor":
+    case "splice_band":
+    case "pivot_macro":          // weekly / macro pivot
+    case "pivot_secondary":      // secondary pivot (OVN per Milk's strategy)
+    case "gex_wall_long":
+    case "gex_wall_short":
+    case "gex_flip":
+    case "e_vector":
+    case "s_vector":
+    case "apex":
+    case "options_ledge":
+    case "session_cap":
+    case "buyer_soft_target":    // "BUYERS SOFT TARGET" = OVN per Milk's strategy
+    case "seller_soft_target":   // "SELLERS SOFT TARGET" = OVN per Milk's strategy
+    case "buyer_ultimate_target":
+    case "seller_ultimate_target":
+      return "ovn";
+
+    // ── RTH-only: intraday zones that start at the 9:30 AM ET open ───────────
+    case "buyer_positioning":
+    case "buyer_positioning_strong":
+    case "buyer_positioning_ltf":
+    case "seller_positioning":
+    case "seller_positioning_strong":
+    case "seller_positioning_ltf":
+    case "buyer_absorb":
+    case "seller_absorb":
+    case "buyer_value_add":
+    case "buyer_objective":
+    case "buyer_objective_ltf":
+    case "seller_objective":
+    case "seller_objective_ltf":
+    case "non_fair_value":
+    case "rth_gap":
+    case "pivot":               // intraday daily pivot = RTH
+    case "supportive":
+    case "resistive":
+    case "single_print":
+    case "gex_median_long":
+    case "gex_median_short":
+    case "gex_spread":
+      return "rth";
+
+    default:
+      return undefined; // unknown type — fall through to label heuristic or Vision
+  }
+}
+
+/**
+ * Derive scope from the zone's text label using the same regex as market.tsx's zoneFromTime().
+ * Used as a secondary fallback when zone_type is unknown.
+ */
+function zoneScopeFromLabel(label: string): "ovn" | "rth" | undefined {
+  const l = label.toLowerCase();
+  if (/ovn|overnight|max[\s_]?range|iv[\s_]?wall|iv[\s_]?overflow|splice|weekly|mon[\s_]?fri|buyers?[\s_]?soft|sellers?[\s_]?soft|secondary[\s_]?pivot|avg[\s_]?range|normal[\s_]?range|support.*bottom|top.*ave/.test(l))
+    return "ovn";
+  if (/non[\s_]?fair|non fair|buyer[\s_]?positioning|seller[\s_]?positioning|rth[\s_]?gap|\bpivot\b/.test(l))
+    return "rth";
+  return undefined;
 }
 
 /**
