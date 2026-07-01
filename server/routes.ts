@@ -163,6 +163,130 @@ function isRTH(timestampSec: number): boolean {
   return etMin >= 9 * 60 + 30 && etMin < 17 * 60; // 9:30 AM – 5:00 PM ET
 }
 
+// CME ES/MES is CLOSED on the weekend (Fri 5:00 PM ET → Sun 6:00 PM ET) and during the daily
+// 5:00–6:00 PM ET maintenance halt. Any bar timestamped inside those windows is phantom/corrupt
+// (e.g. Yahoo returns a handful of low-volume Saturday bars) and must never reach the chart — a
+// single isolated closed-session bar surrounded by gaps renders as a "thin vertical line" spike.
+function isMarketClosed(timestampSec: number): boolean {
+  const etSec = timestampSec + etOffsetMin(timestampSec) * 60;
+  const etDow = ((Math.floor(etSec / 86400) % 7) + 4) % 7; // 0=Sun … 6=Sat
+  const etMin = ((Math.floor(etSec / 60) % 1440) + 1440) % 1440;
+  if (etDow === 6) return true;                 // Saturday — fully closed
+  if (etDow === 5) return etMin >= 17 * 60;     // Friday after 5:00 PM ET
+  if (etDow === 0) return etMin < 18 * 60;      // Sunday before 6:00 PM ET
+  return etMin >= 17 * 60 && etMin < 18 * 60;   // Mon–Thu daily maintenance halt
+}
+
+// Remove ISOLATED phantom bars — a bar whose entire body sits more than `fracThr` of price away
+// from BOTH its neighbours' closes, then price returns (a "spike-and-return" outlier, typically a
+// single low-volume print ~50pt off the real level from a bad data source / wrong contract). These
+// pass isSpikeBar (their own H-L range is tiny) yet render as spikes/gaps throughout the history.
+// Real directional moves are preserved: a true 30pt push is only flagged if the NEXT bar snaps back.
+function dropIsolatedSpikes<T extends { open: number; high: number; low: number; close: number; time?: number }>(
+  bars: T[], fracThr = 0.0025,
+): T[] {
+  if (bars.length < 3) return bars;
+  // Infer the bar interval so we can tell a real spike (neighbours temporally adjacent) from a lone
+  // bar in a sparse region (neighbours hours away — its price differs by normal drift, not a spike,
+  // so it must NOT be dropped). Input is already bucket-aligned, so min positive delta == interval.
+  let interval = Infinity;
+  if (bars[0].time !== undefined) {
+    for (let i = 1; i < Math.min(bars.length, 300); i++) {
+      const d = (bars[i].time as number) - (bars[i - 1].time as number);
+      if (d > 0 && d < interval) interval = d;
+    }
+  }
+  const maxGap = isFinite(interval) ? interval * 3 + 1 : Infinity; // "adjacent" = within ~3 intervals
+  const adjacent = (a: T, b: T) =>
+    a.time === undefined || b.time === undefined || Math.abs((a.time as number) - (b.time as number)) <= maxGap;
+  const isSpike = (cur: T, a: T, b: T) => {
+    if (!adjacent(cur, a) || !adjacent(cur, b)) return false; // sparse neighbour → drift, not a spike
+    const tol = cur.close * fracThr;
+    return (cur.low - a.close > tol && cur.low - b.close > tol) ||   // up-spike: low above both refs
+           (a.close - cur.high > tol && b.close - cur.high > tol);   // down-spike: high below both refs
+  };
+  // Iterate until stable: interleaved phantoms (a wrong-contract feed bleeding in on alternate bars)
+  // shield each other on the first pass — once the outer phantoms are removed the inner one becomes
+  // isolated and is caught on the next pass. Also validates the FIRST/LAST bar of the window (no
+  // left/right neighbour) against its two same-side neighbours so a phantom at a pagination boundary
+  // can't leak.
+  let cur: T[] = bars;
+  for (let pass = 0; pass < 6 && cur.length >= 3; pass++) {
+    const out: T[] = [];
+    const start = isSpike(cur[0], cur[1], cur[2]) ? 1 : 0;
+    out.push(cur[start]);
+    for (let i = start + 1; i < cur.length - 1; i++) {
+      const prev = out[out.length - 1]; // last KEPT bar, so runs of phantoms don't anchor each other
+      if (isSpike(cur[i], prev, cur[i + 1])) continue; // drop the phantom
+      out.push(cur[i]);
+    }
+    const last = cur[cur.length - 1];
+    const p1 = out[out.length - 1], p2 = out[out.length - 2];
+    if (!p2 || !isSpike(last, p1, p2)) out.push(last);
+    if (out.length === cur.length) { cur = out; break; } // stable — no more phantoms found
+    cur = out;
+  }
+  return cur;
+}
+
+// Remove low-volume WICK/BODY spike glitches — a bar whose HIGH or LOW is an isolated outlier far
+// beyond its temporally-adjacent neighbours, with volume too low to be a real move. These render as
+// "thin vertical line" candles and slip past BOTH isSpikeBar (their total range is below the
+// absolute spikeThreshold, e.g. a 40pt wick << 4% of 7500) AND dropIsolatedSpikes (which only
+// catches a displaced BODY, not a lone wick). VOLUME is the discriminator: genuine news/settlement
+// moves carry large volume and are preserved; phantom prints are near-zero volume. This is the
+// permanent fallback that guarantees these glitches never render regardless of what's in the DB.
+function dropWickSpikes<T extends { open: number; high: number; low: number; close: number; time: number; volume: number | null }>(
+  bars: T[],
+): T[] {
+  if (bars.length < 5) return bars;
+  // A bar is a glitch when its HIGH or LOW is displaced beyond its TWO-SIDED neighbourhood AND its
+  // volume is anomalously low. Two-sided (±3) neighbours are key: a real session gap / weekend
+  // reopen is displaced only from the PRIOR side (the following bars sit at the new level), so it
+  // is NOT flagged — only a spike that pokes out and RETURNS is. Volume is the discriminator, tested
+  // both absolutely and RELATIVE to the local median so it works across intervals (a 60m phantom is
+  // ~V200 while real 60m bars are V10k+) and across sparse holiday/overnight sessions. No adjacency
+  // guard — that previously let sparse-session phantoms through.
+  const HARD_REAL_VOL = 500; // bars at/above this volume are never treated as phantoms
+  let cur: T[] = bars;
+  for (let pass = 0; pass < 4; pass++) {
+    const out: T[] = [];
+    let dropped = 0;
+    for (let i = 0; i < cur.length; i++) {
+      const b = cur[i];
+      const vol = b.volume ?? 0;
+      if (vol >= HARD_REAL_VOL) { out.push(b); continue; } // real volume → never a phantom
+      // ±3 neighbours excluding self; left side uses already-KEPT bars so a run of phantoms
+      // doesn't anchor itself.
+      const nb: T[] = [];
+      for (let j = out.length - 1; j >= 0 && nb.length < 3; j--) nb.push(out[j]);
+      for (let j = i + 1; j < cur.length && nb.length < 6; j++) nb.push(cur[j]);
+      if (nb.length < 3) { out.push(b); continue; } // window edge → keep
+      let nHi = -Infinity, nLo = Infinity;
+      const vols: number[] = [];
+      for (const x of nb) { if (x.high > nHi) nHi = x.high; if (x.low < nLo) nLo = x.low; vols.push(x.volume ?? 0); }
+      const tol = Math.max(8, b.close * 0.001); // ~8pt / 0.1% of price
+      const upSpike = b.high - nHi > tol;
+      const downSpike = nLo - b.low > tol;
+      if (!upSpike && !downSpike) { out.push(b); continue; }
+      vols.sort((a, z) => a - z);
+      const medVol = vols[vols.length >> 1] || 0;
+      const lowVol = vol < 100 || (medVol > 0 && vol < 0.15 * medVol);
+      // Lone WICK: the extreme pokes out but the BODY stays within the neighbourhood — a spike that
+      // returned. A real move that large would carry the body (and volume) with it; a real pin/hammer
+      // is already protected by the HARD_REAL_VOL floor above. This catches big low-vol wicks even
+      // when the WHOLE overnight neighbourhood is low-volume (where the relative test alone misses).
+      const bodyHi = Math.max(b.open, b.close), bodyLo = Math.min(b.open, b.close);
+      const loneWick = (upSpike && bodyHi - nHi <= tol) || (downSpike && nLo - bodyLo <= tol);
+      if (lowVol || loneWick) { dropped++; continue; } // displaced extreme + (low vol OR lone wick) → glitch
+      out.push(b);
+    }
+    cur = out;
+    if (!dropped) break;
+  }
+  return cur;
+}
+
 function mapQuotes(quotes: any[]): any[] {
   return quotes
     .filter((q: any) => q.open != null && q.close != null && q.high != null && q.low != null)
@@ -207,13 +331,28 @@ function toYahooSymbol(sym: string): string {
 }
 
 // Fetches up to 720 days of 60m bars + 59 days of 5m/15m bars from Yahoo Finance
-// and upserts into cached_candles with ON CONFLICT DO NOTHING so MW relay data
-// is never overwritten.  Returns total new bars inserted.
-async function yahooBackfillSymbol(symbol: string): Promise<number> {
+// Upserts into cached_candles. Default `overwrite=false` → ON CONFLICT DO NOTHING (auto-startup
+// run never clobbers live MW relay data). `overwrite=true` → ON CONFLICT DO UPDATE so Yahoo becomes
+// authoritative for its available range (60d for 5m/15m, ~720d for 60m) — used to repair corrupt /
+// wrong-contract bars. Returns total bars fetched + written.
+async function yahooBackfillSymbol(symbol: string, overwrite = false): Promise<number> {
   const ySym  = toYahooSymbol(symbol);
   const now   = new Date();
   const nowMs = now.getTime();
   let totalInserted = 0;
+  const upsert = async (vals: any[]) => {
+    for (let i = 0; i < vals.length; i += 500) {
+      const chunk = vals.slice(i, i + 500);
+      if (overwrite) {
+        await db.insert(cachedCandles).values(chunk).onConflictDoUpdate({
+          target: [cachedCandles.symbol, cachedCandles.resolution, cachedCandles.timestamp],
+          set: { open: sql`excluded.open`, high: sql`excluded.high`, low: sql`excluded.low`, close: sql`excluded.close`, volume: sql`excluded.volume` },
+        });
+      } else {
+        await db.insert(cachedCandles).values(chunk).onConflictDoNothing();
+      }
+    }
+  };
 
   const CHUNK_DAYS = 240;
   const MAX_DAYS   = 720;
@@ -240,8 +379,7 @@ async function yahooBackfillSymbol(symbol: string): Promise<number> {
         symbol, resolution: "60",
         timestamp: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0,
       }));
-      for (let i = 0; i < vals.length; i += 500)
-        await db.insert(cachedCandles).values(vals.slice(i, i + 500)).onConflictDoNothing();
+      await upsert(vals);
       totalInserted += bars.length;
     }
   }
@@ -255,8 +393,7 @@ async function yahooBackfillSymbol(symbol: string): Promise<number> {
         symbol, resolution: res,
         timestamp: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0,
       }));
-      for (let i = 0; i < vals.length; i += 500)
-        await db.insert(cachedCandles).values(vals.slice(i, i + 500)).onConflictDoNothing();
+      await upsert(vals);
       totalInserted += bars.length;
     }
   }
@@ -763,8 +900,10 @@ export async function registerRoutes(
     const cached = cacheGet<object>(cacheKey);
     if (cached) { res.json(cached); return; }
 
-    // Max H-L spread (fraction of close) before a bar is treated as a corrupt spike
-    const spikeThreshold = interval === "1m" ? 0.005 : interval === "5m" ? 0.010 : interval === "15m" ? 0.015 : 0.025;
+    // Max H-L spread (fraction of close) before a bar is treated as a corrupt spike.
+    // Float32 corruptions are typically 10x+ off from real price (e.g. 512 or 8192 instead of ~5800).
+    // Thresholds are raised to allow real news-event bars (1m flash crashes, 60m trend days).
+    const spikeThreshold = interval === "1m" ? 0.025 : interval === "5m" ? 0.040 : interval === "15m" ? 0.050 : 0.070;
     function isSpikeBar(o: number, h: number, l: number, c: number): boolean {
       // Malformed OHLCV (impossible values)
       if (h < l || o > h || o < l || c > h || c < l || c <= 0) return true;
@@ -781,18 +920,17 @@ export async function registerRoutes(
         if ((Math.abs(o - h) < 0.5 && Math.abs(l - c) < 0.5) ||
             (Math.abs(o - l) < 0.5 && Math.abs(h - c) < 0.5)) return true;
       }
-      // Doji-spike: tiny body but large wick
-      const body = Math.abs(c - o);
-      if (range > 0 && body / range < 0.05 && range / c > 0.002) return true;
       return false;
     }
 
     // Helper: convert MinBar[] to the candle shape the client expects
     function memBarsToCandles(bars: { timeSec: number; open: number; high: number; low: number; close: number; volume: number }[]) {
-      return bars
+      return dropWickSpikes(dropIsolatedSpikes(bars
         .filter(b => (!fromN || b.timeSec >= fromN) && (!isFinite(toN) || b.timeSec <= toN))
+        .filter(b => !(b.high === b.low)) // flat zero-range = no-body "dash" bar
         .filter(b => !isSpikeBar(b.open, b.high, b.low, b.close))
-        .map(b => ({ time: b.timeSec, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, rth: isRTH(b.timeSec) }));
+        .filter(b => !isMarketClosed(b.timeSec))
+        .map(b => ({ time: b.timeSec, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, rth: isRTH(b.timeSec) }))));
     }
 
     try {
@@ -815,9 +953,40 @@ export async function registerRoutes(
       }
 
       if (rows.length > 0) {
-        const candles = rows
+        // Real bars sit exactly on the resolution boundary (e.g. 5m → timestamp % 300 === 0). Bars
+        // at odd seconds are foreign-source artifacts — typically a zero-range / volume-0 single
+        // print that renders as a "no-body dash" candle. Drop anything off the bucket grid.
+        const resSec = (parseInt(usedRes, 10) || 5) * 60;
+        // dropWickSpikes runs BEFORE any 15m aggregation so a glitchy 5m wick can't corrupt the
+        // aggregated 15m high/low.
+        let candles = dropWickSpikes(dropIsolatedSpikes(rows
+          .filter(r => r.timestamp % resSec === 0)
+          .filter(r => !(r.high === r.low)) // flat zero-range = no-body "dash" bar (drop regardless of volume — no real MES bar is perfectly flat)
           .filter(r => !isSpikeBar(r.open, r.high, r.low, r.close))
-          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) }));
+          .filter(r => !isMarketClosed(r.timestamp))
+          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) }))));
+
+        // 15m fallback: when native 15m bars are absent and we fell back to 5m rows, the client
+        // receives raw 5m bars for a 15m chart request. Its `isAligned` filter would keep ONLY
+        // bars sitting on 15m boundaries (the first 5m sub-bar of each 15m period), not proper
+        // aggregated 15m OHLCV. Aggregate server-side so the chart sees correct 15m bars.
+        if (interval === "15m" && usedRes === "5") {
+          const agg = new Map<number, typeof candles[0]>();
+          for (const c of candles) {
+            const t = Math.floor(c.time / 900) * 900;
+            const ex = agg.get(t);
+            if (!ex) { agg.set(t, { ...c, time: t }); }
+            else {
+              ex.high   = Math.max(ex.high, c.high);
+              ex.low    = Math.min(ex.low,  c.low);
+              ex.close  = c.close;
+              ex.volume = (ex.volume ?? 0) + (c.volume ?? 0);
+              if (!ex.rth && c.rth) ex.rth = c.rth;
+            }
+          }
+          candles = [...agg.values()].sort((a, b) => a.time - b.time);
+        }
+
         const result = { symbol: sym, interval, candles, source: "cached", resolution: usedRes };
         cacheSet(cacheKey, result, TTL.continuous);
         res.json(result);
@@ -827,7 +996,24 @@ export async function registerRoutes(
       // DB empty — try in-memory MW bars before giving up
       const memRes = interval === "15m" ? ["5"] : [resolution];
       for (const r of memRes) {
-        const memCandles = memBarsToCandles(getMemBars(sym, r));
+        let memCandles = memBarsToCandles(getMemBars(sym, r));
+        // Same 15m fallback aggregation for the memory path
+        if (memCandles.length > 0 && interval === "15m" && r === "5") {
+          const agg = new Map<number, typeof memCandles[0]>();
+          for (const c of memCandles) {
+            const t = Math.floor(c.time / 900) * 900;
+            const ex = agg.get(t);
+            if (!ex) { agg.set(t, { ...c, time: t }); }
+            else {
+              ex.high   = Math.max(ex.high, c.high);
+              ex.low    = Math.min(ex.low,  c.low);
+              ex.close  = c.close;
+              ex.volume = (ex.volume ?? 0) + (c.volume ?? 0);
+              if (!ex.rth && c.rth) ex.rth = c.rth;
+            }
+          }
+          memCandles = [...agg.values()].sort((a, b) => a.time - b.time);
+        }
         if (memCandles.length > 0) {
           res.json({ symbol: sym, interval, candles: memCandles, source: "memory", resolution: r });
           return;
@@ -2929,9 +3115,10 @@ Critical rules:
   // Returns { ok, symbol, inserted }.  Uses ON CONFLICT DO NOTHING so MW data is never overwritten.
   app.post("/api/data/yahoo-backfill", async (req, res) => {
     const sym = ((req.body?.symbol as string) || "MES").toUpperCase();
+    const overwrite = req.body?.overwrite === true; // true → Yahoo overwrites existing bars (repair)
     try {
-      const inserted = await yahooBackfillSymbol(sym);
-      res.json({ ok: true, symbol: sym, inserted });
+      const inserted = await yahooBackfillSymbol(sym, overwrite);
+      res.json({ ok: true, symbol: sym, overwrite, inserted });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

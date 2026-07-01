@@ -177,6 +177,14 @@ async function loadMultiDir(symbol: string, instrDirs: string[]) {
     await bulkUpsert(symbol, "1",  bars1);
     await bulkUpsert(symbol, "5",  bars5);
     await bulkUpsert(symbol, "60", bars60);
+
+    // 60m alignment cleanup: 60m bars are standardized on :00 top-of-hour (Yahoo's alignment
+    // and the deep-history source; matches serving filter `timestamp % 3600 === 0`). Purge any
+    // stale :30-boundary rows (timestamp % 3600 === 1800) left over from the prior :30 alignment
+    // so the 60m series stays single-aligned (no offset/duplicate bars). Yahoo :00 bars are kept.
+    await db.$client.prepare(
+      `DELETE FROM cached_candles WHERE symbol = ? AND resolution = '60' AND (timestamp % 3600) = 1800`
+    ).run(symbol.toUpperCase());
   } catch (e: any) {
     console.warn(`[mw-reader] DB write failed (quota?): ${e.message} — in-memory bars still available`);
   }
@@ -495,7 +503,8 @@ function applyTick(symbol: string, price: number) {
   }
 
   // ── 60-min in-progress bar ────────────────────────────────────────────────
-  const bucket60m = Math.floor(nowSec / 3600) * 3600;
+  // Use the RTH-aligned :30 bucket so the live forming bar matches Yahoo/LiveBarRelay timestamps.
+  const bucket60m = agg60mBucket(nowSec);
   const prev60m = inProgressBar60m.get(sym);
   if (prev60m && prev60m.timeSec === bucket60m) {
     prev60m.close = price;
@@ -661,7 +670,8 @@ export function notifyExternalTick(symbol: string, price: number) {
   }
 
   // ── 60-min in-progress bar ────────────────────────────────────────────────
-  const bucket60m = Math.floor(nowSec / 3600) * 3600;
+  // RTH-aligned :30 bucket — matches Yahoo Finance and LiveBarRelay timestamps.
+  const bucket60m = agg60mBucket(nowSec);
   const prev60m = inProgressBar60m.get(sym);
   if (prev60m && prev60m.timeSec === bucket60m) {
     prev60m.close = price;
@@ -765,12 +775,22 @@ function parseBarFile(filePath: string): MinBar[] {
 
 // ── Aggregation ───────────────────────────────────────────────────────────────
 
+// 60m bars align to :00 top-of-hour. This is Yahoo's ES=F 60m alignment (empirically
+// verified — Yahoo returns bars at 22:00, 23:00, 00:00 … UTC, NOT :30) and it's where the
+// deep 2-year history lives, so the live/aggregated MW bars must match it. It also matches
+// the serving filter `timestamp % 3600 === 0` in routes.ts and client get60mBucket().
+// (A prior version offset by :30 on the mistaken belief Yahoo used :30 — that produced MW
+// bars the serving filter silently dropped. Standardized on :00 per user decision.)
+function agg60mBucket(timeSec: number): number {
+  return Math.floor(timeSec / 3600) * 3600;
+}
+
 function aggregate(minBars: MinBar[], periodMin: number): MinBar[] {
   const pSec = periodMin * 60;
   const map  = new Map<number, MinBar>();
 
   for (const b of minBars) {
-    const t  = Math.floor(b.timeSec / pSec) * pSec;
+    const t  = periodMin === 60 ? agg60mBucket(b.timeSec) : Math.floor(b.timeSec / pSec) * pSec;
     const ex = map.get(t);
     if (!ex) {
       map.set(t, { ...b, timeSec: t });
@@ -794,7 +814,10 @@ async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
   if (!bars.length) return;
   // Reject bars with prices outside a safe range — catches corrupt tick-file float32 misreads
   // (512, 8192, 14336, 47104, etc.) before they reach the DB and distort chart auto-scale.
+  const resSec = (parseInt(resolution, 10) || 1) * 60;
   const clean = bars.filter(b => {
+    if (b.volume == null || b.volume === 0) return false; // ghost bar — zero/absent volume
+    if (b.timeSec % resSec !== 0) return false;           // off-grid timestamp (not on bucket boundary)
     if (b.low < 1000 || b.high > 100_000) return false;
     if (b.open <= 0 || b.close <= 0) return false;
     if (b.high < b.low || b.high < b.open || b.high < b.close) return false;
@@ -805,12 +828,6 @@ async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
     // Reject doji-wick spikes: body <10% of range on a large bar (>1.5% spread).
     // A bad float32 byte in the MW binary creates an extreme wick while open/close stay near real price.
     if (range / b.close > 0.015 && Math.abs(b.open - b.close) / range < 0.10) return false;
-    // Reject extreme isolated wick extensions — a bad float32 byte that affects only high or low.
-    // Thresholds: 1m=0.9%, 5m=1.2%, 60m=2.5% of close price (e.g., 63 / 84 / 175 pts at 7000).
-    const maxWickPct = resolution === "1" ? 0.009 : resolution === "5" ? 0.012 : 0.025;
-    const lowerWick = Math.min(b.open, b.close) - b.low;
-    const upperWick = b.high - Math.max(b.open, b.close);
-    if (lowerWick / b.close > maxWickPct || upperWick / b.close > maxWickPct) return false;
     return true;
   });
   if (!clean.length) return;

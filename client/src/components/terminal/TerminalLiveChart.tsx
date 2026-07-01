@@ -20,6 +20,8 @@ import type { StrategyToggles } from "@/lib/terminalSettings";
 import { currentRthSession, type MilkZone } from "@/lib/milkZones";
 import { aggregateSessions } from "./footprintAggregate";
 import { buildProxyFootprintCandle, type FootprintCandle } from "@/lib/footprint-analysis";
+import { computeProbabilitySnapshot, type ProbabilitySnapshot } from "@/lib/probability";
+import type { Regime } from "@/lib/hurst";
 
 const fmtVol = (v: number): string =>
   v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : v >= 1_000 ? Math.round(v / 1_000) + "k" : String(Math.round(v));
@@ -90,6 +92,12 @@ export function TerminalLiveChart({
   const fpRafRef = useRef(0);
   const drawFpRef = useRef<() => void>(() => {});
   const candlesRef = useRef<TerminalCandle[]>([]);
+  // Probability overlay canvas (separate layer — never touches the candle/vector series, so it
+  // can't destabilize the chart). Renders each fractal concept individually, flag-gated.
+  const probCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const probRafRef = useRef(0);
+  const drawProbRef = useRef<() => void>(() => {});
+  const probSnapRef = useRef<ProbabilitySnapshot | null>(null);
   const fpOnRef = useRef(false);
   const milkOnRef = useRef(false);
   const milkZonesRef = useRef<MilkZone[]>([]);
@@ -213,7 +221,7 @@ export function TerminalLiveChart({
       if (!hostRef.current || !chartRef.current) return;
       chartRef.current.applyOptions({ width: hostRef.current.clientWidth, height: hostRef.current.clientHeight });
       cancelAnimationFrame(fpRafRef.current);
-      fpRafRef.current = requestAnimationFrame(() => drawFpRef.current());
+      fpRafRef.current = requestAnimationFrame(() => { drawFpRef.current(); drawProbRef.current(); });
     });
     ro.observe(hostRef.current);
 
@@ -565,6 +573,104 @@ export function TerminalLiveChart({
   };
   drawFpRef.current = drawFootprint;
 
+  // ── Probability overlays: each fractal concept drawn individually on its own canvas layer ──
+  const scheduleProbDraw = () => {
+    cancelAnimationFrame(probRafRef.current);
+    probRafRef.current = requestAnimationFrame(() => drawProbRef.current());
+  };
+  const drawProbability = () => {
+    const canvas = probCanvasRef.current, chart = chartRef.current, series = candleRef.current, host = hostRef.current;
+    if (!canvas || !chart || !series || !host) return;
+    const cw = host.clientWidth, ch = host.clientHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (canvas.width !== Math.floor(cw * dpr) || canvas.height !== Math.floor(ch * dpr)) {
+      canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(ch * dpr);
+      canvas.style.width = cw + "px"; canvas.style.height = ch + "px";
+    }
+    const ctx = canvas.getContext("2d"); if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    if (!strategies.Probability) return;
+    const snap = probSnapRef.current; if (!snap) return;
+    const ts = chart.timeScale();
+    ctx.font = "10px 'IBM Plex Mono', monospace";
+
+    // Pixel-density estimator → map any unix ts → X, including FUTURE times (forecast cone).
+    const sortedC = [...candlesRef.current].sort((a, b) => a.time - b.time);
+    let pxPerSec = 0, refX = 0, refT = 0;
+    for (let si = sortedC.length - 1; si > 0; si--) {
+      const t1 = sortedC[si - 1].time, t2 = sortedC[si].time;
+      const cx1 = ts.timeToCoordinate(t1 as any) as number | null;
+      const cx2 = ts.timeToCoordinate(t2 as any) as number | null;
+      if (cx1 !== null && cx2 !== null && t2 !== t1) { pxPerSec = (cx2 - cx1) / (t2 - t1); refX = cx2; refT = t2; break; }
+    }
+    const estX = (t: number): number => { const c = ts.timeToCoordinate(t as any) as number | null; return c !== null ? c : (pxPerSec !== 0 ? refX + (t - refT) * pxPerSec : -1); };
+    const Y = (p: number): number | null => { const y = series.priceToCoordinate(p); return y === null ? null : (y as number); };
+
+    // ── 1. Value Area — long-run POC / VAH / VAL horizontal lines + 70% band ──
+    if (strategies.probValueArea && snap.valueArea) {
+      const va = snap.valueArea;
+      const yH = Y(va.vah), yL = Y(va.val);
+      if (yH !== null && yL !== null) { ctx.fillStyle = "rgba(255,180,84,0.05)"; ctx.fillRect(0, Math.min(yH, yL), cw, Math.abs(yL - yH)); }
+      const hLine = (price: number, color: string, label: string, dash: number[] = []) => {
+        const y = Y(price); if (y === null || y < 0 || y > ch) return;
+        ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash(dash);
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cw, y); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = color; ctx.textAlign = "left"; ctx.fillText(label, 6, y - 3);
+      };
+      hLine(va.vah, C.down, `VAH ${va.vah.toFixed(2)}`, [4, 3]);
+      hLine(va.poc, C.amber, `POC ${va.poc.toFixed(2)}`);
+      hLine(va.val, C.up, `VAL ${va.val.toFixed(2)}`, [4, 3]);
+    }
+
+    // ── 2. Target Levels — Hurst target-scaler ± expected range at the current price ──
+    if (strategies.probScaler && snap.projection) {
+      ctx.textAlign = "right";
+      for (const lv of snap.projection.levels) {
+        for (const [price, tag] of [[lv.up, `+${lv.horizon}b`], [lv.dn, `-${lv.horizon}b`]] as [number, string][]) {
+          const y = Y(price); if (y === null || y < 0 || y > ch) continue;
+          ctx.strokeStyle = "rgba(96,165,250,0.45)"; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+          ctx.beginPath(); ctx.moveTo(cw * 0.58, y); ctx.lineTo(cw, y); ctx.stroke(); ctx.setLineDash([]);
+          ctx.fillStyle = "rgba(96,165,250,0.85)"; ctx.fillText(tag, cw - 5, y - 2);
+        }
+      }
+    }
+
+    // ── 3. Forecast Cone — fBm Hurst-scaled expected range projecting right from the last bar ──
+    if (strategies.probForecast && snap.projection && sortedC.length) {
+      const last = sortedC[sortedC.length - 1];
+      const ivSec = INTERVAL_SECS[interval] ?? 300;
+      const x0 = estX(last.time), y0 = Y(snap.price);
+      if (y0 !== null && x0 >= 0) {
+        const pts = snap.projection.levels.map((lv) => ({ x: estX(last.time + lv.horizon * ivSec), yu: Y(lv.up), yd: Y(lv.dn) }));
+        ctx.beginPath(); ctx.moveTo(x0, y0);
+        for (const p of pts) if (p.yu !== null) ctx.lineTo(p.x, p.yu);
+        for (let i = pts.length - 1; i >= 0; i--) if (pts[i].yd !== null) ctx.lineTo(pts[i].x, pts[i].yd as number);
+        ctx.closePath(); ctx.fillStyle = "rgba(45,212,191,0.08)"; ctx.fill();
+        ctx.strokeStyle = "rgba(45,212,191,0.55)"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x0, y0); for (const p of pts) if (p.yu !== null) ctx.lineTo(p.x, p.yu); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x0, y0); for (const p of pts) if (p.yd !== null) ctx.lineTo(p.x, p.yd as number); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // ── 4. Regime Ribbon — DFA-Hurst regime colored along the bottom of the chart over time ──
+    if (strategies.probRegime && snap.regimeStrip.length) {
+      const ribH = 7, ribY = ch - ribH - 2;
+      const regColor: Record<Regime, string> = { PERSISTENT: C.up, MEANREVERT: C.amber, NEUTRAL: "rgba(124,129,144,0.7)", UNKNOWN: "rgba(86,91,105,0.45)" };
+      const strip = snap.regimeStrip;
+      for (let i = 0; i < strip.length; i++) {
+        const x1 = estX(strip[i].time);
+        const x2 = i + 1 < strip.length ? estX(strip[i + 1].time) : x1 + (pxPerSec !== 0 && strip[i - 1] ? pxPerSec * (strip[i].time - strip[i - 1].time) : 8);
+        const xa = Math.max(0, x1), xb = Math.min(cw, x2); if (xb <= xa) continue;
+        ctx.fillStyle = regColor[strip[i].regime]; ctx.fillRect(xa, ribY, xb - xa, ribH);
+      }
+      ctx.fillStyle = C.muted; ctx.textAlign = "left"; ctx.font = "8px 'IBM Plex Mono', monospace";
+      ctx.fillText("REGIME", 6, ribY - 2);
+    }
+  };
+  drawProbRef.current = drawProbability;
+
   // ── Footprint: fetch REAL per-candle data → delta tint + session aggregates → redraw ──
   useEffect(() => {
     if (!strategies.Footprint) { deltaRef.current = new Map(); fpSessionsRef.current = []; applyCandles(); scheduleFpDraw(); return; }
@@ -614,14 +720,28 @@ export function TerminalLiveChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, interval, strategies.Footprint, barSig]);
 
-  // Redraw the footprint overlay when the visible time range changes (pan / zoom).
+  // Redraw the footprint + probability overlays when the visible time range changes (pan / zoom).
   useEffect(() => {
     const chart = chartRef.current; if (!chart) return;
-    const sub = () => scheduleFpDraw();
+    const sub = () => { scheduleFpDraw(); scheduleProbDraw(); };
     chart.timeScale().subscribeVisibleTimeRangeChange(sub);
     return () => { try { chart.timeScale().unsubscribeVisibleTimeRangeChange(sub); } catch { /* ignore */ } };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Compute the probability snapshot when the bar set changes (memoized to barSig), then redraw.
+  useEffect(() => {
+    if (!strategies.Probability) { probSnapRef.current = null; scheduleProbDraw(); return; }
+    const ivSec = INTERVAL_SECS[interval] ?? 300;
+    probSnapRef.current = computeProbabilitySnapshot(candles, ivSec);
+    scheduleProbDraw();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [barSig, strategies.Probability, interval]);
+
+  // Redraw (no recompute) when an individual overlay is toggled.
+  useEffect(() => { scheduleProbDraw(); },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [strategies.probValueArea, strategies.probRegime, strategies.probForecast, strategies.probScaler, selectedSig]);
 
   // ── Lazy deep-history: load the full history when the user scrolls near the left edge ──
   useEffect(() => {
@@ -641,8 +761,13 @@ export function TerminalLiveChart({
     const m = markersRef.current;
     if (!m) return;
     const times = candles.map((c) => c.time);
-    const minT = times.length ? Math.min(...times) : 0;
-    const maxT = times.length ? Math.max(...times) : 0;
+    // NOTE: Math.min/max(...times) overflows the call stack on 1m (~190k bars spread as args).
+    // Compute via a loop instead — never spread a full-history candle array.
+    let minT = 0, maxT = 0;
+    if (times.length) {
+      minT = maxT = times[0];
+      for (let i = 1; i < times.length; i++) { const t = times[i]; if (t < minT) minT = t; if (t > maxT) maxT = t; }
+    }
     const markers = [...signals]
       .filter((s) => s.ts >= minT && s.ts <= maxT)
       .sort((a, b) => a.ts - b.ts)
@@ -678,6 +803,10 @@ export function TerminalLiveChart({
       <canvas
         ref={fpCanvasRef}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 3 }}
+      />
+      <canvas
+        ref={probCanvasRef}
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 4 }}
       />
       <div key={"sweep" + chartKey} className="tt-sweep" />
     </div>

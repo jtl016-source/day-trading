@@ -14,7 +14,7 @@ import { db } from "./db";
 import { sql } from "drizzle-orm";
 import { cachedCandles } from "@shared/schema";
 import { normalizeSymbol } from "@shared/symbol";
-import { isSaneBarTime } from "@shared/bar-time";
+import { isSaneBarTime, validateBar } from "@shared/bar-time";
 import { setMWBroadcast, notifyExternalTick, setTickRelayConnected } from "./mw-reader";
 import { cacheInvalidate } from "./cache";
 
@@ -340,8 +340,9 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           const intervalSec = parseInt(res, 10) * 60; // e.g. res="5" → 300s
           const validBars = normalizedBars.filter(b => {
             if (!b.t || !b.o || !b.h || !b.l || !b.c) return false;   // missing fields
+            if ((b as any).v == null || (b as any).v === 0) return false; // ghost bar — zero/absent volume
             if (!isSaneBarTime(b.t))                  return false;   // future/corrupt-dated
-            if (b.h < b.l || b.o <= 0 || b.c <= 0)   return false;   // invalid OHLC
+            if (b.h <= b.l || b.o <= 0 || b.c <= 0)  return false;   // invalid OHLC (h<=l rejects flat/no-range candles)
             if (!Number.isFinite(b.o) || !Number.isFinite(b.h) ||
                 !Number.isFinite(b.l) || !Number.isFinite(b.c))       return false; // NaN/Inf
             if (b.l < 1000 || b.h > 100_000)                          return false; // corrupt float32 pattern (512, 47104, etc.)
@@ -512,11 +513,12 @@ export function broadcast(msg: object) {
 
 async function persistBar(bar: LiveBar, resolution = "5") {
   if (!isSaneBarTime(bar.time)) return; // never persist future/corrupt-dated bars
-  if (
-    !bar.open || !bar.high || !bar.low || !bar.close ||
-    bar.high < bar.low || bar.low < 1000 || bar.high > 100_000 ||
-    (bar.high - bar.low) / bar.close > 0.05
-  ) return;
+  const resSec = (parseInt(resolution, 10) || 5) * 60;
+  // Write-time guard: rejects None/≤0/malformed OHLC, GHOST bars (volume 0/None), OFF-GRID
+  // timestamps (the source of the stray off-grid V0 rows), and gross spikes. maxDeviation 0.05
+  // keeps the prior stricter MES bound on this live path.
+  if (!validateBar({ open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume, time: bar.time }, { resSec, maxDeviation: 0.05 })) return;
+  if (bar.low < 1000 || bar.high > 100_000) return; // corrupt float32 pattern (512, 47104, …)
   await db.insert(cachedCandles).values({
     symbol: bar.symbol.toUpperCase(),
     resolution,
@@ -536,7 +538,12 @@ async function persistBulk(
   bars: Array<{ t: number; o: number; h: number; l: number; c: number; v: number }>,
 ) {
   const nowSec = Math.floor(Date.now() / 1000);
-  bars = bars.filter(b => isSaneBarTime(b.t, nowSec));
+  const resSec = (parseInt(resolution, 10) || 5) * 60;
+  // Write-time guard: off-grid, ghost (V0), malformed/≤0, spike — plus MES float32 bounds + time sanity.
+  bars = bars.filter(b =>
+    isSaneBarTime(b.t, nowSec) &&
+    validateBar({ open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v, time: b.t }, { resSec, maxDeviation: 0.05 }) &&
+    b.l >= 1000 && b.h <= 100_000);
   if (!bars.length) return;
   const CHUNK = 500;
   const sym = symbol.toUpperCase();
