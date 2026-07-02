@@ -13,7 +13,10 @@ import { type Express } from "express";
 import { db } from "./db";
 import { sql } from "drizzle-orm";
 import { cachedCandles } from "@shared/schema";
+import { normalizeSymbol } from "@shared/symbols";
 import { setMWBroadcast, notifyExternalTick } from "./mw-reader";
+import { onStudyConnected, onStudyDisconnected, onBackfillDone } from "./gap-audit";
+import { detectAndHeal } from "./roll-heal";
 
 interface LiveBar {
   symbol:   string;
@@ -46,6 +49,10 @@ let mwSyncStartedAt: number | null = null;
 export function getMWSyncStatus() {
   return { status: mwSyncStatus, symbol: mwSyncSymbol, barsReceived: mwSyncBarsReceived, startedAt: mwSyncStartedAt };
 }
+
+// MW-SYNC: upgraded (v2) LiveBarRelay studies that completed the `hello` handshake.
+// Keyed by "SYM:RES" — one study instance per MW chart. Cleaned up on socket close.
+const studySockets = new Map<string, WebSocket>();
 
 export function broadcastOrderCommand(cmd: object) {
   // Send to ONE open socket only — broadcasting to all would cause duplicate orders
@@ -160,6 +167,13 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
   mwWss.on("connection", (ws) => {
     console.log("[mw-feed] MotiveWave study connected");
 
+    // Per-connection state. `helloSeen` marks a v2 study that will always tag its
+    // bars with an explicit resolution; legacy studies (no hello) keep the old
+    // timestamp-mod inference fallback.
+    let helloSeen = false;
+    let resWarned = false;
+    const registeredKeys = new Set<string>();
+
     ws.on("error", () => {});
 
     ws.on("message", (data) => {
@@ -177,12 +191,47 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           // Keep mw-reader's internal bar state in sync and suppress its disk heartbeat
           notifyExternalTick(symbol, price);
 
+        } else if (msg.type === "hello") {
+          // MW-SYNC: v2 handshake — register the study socket and kick a gap audit.
+          const hm = msg as any;
+          const sym = normalizeSymbol(hm.symbol ?? "");
+          const res = String(hm.resolution ?? "").replace("m", "");
+          if (!sym || !res) return;
+          helloSeen = true;
+          const k = `${sym}:${res}`;
+          registeredKeys.add(k);
+          studySockets.set(k, ws);
+          console.log(`[mw-feed] hello ${k} ver=${hm.ver ?? "?"} series=[${hm.seriesStartMs ?? "?"}..${hm.seriesEndMs ?? "?"}]`);
+          onStudyConnected(sym, res, ws);
+
+        } else if (msg.type === "backfill_done") {
+          // MW-SYNC: study finished servicing a backfill request.
+          const bd = msg as any;
+          const id = bd.id as string | undefined;
+          if (!id) return;
+          const count = Number(bd.count) || 0;
+          const earliestAvailableMs = Number(bd.earliestAvailableMs) || 0;
+          const source = typeof bd.source === "string" ? bd.source : "feed";
+          onBackfillDone(id, count, earliestAvailableMs, source);
+
         } else if (msg.type === "bar") {
           const bar = msg as LiveBar;
           if (!bar.symbol || !bar.time) return;
-          // Infer resolution if the study didn't include it
-          const res = (msg as any).resolution as string | undefined
-            ?? (bar.time % 3600 === 0 ? "60" : bar.time % 300 === 0 ? "5" : "1");
+          // Resolution: explicit field is authoritative. For a v2 study (hello seen)
+          // it is mandatory — drop untagged bars. Legacy studies fall back to the
+          // timestamp-mod heuristic.
+          let res = (msg as any).resolution as string | undefined;
+          if (res) {
+            res = res.replace("m", "");
+          } else if (helloSeen) {
+            if (!resWarned) {
+              console.warn(`[mw-feed] bar without resolution from v2 study ${bar.symbol} — dropping`);
+              resWarned = true;
+            }
+            return;
+          } else {
+            res = bar.time % 3600 === 0 ? "60" : bar.time % 300 === 0 ? "5" : "1";
+          }
 
           // CATCH-UP CANDLE FIX: validate individual live bars before broadcasting/persisting.
           // A bar with bad OHLC (e.g. h < l, zero prices) would corrupt signals and chart.
@@ -218,11 +267,14 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           } // FOOTPRINT-STRATEGY:
 
         } else if (msg.type === "bulk_bars") {
-          // History dump from LiveBarRelay — batch upsert into cached_candles
+          // History dump / backfill batch from LiveBarRelay — batch upsert into cached_candles.
+          // v2 batches carry id/seq/final; legacy batches (no id) still flow through the same path.
           const bulk = msg as any;
-          const sym  = (bulk.symbol as string | undefined)?.toUpperCase();
+          const sym  = normalizeSymbol(bulk.symbol ?? "");
           const rawRes = (bulk.resolution as string | undefined) ?? "1";
           const res = rawRes.replace("m", "");
+          const id  = bulk.id as string | undefined;
+          const seq = typeof bulk.seq === "number" ? bulk.seq : 0;
           const bars = bulk.bars as Array<{ t: number; o: number; h: number; l: number; c: number; v: number }> | undefined;
           if (!sym || !Array.isArray(bars) || bars.length === 0) return;
 
@@ -242,16 +294,31 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
             if (intervalSec > 0 && b.t % intervalSec !== 0)           return false; // not aligned
             return true;
           });
-          const skipped = bars.length - validBars.length;
-          if (skipped > 0) console.log(`[mw-feed] bulk_bars: skipped ${skipped} invalid/misaligned bars for ${sym} res=${res}`);
-          if (validBars.length === 0) return;
+          const accepted = validBars.length;
+          const rejected = bars.length - accepted;
+
+          // MW-SYNC: counted-reject reply so the study/server can track batch health.
+          if (id) {
+            try { ws.send(JSON.stringify({ type: "bulk_report", id, seq, accepted, rejected })); } catch {}
+          }
+          if (rejected > bars.length * 0.02) {
+            console.warn(`[mw-feed] bulk_bars: ${rejected}/${bars.length} rejected for ${sym} res=${res}`);
+            broadcast({ type: "mw_sync_warning", symbol: sym, resolution: res, accepted, rejected });
+          } else if (rejected > 0) {
+            console.log(`[mw-feed] bulk_bars: skipped ${rejected} invalid/misaligned bars for ${sym} res=${res}`);
+          }
+          if (accepted === 0) return;
 
           // Track sync state
           if (mwSyncStatus === "pending") { mwSyncStatus = "syncing"; mwSyncStartedAt = Date.now(); }
           mwSyncSymbol = sym;
-          mwSyncBarsReceived += validBars.length;
+          mwSyncBarsReceived += accepted;
           broadcast({ type: "mw_sync_progress", symbol: sym, barsReceived: mwSyncBarsReceived });
-          persistBulk(sym, res, validBars)
+
+          // MW-SYNC: heal continuous-contract roll re-adjustments BEFORE upserting the overlap.
+          detectAndHeal(sym, res, validBars)
+            .catch(() => null)
+            .then(() => persistBulk(sym, res, validBars))
             .then(() => {
               mwSyncStatus = "done";
               broadcast({ type: "data_updated", symbol: sym });
@@ -265,6 +332,11 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
     });
 
     ws.on("close", () => {
+      // MW-SYNC: unregister this study's (SYM:RES) entries and stop its backfills.
+      for (const k of registeredKeys) {
+        if (studySockets.get(k) === ws) studySockets.delete(k);
+      }
+      onStudyDisconnected(ws);
       console.log("[mw-feed] MotiveWave study disconnected");
     });
   });
@@ -333,7 +405,7 @@ async function persistBar(bar: LiveBar, resolution = "5") {
 }
 
 /** Batch-upsert bars from a LiveBarRelay history dump. */
-async function persistBulk(
+export async function persistBulk(
   symbol: string,
   resolution: string,
   bars: Array<{ t: number; o: number; h: number; l: number; c: number; v: number }>,

@@ -9,6 +9,7 @@ import { cachedCandles, downloadStatus, newsArticles, appSettings, signalHistory
 import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus } from "./live-bars";
+import { getCompleteness } from "./gap-audit";
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, setAutoTrade, getAutoTrade, deepBackReadAll, reparseAllZones } from "./discord-reader";
 import { parseZonesFromMessage } from "./discord-zone-parser";
@@ -1684,7 +1685,45 @@ export async function registerRoutes(
   });
 
   app.get("/api/mw/sync-status", (_req, res) => {
-    res.json(getMWSyncStatus());
+    // MW-SYNC: base status + per-resolution completeness for the currently-synced symbol.
+    const base = getMWSyncStatus();
+    let completeness: Record<string, ReturnType<typeof getCompleteness>> | undefined;
+    if (base.symbol) {
+      completeness = {};
+      for (const r of ["1", "5", "15", "60"]) {
+        try {
+          const c = getCompleteness(base.symbol, r);
+          if (c.stored > 0 || c.expected > 0) completeness[r] = c;
+        } catch { /* skip resolution on error */ }
+      }
+    }
+    res.json({ ...base, completeness });
+  });
+
+  // MW-SYNC: gap/completeness report for a (symbol, resolution).
+  app.get("/api/data/gaps/:symbol/:resolution", (req, res) => {
+    try {
+      const sym = req.params.symbol.toUpperCase();
+      const resolution = req.params.resolution.replace("m", "");
+      const c = getCompleteness(sym, resolution);
+      res.json({ symbol: sym, resolution, ...c });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // MW-SYNC: clear "no_data" unfillable rows so the auditor retries those ranges.
+  app.delete("/api/data/unfillable/:symbol/:resolution", (req, res) => {
+    try {
+      const sym = req.params.symbol.toUpperCase();
+      const resolution = req.params.resolution.replace("m", "");
+      const info = db.$client.prepare(
+        `DELETE FROM unfillable_ranges WHERE symbol=? AND resolution=? AND reason='no_data'`,
+      ).run(sym, resolution);
+      res.json({ ok: true, cleared: info.changes });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // GET /api/trade/settings — current auto-trade config

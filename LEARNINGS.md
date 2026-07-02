@@ -699,3 +699,28 @@ Error: Could not resolve authentication method. Expected either apiKey or authTo
 - Afternoon entry — momentum often faded (×31)
 - Late session — expired near close (×11)
 - Resistance at 7235.00 capped the run (×1)
+
+---
+
+**2026-07-02 — MW data-sync overhaul (hello handshake + server-driven backfill + roll-heal + gap audit)**
+
+Root causes fixed (each had silently corrupted or thinned the candle store):
+- **Resolution inferred from bar deltas across session gaps** — v1 LiveBarRelay/`live-bars.ts` inferred resolution from a single `startTime` delta. Across the Fri→Sun weekend or the daily maintenance break the delta is huge, so a 1m chart's dump got mislabeled 15m/60m and landed in the wrong `cached_candles` resolution bucket. Fix: resolution is now GROUND TRUTH — the study resolves it once via `DataSeries.getBarSize()` reflection (interval accessor), falling back to the MEDIAN of the first 50 consecutive deltas (never a single pair), and stamps every `bar`/`bulk_bars` with it. The server requires `resolution` from any socket that sent `hello` (v2) and only uses the timestamp-mod guess for legacy studies.
+- **Silent alignment-filter drops** — `bulk_bars` validation discarded misaligned/invalid bars with only a `console.log`. Now it is a COUNTED reject: the server replies `bulk_report{id,seq,accepted,rejected}` and, if >2% of a batch is rejected, warns + broadcasts `mw_sync_warning`. Legacy batches (no `id`) still flow through unchanged.
+- **`sendWs` drop-on-inflight lost all but the first batch** — v1 dropped any message while a previous send was in flight, so multi-batch history dumps lost most bars. v2 uses a single daemon **sender thread + outbox**: protocol + complete-bar messages are queued (never dropped); ticks and forming bars use latest-wins single slots. Java WebSocket forbids concurrent `sendText`, so ALL sends (including backfill batches) are serialized through that one thread — do NOT reintroduce direct `sendText` calls from the scheduler thread.
+- **DataSeries only holds chart-loaded range** — the study can only see bars MW has loaded into the chart, so deep history was never obtainable. v2 services server `backfill{id,fromMs,toMs}` requests via `Instrument.forEachBar` (reflection) for deep history, and **auto-degrades** to the loaded DataSeries slice (`source:"chart"`) when forEachBar is missing/empty for a range that overlaps the chart. `backfill_done{count,earliestAvailableMs,source}` reports the provider's history cap.
+
+New architecture:
+- **hello handshake**: study → `{type:"hello",symbol,resolution,seriesStartMs,seriesEndMs,ver:2}` on WS open once resolution is known (via a `pendingHello` AtomicBoolean fired from `calculate()`). Server registers the socket in a `Map<"SYM:RES",WebSocket>` and calls `gap-audit.onStudyConnected`.
+- **server-driven backfill** (`server/gap-audit.ts`): walks the expected bar grid from `sync_state.earliest_ts` to now, emits missing runs that fall inside CME Globex hours (`isSessionOpen`: Sun 17:00 CT → Fri 16:00 CT, daily 16:00–17:00 break; CT offset cached per day via a module-level `Intl.DateTimeFormat` singleton — never per-call), merges runs <2 bars apart, splits ranges >5000 bars, skips `unfillable_ranges`. One in-flight `backfill` per socket; next sent on `backfill_done`. First-ever sync also queues a deep-history probe `backfill(0→earliest)`; a returned `earliestAvailableMs` marks everything before it `unfillable(reason=provider_cap)`; a range returning 0 bars twice → `unfillable(reason=no_data)`.
+- **roll-heal** (`server/roll-heal.ts`): before persisting a bulk batch, compares overlapping stored vs incoming closes. ≥20 overlaps all equal within 0.125 (half ES tick) with |δ|>0.125 ⇒ continuous-contract roll re-adjustment: shift all older bars by δ in one transaction + log to `adjustment_log`. Non-constant diffs ⇒ warn + `mw_sync_warning`, no heal.
+- New tables (`shared/schema.ts` + `server/db.ts` raw CREATE): `sync_state`, `unfillable_ranges`, `adjustment_log`. New shared helper `normalizeSymbol()` (`shared/symbols.ts`) strips `@`/`!` continuous-contract prefixes + uppercases.
+- New routes: `GET /api/data/gaps/:symbol/:resolution`, `DELETE /api/data/unfillable/:symbol/:resolution` (clears `no_data` for retry), and `/api/mw/sync-status` now includes per-resolution completeness.
+- **CSV fallback** (`server/csv-watch.ts`, off unless `MW_EXPORT_DIR` set): `fs.watch` (NOT chokidar — not a dep) on `<SYMBOL>_<RES>.csv`, debounced 2s, same validate → roll-heal → `persistBulk` path. `yyyy-MM-dd HH:mm` timestamps assumed UTC (to confirm via P5 dry run).
+- Deleted `HistoryDumper.java`; `SdkProbe.java` added to `build.bat` (bundled into LiveBarRelay.jar).
+
+Pending Windows verification (run `SdkProbe` once, send back `~/MotiveWave Extensions/sdk_probe.txt`):
+- **P1** — confirm the real `BarSize` interval accessor name (getInterval vs getIntervalMinutes vs getSize) and whether it returns minutes or seconds; `mapBarSizeValue` guesses today.
+- **P2/P3** — confirm `Instrument.forEachBar` exists, its exact signature, the callback interface + bar getter names, and CRUCIALLY whether P3 (7-day window 2 years ago) returns bars beyond the chart-loaded range. If forEachBar cannot fetch deep history, only the DataSeries-slice (`source:"chart"`) path works and deep backfill must come from the CSV export fallback.
+- **P4** — capture `Instrument.getBars` signature(s) as an alternative to forEachBar.
+- **P5** — confirm MW Data Export CSV column order + timestamp format for `csv-watch.ts`.

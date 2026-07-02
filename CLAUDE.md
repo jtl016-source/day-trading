@@ -5,6 +5,12 @@
 2. Apply all "What Has Worked" and avoid all "What Has Failed"
 3. After completing the task, update `LEARNINGS.md`
 
+## Subagent Model Policy (permanent — set by user 2026-07-02)
+When spawning subagents via the Agent tool, always pick the model by task type:
+- **fable** — problem solving, strategy making, and closely related topics
+- **sonnet** — research, question making/thinking related topics
+- **opus** — coding/implementation
+
 ---
 
 ## Project Overview

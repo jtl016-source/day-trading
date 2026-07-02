@@ -7,6 +7,7 @@ import { serveStatic } from "./static";
 import { createServer } from "http";
 import { strategyGuard } from "./strategy-guard";
 import { initFootprintEngine } from "./footprint-engine"; // FOOTPRINT-STRATEGY:
+import { setupCsvWatch } from "./csv-watch"; // MW-SYNC: optional CSV export fallback
 
 const app = express();
 const httpServer = createServer(app);
@@ -79,6 +80,7 @@ process.on("unhandledRejection", (reason) => {
   setupLiveBars(httpServer, app);
   initFootprintEngine(broadcast); // FOOTPRINT-STRATEGY: wire broadcast so footprint_candle messages reach clients
   setupMWReader(httpServer, app);
+  setupCsvWatch(); // MW-SYNC: no-op unless MW_EXPORT_DIR is set
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
