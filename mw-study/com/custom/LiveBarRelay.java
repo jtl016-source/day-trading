@@ -387,6 +387,36 @@ public class LiveBarRelay extends Study {
 
   // ── Incoming protocol handling ────────────────────────────────────────────────
 
+  /** Extracts a string field value ("field":"value") from a JSON message. */
+  private static String extractString(String json, String field) {
+    String key = "\"" + field + "\":\"";
+    int i = json.indexOf(key);
+    if (i < 0) return null;
+    int start = i + key.length();
+    int end = json.indexOf('"', start);
+    if (end < 0) return null;
+    return json.substring(start, end);
+  }
+
+  /** Extracts a numeric field value ("field":12345) from a JSON message; -1 if absent. */
+  private static long extractLongField(String json, String field) {
+    String key = "\"" + field + "\":";
+    int i = json.indexOf(key);
+    if (i < 0) return -1;
+    int p = i + key.length();
+    boolean neg = false;
+    if (p < json.length() && json.charAt(p) == '-') { neg = true; p++; }
+    long v = 0;
+    boolean any = false;
+    while (p < json.length() && Character.isDigit(json.charAt(p))) {
+      v = v * 10 + (json.charAt(p) - '0');
+      p++;
+      any = true;
+    }
+    if (!any) return -1;
+    return neg ? -v : v;
+  }
+
   private void handleIncoming(String s) {
     try {
       if (s.contains("\"backfill\"") && s.contains("\"fromMs\"")) {

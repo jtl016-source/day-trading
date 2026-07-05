@@ -724,3 +724,8 @@ Pending Windows verification (run `SdkProbe` once, send back `~/MotiveWave Exten
 - **P2/P3** — confirm `Instrument.forEachBar` exists, its exact signature, the callback interface + bar getter names, and CRUCIALLY whether P3 (7-day window 2 years ago) returns bars beyond the chart-loaded range. If forEachBar cannot fetch deep history, only the DataSeries-slice (`source:"chart"`) path works and deep backfill must come from the CSV export fallback.
 - **P4** — capture `Instrument.getBars` signature(s) as an alternative to forEachBar.
 - **P5** — confirm MW Data Export CSV column order + timestamp format for `csv-watch.ts`.
+
+**2026-07-05 — LiveBarRelay v2 compile failure: undefined JSON helpers**
+- Observation: `handleIncoming` called `extractString`/`extractLongField` which were never defined — compile failed on the user's machine (`cannot find symbol`). The MW SDK jar only exists on Windows, so the error wasn't caught before push.
+- Fix: added the two manual JSON field-extraction helpers. Prevention: MW studies can be stub-compiled in the sandbox — write minimal stub classes for the SDK types actually referenced (Study, StudyHeader, DataContext, DataSeries, Instrument, Tick, Defaults + one class in desc package for the wildcard import) and run `javac --release 17 -sourcepath <stubs>`. Catches all symbol/syntax errors without the real SDK. Always do this before pushing Java study changes.
+- Confidence: high
