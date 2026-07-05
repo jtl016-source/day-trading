@@ -445,6 +445,14 @@ public class LiveBarRelay extends Study {
 
   // ── Backfill servicing ────────────────────────────────────────────────────────
 
+  // Deep ranges (e.g. the server's 0 → earliest-stored probe) must not become one
+  // giant getBars call — that could block for minutes or hammer the data feed.
+  // Instead walk backward in 30-day windows, streaming each window out as it
+  // arrives, and stop after MAX_EMPTY_WINDOWS consecutive empty windows (the
+  // provider history cap — ~6 months of silence means there is nothing older).
+  private static final long DEEP_WINDOW_MS     = 30L * 24L * 3600_000L;
+  private static final int  MAX_EMPTY_WINDOWS  = 6;
+
   private void serviceBackfill(String id, long fromMs, long toMs) {
     DataSeries ds   = dataSeries;
     Instrument inst = instrument;
@@ -452,26 +460,52 @@ public class LiveBarRelay extends Study {
 
     String source = "feed";
     long   earliestMs = 0;
-    List<String> bars = null;
+    int    totalSent  = 0;
+    int    seq        = 0;
 
-    // 1. Try Instrument.getBars (deep history).
+    // 1. Try Instrument.getBars (deep history), windowed for large ranges.
     try {
-      BarsResult r = tryGetBars(inst, fromMs, toMs);
-      if (r != null && r.count > 0) { bars = r.bars; earliestMs = r.earliestMs; source = "feed"; }
+      if (toMs - fromMs <= DEEP_WINDOW_MS + 5L * 24L * 3600_000L) {
+        BarsResult r = tryGetBars(inst, fromMs, toMs);
+        if (r != null && r.count > 0) {
+          earliestMs = r.earliestMs;
+          seq        = emitBatches(id, r.bars, seq);
+          totalSent += r.count;
+        }
+      } else {
+        int  empties = 0;
+        long winEnd  = toMs;
+        while (winEnd > fromMs && empties < MAX_EMPTY_WINDOWS) {
+          long winStart = Math.max(fromMs, winEnd - DEEP_WINDOW_MS);
+          BarsResult r = tryGetBars(inst, winStart, winEnd);
+          if (r != null && r.count > 0) {
+            empties = 0;
+            if (earliestMs == 0 || r.earliestMs < earliestMs) earliestMs = r.earliestMs;
+            seq        = emitBatches(id, r.bars, seq);
+            totalSent += r.count;
+          } else {
+            empties++;
+          }
+          winEnd = winStart;
+          // Backpressure: don't let the fetch loop run far ahead of the sender.
+          while (outbox.size() > 20) {
+            try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+          }
+        }
+      }
     } catch (Throwable t) {
       System.out.println("[LiveBarRelay] getBars failed: " + t);
     }
 
-    // 2. Auto-degrade to the loaded DataSeries slice when getBars is unavailable/empty
+    // 2. Auto-degrade to the loaded DataSeries slice when getBars produced nothing
     //    and the requested range overlaps what the chart already has.
-    if (bars == null || bars.isEmpty()) {
+    if (totalSent == 0) {
       int size = ds.size();
       if (size > 1) {
         long chartStart = ds.getStartTime(0);
         long chartEnd   = ds.getStartTime(size - 1);
         if (fromMs <= chartEnd && toMs >= chartStart) {
-          bars = new ArrayList<>();
-          earliestMs = 0;
+          List<String> bars = new ArrayList<>();
           for (int i = 0; i < size - 1; i++) { // skip forming last bar
             long t = ds.getStartTime(i);
             if (t < fromMs || t > toMs) continue;
@@ -481,24 +515,29 @@ public class LiveBarRelay extends Study {
             bars.add(barJson(t / 1000L, o, h, l, c, v));
             if (earliestMs == 0 || t < earliestMs) earliestMs = t;
           }
-          source = "chart";
+          if (!bars.isEmpty()) {
+            seq        = emitBatches(id, bars, seq);
+            totalSent += bars.size();
+            source = "chart";
+          }
         }
       }
     }
 
-    if (bars == null) bars = new ArrayList<>();
+    sendBackfillDone(id, totalSent, earliestMs, source);
+    System.out.printf("[LiveBarRelay] backfill %s done: %d bars source=%s%n", id, totalSent, source);
+  }
 
+  /** Enqueues the given bars as bulk_bars batches; returns the next seq number. */
+  private int emitBatches(String id, List<String> bars, int seq) {
     int total = bars.size();
-    int seq = 0;
     for (int i = 0; i < total; i += BATCH_SIZE) {
       List<String> chunk = new ArrayList<>(bars.subList(i, Math.min(total, i + BATCH_SIZE)));
-      boolean fin = (i + BATCH_SIZE) >= total;
       enqueue(String.format(
-        "{\"type\":\"bulk_bars\",\"id\":\"%s\",\"symbol\":\"%s\",\"resolution\":\"%s\",\"seq\":%d,\"final\":%b,\"bars\":[%s]}",
-        id, symbol, resolution, seq++, fin, String.join(",", chunk)));
+        "{\"type\":\"bulk_bars\",\"id\":\"%s\",\"symbol\":\"%s\",\"resolution\":\"%s\",\"seq\":%d,\"final\":false,\"bars\":[%s]}",
+        id, symbol, resolution, seq++, String.join(",", chunk)));
     }
-    sendBackfillDone(id, total, earliestMs, source);
-    System.out.printf("[LiveBarRelay] backfill %s done: %d bars source=%s%n", id, total, source);
+    return seq;
   }
 
   private void sendBackfillDone(String id, int count, long earliestMs, String source) {
