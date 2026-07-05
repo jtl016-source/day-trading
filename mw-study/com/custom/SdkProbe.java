@@ -39,6 +39,13 @@ public class SdkProbe extends Study {
   private final AtomicBoolean done = new AtomicBoolean(false);
 
   @Override
+  public void initialize(Defaults defaults) {
+    // MW needs a settings descriptor to apply the study — without this the
+    // add silently fails (same pattern as LiveBarRelay/TickRelay).
+    createSD();
+  }
+
+  @Override
   protected void calculate(int index, DataContext ctx) {
     if (!done.compareAndSet(false, true)) return;
 
