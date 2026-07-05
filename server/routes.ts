@@ -10,6 +10,7 @@ import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus } from "./live-bars";
 import { getCompleteness } from "./gap-audit";
+import { normalizeSymbol } from "@shared/symbols";
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, setAutoTrade, getAutoTrade, deepBackReadAll, reparseAllZones } from "./discord-reader";
 import { parseZonesFromMessage } from "./discord-zone-parser";
@@ -637,7 +638,7 @@ export async function registerRoutes(
 
   app.get("/api/data/cached-continuous/:symbol/:interval", async (req, res) => {
     const { symbol, interval } = req.params;
-    const sym = symbol.toUpperCase();
+    const sym = normalizeSymbol(symbol); // fold contract codes (MESU6) → root (MES)
     const resolution = interval === "60m" ? "60" : interval === "1m" ? "1" : "5";
     const fromN = req.query.from ? Number(req.query.from) : 0;
     const toN   = req.query.to   ? Number(req.query.to)   : Infinity;
@@ -1703,7 +1704,7 @@ export async function registerRoutes(
   // MW-SYNC: gap/completeness report for a (symbol, resolution).
   app.get("/api/data/gaps/:symbol/:resolution", (req, res) => {
     try {
-      const sym = req.params.symbol.toUpperCase();
+      const sym = normalizeSymbol(req.params.symbol); // fold contract codes → root
       const resolution = req.params.resolution.replace("m", "");
       const c = getCompleteness(sym, resolution);
       res.json({ symbol: sym, resolution, ...c });

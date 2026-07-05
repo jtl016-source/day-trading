@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "@shared/schema";
+import { normalizeSymbol } from "@shared/symbols";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -225,5 +226,87 @@ sqlite.exec(`
 // MW re-syncs, so historical Polygon-downloaded data is never lost across server restarts.
 // Previously this line: sqlite.exec(`DELETE FROM cached_candles`) wiped months of data.
 console.log("[db] cached_candles intact — historical data preserved across restarts");
+
+/**
+ * SYMBOL-FOLD: one-time (idempotent) merge of contract-keyed rows into root buckets.
+ *
+ * MW ingest keys rows by the raw contract code getSymbol() returns (e.g. "MESU6"),
+ * but the web client queries by continuous ROOT ("MES"). Without this fold, MW history
+ * fragments into per-contract buckets the client never reads, and every quarterly roll
+ * starts a fresh bucket. This folds each contract symbol into its root:
+ *   - INSERT OR IGNORE so existing root rows win on a (symbol,res,ts) collision — the root
+ *     rows are the ones the client has been reading, so they are authoritative.
+ *   - DELETE the now-duplicated contract rows.
+ * Idempotent: a second run finds no symbols where normalizeSymbol(s) !== s → no-ops.
+ *
+ * Exported so tests can drive it against a throwaway DB.
+ */
+export function foldContractSymbols(sqlite: Database.Database): void {
+  // cached_candles: unique(symbol, resolution, timestamp) → INSERT OR IGNORE is safe.
+  // signal_history: unique(symbol, interval, timestamp, direction) → same pattern applies.
+  const candleSyms = sqlite
+    .prepare(`SELECT DISTINCT symbol FROM cached_candles`)
+    .all() as { symbol: string }[];
+
+  let sigSyms: { symbol: string }[] = [];
+  try {
+    sigSyms = sqlite
+      .prepare(`SELECT DISTINCT symbol FROM signal_history`)
+      .all() as { symbol: string }[];
+  } catch {
+    // signal_history may not exist in a stripped-down DB — skip its fold.
+  }
+
+  const foldTxn = sqlite.transaction(() => {
+    // ── cached_candles ──────────────────────────────────────────────────────
+    for (const { symbol } of candleSyms) {
+      const root = normalizeSymbol(symbol);
+      if (root === symbol) continue; // already a root (or unrecognized) — leave it
+      const ins = sqlite
+        .prepare(
+          `INSERT OR IGNORE INTO cached_candles
+             (symbol, resolution, timestamp, open, high, low, close, volume)
+           SELECT ?, resolution, timestamp, open, high, low, close, volume
+             FROM cached_candles WHERE symbol = ?`,
+        )
+        .run(root, symbol);
+      const del = sqlite
+        .prepare(`DELETE FROM cached_candles WHERE symbol = ?`)
+        .run(symbol);
+      const moved = ins.changes; // rows that actually landed in the root bucket
+      const dropped = del.changes - moved; // collisions IGNOREd (existing root row kept)
+      console.log(
+        `[db] symbol-fold cached_candles ${symbol}->${root}: moved=${moved} dropped=${dropped}`,
+      );
+    }
+
+    // ── signal_history (has a symbol column; unique constraint makes IGNORE safe) ──
+    for (const { symbol } of sigSyms) {
+      const root = normalizeSymbol(symbol);
+      if (root === symbol) continue;
+      const ins = sqlite
+        .prepare(
+          `INSERT OR IGNORE INTO signal_history
+             (symbol, interval, timestamp, direction, risk_level, signal_type,
+              entry, tp1, tp2, sl, outcome, pattern_bars, footprint_reading, updated_at)
+           SELECT ?, interval, timestamp, direction, risk_level, signal_type,
+              entry, tp1, tp2, sl, outcome, pattern_bars, footprint_reading, updated_at
+             FROM signal_history WHERE symbol = ?`,
+        )
+        .run(root, symbol);
+      const del = sqlite
+        .prepare(`DELETE FROM signal_history WHERE symbol = ?`)
+        .run(symbol);
+      const moved = ins.changes;
+      const dropped = del.changes - moved;
+      console.log(
+        `[db] symbol-fold signal_history ${symbol}->${root}: moved=${moved} dropped=${dropped}`,
+      );
+    }
+  });
+  foldTxn();
+}
+
+foldContractSymbols(sqlite);
 
 export const db = drizzle(sqlite, { schema });

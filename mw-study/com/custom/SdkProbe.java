@@ -7,20 +7,23 @@ import com.motivewave.platform.sdk.study.*;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
-import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * TEMPORARY verification study. Writes a report to
+ * TEMPORARY verification study (v2). Writes a report to
  *   ~/MotiveWave Extensions/sdk_probe.txt
- * describing the SDK surface we rely on for the server-driven backfill upgrade:
- *   P1 — reflect DataSeries / Instrument / BarSize public methods + basic bar stats.
- *   P2 — call Instrument.forEachBar for the last 24h via reflection (chart range).
- *   P3 — call Instrument.forEachBar for a 7-day window two years ago (deep history).
- *   P4 — locate Instrument.getBars signature(s) WITHOUT calling.
+ * describing the SDK surface we rely on for the server-driven backfill upgrade.
+ *
+ * Round-2 changes (after probe v1 findings):
+ *   - forEachBar proxy machinery DELETED — constructing a reflect.Proxy for the
+ *     obfuscated BarOperation interface throws IllegalArgumentException ("methods
+ *     with same signature b() but incompatible return types"). That path is dead.
+ *   - P2/P3 now call Instrument.getBars(long, long, BarSize, boolean) via reflection
+ *     (plain List return — no callback interface) which is the real replacement.
+ *   - P1 additionally dumps the VALUES of getUnderlying/getExchangeSymbol/
+ *     getSymbolDisplay/getKey so we can pick a continuous key.
  * Every step is wrapped in try/catch so the study can never crash MotiveWave.
  * Add it to one chart, let it run once, then send sdk_probe.txt back.
  */
@@ -61,7 +64,7 @@ public class SdkProbe extends Study {
       w = new PrintWriter(new FileWriter(path));
       final PrintWriter out = w;
 
-      out.println("=== SDK PROBE ===");
+      out.println("=== SDK PROBE v2 ===");
       out.println("generated: " + new java.util.Date());
       try { out.println("symbol: " + instrument.getSymbol()); } catch (Throwable t) { out.println("symbol: <err> " + t); }
 
@@ -74,6 +77,18 @@ public class SdkProbe extends Study {
       out.println("--- P1: Instrument methods ---");
       dumpMethods(out, instrument);
 
+      // P1: instrument identity accessors — hunting for a continuous key.
+      out.println();
+      out.println("--- P1: Instrument identity values ---");
+      for (String m : new String[]{ "getSymbol", "getUnderlying", "getExchangeSymbol", "getSymbolDisplay", "getKey" }) {
+        try {
+          Object v = tryCallOrThrow(instrument, m);
+          out.println("instrument." + m + "() = " + v);
+        } catch (Throwable t) {
+          out.println("instrument." + m + "() ERROR: " + t);
+        }
+      }
+
       Object barSize = null;
       try {
         Method gbs = findMethod(ds.getClass(), "getBarSize");
@@ -83,8 +98,8 @@ public class SdkProbe extends Study {
           out.println("--- P1: BarSize methods (" + (barSize == null ? "null" : barSize.getClass().getName()) + ") ---");
           out.println("getBarSize().toString() = " + barSize);
           if (barSize != null) dumpMethods(out, barSize);
-          // Probe likely interval accessors on the BarSize object.
-          for (String m : new String[]{ "getInterval", "getIntervalMinutes", "getSize", "getIntervalSeconds", "getMinutes" }) {
+          // Probe the verified interval accessors on the BarSize object.
+          for (String m : new String[]{ "getInterval", "getIntervalMinutes", "getIntervalSeconds", "getSize", "getMinutes" }) {
             Object v = tryCall(barSize, m);
             if (v != null) out.println("BarSize." + m + "() = " + v);
           }
@@ -123,7 +138,7 @@ public class SdkProbe extends Study {
         out.println("P4 error: " + t);
       }
 
-      // ── P2 + P3: forEachBar via reflection on a background thread ──────────
+      // ── P2 + P3: getBars via reflection on a background thread ─────────────
       final Object bs = barSize;
       Thread bg = new Thread(() -> {
         PrintWriter bout = null;
@@ -131,15 +146,22 @@ public class SdkProbe extends Study {
           // Append to the same file after the main report is flushed.
           bout = new PrintWriter(new FileWriter(path, true));
           long now = System.currentTimeMillis();
-          out.flush();
-          bout.println();
-          bout.println("--- P2: forEachBar last 24h (chart range) ---");
-          probeForEachBar(bout, instrument, bs, now - 24L * 3600_000L, now);
 
           bout.println();
-          bout.println("--- P3: forEachBar 7-day window ~2 years ago (deep history) ---");
+          bout.println("--- P2: getBars last 24h (chart range) ---");
+          probeGetBars(bout, instrument, bs, now - 24L * 3600_000L, now);
+
+          bout.println();
+          bout.println("--- P3: getBars 7-day window ~2 years ago (deep history) ---");
           long twoYearsAgo = now - 2L * 365L * 24L * 3600_000L;
-          probeForEachBar(bout, instrument, bs, twoYearsAgo, twoYearsAgo + 7L * 24L * 3600_000L);
+          int p3 = probeGetBars(bout, instrument, bs, twoYearsAgo, twoYearsAgo + 7L * 24L * 3600_000L);
+
+          if (p3 == 0) {
+            bout.println();
+            bout.println("--- P3b: 2y window empty → retry 6 months ago (7-day window) ---");
+            long sixMonthsAgo = now - 182L * 24L * 3600_000L;
+            probeGetBars(bout, instrument, bs, sixMonthsAgo, sixMonthsAgo + 7L * 24L * 3600_000L);
+          }
 
           bout.println();
           bout.println("=== PROBE COMPLETE ===");
@@ -148,7 +170,7 @@ public class SdkProbe extends Study {
         } finally {
           if (bout != null) bout.close();
         }
-      }, "SdkProbe-forEachBar");
+      }, "SdkProbe-getBars");
       bg.setDaemon(true);
 
       out.flush();
@@ -160,72 +182,64 @@ public class SdkProbe extends Study {
     }
   }
 
-  // ── forEachBar reflection probe ───────────────────────────────────────────
-  private void probeForEachBar(PrintWriter out, Instrument instrument, Object barSize, long start, long end) {
+  // ── getBars reflection probe ──────────────────────────────────────────────
+  /** Returns the number of bars returned (0 on empty/failure) so callers can retry. */
+  private int probeGetBars(PrintWriter out, Instrument instrument, Object barSize, long fromMs, long toMs) {
     try {
-      Method fe = null;
-      for (Method m : instrument.getClass().getMethods()) {
-        if (m.getName().equals("forEachBar")) { fe = m; break; }
+      if (barSize == null) { out.println("getBars SKIPPED — barSize is null"); return 0; }
+      Method gb = findGetBars(instrument.getClass(), barSize);
+      if (gb == null) { out.println("getBars(long,long,BarSize,boolean) NOT FOUND"); return 0; }
+      out.println("using: " + sig(gb));
+
+      Object result = gb.invoke(instrument, fromMs, toMs, barSize, Boolean.FALSE);
+      if (!(result instanceof List)) {
+        out.println("getBars returned non-List: " + (result == null ? "null" : result.getClass().getName()));
+        return 0;
       }
-      if (fe == null) { out.println("forEachBar NOT FOUND on Instrument"); return; }
-      out.println("using: " + sig(fe));
+      List<?> list = (List<?>) result;
+      out.println("returned list size = " + list.size());
+      if (list.isEmpty()) return 0;
 
-      Class<?>[] pts = fe.getParameterTypes();
-      final AtomicLong count = new AtomicLong(0);
-      final AtomicLong first = new AtomicLong(0);
-      final AtomicLong last  = new AtomicLong(0);
+      Object first = list.get(0);
+      Object last  = list.get(list.size() - 1);
+      out.println("first element class = " + first.getClass().getName());
+      out.println("--- element method dump ---");
+      dumpMethods(out, first);
 
-      Object[] args = new Object[pts.length];
-      int longsSeen = 0;
-      for (int i = 0; i < pts.length; i++) {
-        Class<?> p = pts[i];
-        if (p == long.class || p == Long.class) {
-          args[i] = (longsSeen++ == 0) ? start : end;
-        } else if (p == boolean.class || p == Boolean.class) {
-          args[i] = Boolean.FALSE;                       // rth flag → false (all bars)
-        } else if (barSize != null && p.isInstance(barSize)) {
-          args[i] = barSize;
-        } else if (p.isInterface()) {
-          args[i] = Proxy.newProxyInstance(p.getClassLoader(), new Class<?>[]{ p }, new InvocationHandler() {
-            @Override public Object invoke(Object proxy, Method method, Object[] callArgs) {
-              // Any callback invocation is treated as one bar. Try to pull a timestamp.
-              long ts = extractTs(callArgs);
-              if (ts > 0) {
-                if (first.get() == 0) first.set(ts);
-                last.set(ts);
-              }
-              count.incrementAndGet();
-              Class<?> rt = method.getReturnType();
-              if (rt == boolean.class || rt == Boolean.class) return Boolean.TRUE; // continue iterating
-              if (rt == int.class)     return 0;
-              if (rt == long.class)    return 0L;
-              return null;
-            }
-          });
-        } else {
-          args[i] = null; // unknown param — best effort
-        }
-      }
-
-      fe.invoke(instrument, args);
-      out.println("count=" + count.get() + " first=" + first.get() + " last=" + last.get());
+      long ft = extractTs(first);
+      long lt = extractTs(last);
+      out.println("first bar time = " + ft);
+      out.println("last  bar time = " + lt);
+      return list.size();
     } catch (Throwable t) {
-      out.println("forEachBar error: " + t);
+      out.println("getBars error: " + t);
+      return 0;
     }
   }
 
-  /** Best-effort extraction of an epoch-ms timestamp from a callback argument. */
-  private static long extractTs(Object[] callArgs) {
-    if (callArgs == null) return 0;
-    for (Object a : callArgs) {
-      if (a == null) continue;
-      if (a instanceof Number) { long v = ((Number) a).longValue(); if (v > 1_000_000_000L) return v; }
-      for (String m : new String[]{ "getStartTime", "getTime", "getEndTime", "getStart" }) {
-        Object v = tryCall(a, m);
-        if (v instanceof Number) { long lv = ((Number) v).longValue(); if (lv > 1_000_000_000L) return lv; }
-      }
+  /** Best-effort extraction of an epoch-ms timestamp from a bar element. */
+  private static long extractTs(Object bar) {
+    if (bar == null) return 0;
+    for (String m : new String[]{ "getStartTime", "getTime", "getEndTime" }) {
+      Object v = tryCall(bar, m);
+      if (v instanceof Number) { long lv = ((Number) v).longValue(); if (lv > 1_000_000_000L) return lv; }
     }
     return 0;
+  }
+
+  /** Locate getBars(long, long, <BarSize-assignable>, boolean). */
+  private static Method findGetBars(Class<?> cls, Object barSize) {
+    for (Method m : cls.getMethods()) {
+      if (!m.getName().equals("getBars")) continue;
+      Class<?>[] p = m.getParameterTypes();
+      if (p.length != 4) continue;
+      boolean p0 = (p[0] == long.class || p[0] == Long.class);
+      boolean p1 = (p[1] == long.class || p[1] == Long.class);
+      boolean p2 = p[2].isInstance(barSize);
+      boolean p3 = (p[3] == boolean.class || p[3] == Boolean.class);
+      if (p0 && p1 && p2 && p3) return m;
+    }
+    return null;
   }
 
   // ── reflection helpers ────────────────────────────────────────────────────
@@ -267,5 +281,12 @@ public class SdkProbe extends Study {
     } catch (Throwable t) {
       return null;
     }
+  }
+
+  /** Like tryCall but surfaces the error so P1 can print it as text. */
+  private static Object tryCallOrThrow(Object obj, String name) throws Throwable {
+    if (obj == null) return null;
+    Method m = obj.getClass().getMethod(name);
+    return m.invoke(obj);
   }
 }

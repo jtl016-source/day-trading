@@ -4,9 +4,7 @@ import com.motivewave.platform.sdk.common.*;
 import com.motivewave.platform.sdk.common.desc.*;
 import com.motivewave.platform.sdk.study.*;
 
-import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
@@ -31,8 +29,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *    forming bars use one-slot latest-wins references so they can never flood or block
  *    protocol/complete-bar traffic. Java WebSocket forbids concurrent sendText(), so
  *    ALL sends (including backfill bulk batches) are serialized through this one thread.
- *  - `backfill` requests are serviced on the scheduler thread via Instrument.forEachBar
- *    (reflection); if that is unavailable/empty it degrades to the loaded DataSeries slice.
+ *  - `backfill` requests are serviced on the scheduler thread via Instrument.getBars
+ *    (reflection — plain List return; the forEachBar callback proxy is unusable because
+ *    the obfuscated BarOperation interface can't be reflect.Proxy'd). If getBars is
+ *    unavailable/empty it degrades to the loaded DataSeries slice.
  *
  * onTick + footprint accumulation are unchanged from v1.
  */
@@ -69,6 +69,14 @@ public class LiveBarRelay extends Study {
   private volatile String  resolution   = null;
   private volatile Object  barSizeObj   = null;
   private final AtomicBoolean pendingHello = new AtomicBoolean(false);
+
+  // ── getBars reflection cache ──────────────────────────────────────────────────
+  // The getBars(long,long,BarSize,boolean) Method is resolved once; the per-bar
+  // accessors are resolved once from the first element's class and reused.
+  private volatile Method getBarsMethod  = null;
+  private volatile boolean getBarsLookedUp = false;
+  private volatile Class<?> barAccessorClass = null;
+  private volatile Method aTime, aTimeAlt, aOpen, aHigh, aLow, aClose, aVol, aVolAlt;
 
   // Latest chart context (set in calculate, read by backfill servicer)
   private volatile String     symbol     = "";
@@ -325,46 +333,50 @@ public class LiveBarRelay extends Study {
     System.out.println("[LiveBarRelay] resolution resolved = " + r);
   }
 
-  /** Ground truth via DataSeries.getBarSize() interval accessors (reflection). */
+  /**
+   * Ground truth via DataSeries.getBarSize() interval accessors (reflection).
+   * Verified on the real object: getIntervalMinutes()=5, getIntervalSeconds()=300,
+   * getInterval()=5 for a 5-min chart. Try in that order.
+   */
   private String resolveViaBarSize(DataSeries ds) {
     try {
       Method gbs = ds.getClass().getMethod("getBarSize");
       Object bs  = gbs.invoke(ds);
       if (bs == null) return null;
-      barSizeObj = bs; // cache for forEachBar backfills
-      for (String name : new String[]{ "getIntervalMinutes", "getInterval", "getSize" }) {
-        try {
-          Method m = bs.getClass().getMethod(name);
-          Object v = m.invoke(bs);
-          if (v instanceof Number) {
-            long raw = ((Number) v).longValue();
-            String mapped = mapBarSizeValue(name, raw);
-            if (mapped != null) {
-              System.out.println("[LiveBarRelay] BarSize." + name + "() = " + raw);
-              return mapped;
-            }
-          }
-        } catch (Exception ignored) {}
+      barSizeObj = bs; // cache for getBars backfills
+      long minutes = -1;
+      Object v;
+      if ((v = tryCall(bs, "getIntervalMinutes")) instanceof Number) {
+        minutes = ((Number) v).longValue();
+      } else if ((v = tryCall(bs, "getIntervalSeconds")) instanceof Number) {
+        minutes = ((Number) v).longValue() / 60L;
+      } else if ((v = tryCall(bs, "getInterval")) instanceof Number) {
+        minutes = ((Number) v).longValue(); // verified: getInterval() is in minutes
+      }
+      if (minutes >= 1) {
+        System.out.println("[LiveBarRelay] BarSize minutes = " + minutes);
+        return mapMinutes(minutes);
       }
     } catch (Exception ignored) {}
     return null;
   }
 
-  /** Interpret a BarSize accessor value: minutes for *Minutes methods; else detect seconds. */
-  private static String mapBarSizeValue(String methodName, long v) {
-    long minutes;
-    if (methodName.toLowerCase().contains("minute")) minutes = v;
-    else if (v == 60 || v == 300 || v == 900 || v == 3600) minutes = v / 60; // seconds
-    else minutes = v; // assume minutes
-    return mapMinutes(minutes);
+  /** Map minutes → wire resolution. Known intervals get canonical strings; the server
+   *  parses any other "N" as N minutes, so pass unknown minutes through verbatim. */
+  private static String mapMinutes(long m) {
+    if (m < 1) return null; // sub-minute / bad median → let caller default to "1"
+    if (m == 1)  return "1";
+    if (m == 5)  return "5";
+    if (m == 15) return "15";
+    if (m == 60) return "60";
+    return String.valueOf(m);
   }
 
-  private static String mapMinutes(long m) {
-    if (m >= 50) return "60";
-    if (m >= 12) return "15";
-    if (m >= 3)  return "5";
-    if (m >= 1)  return "1";
-    return null;
+  /** Zero-arg reflection call returning the value or null on any failure. */
+  private static Object tryCall(Object obj, String name) {
+    if (obj == null) return null;
+    try { return obj.getClass().getMethod(name).invoke(obj); }
+    catch (Throwable t) { return null; }
   }
 
   /** Fallback: median of the first 50 consecutive bar deltas (robust across session gaps). */
@@ -442,15 +454,15 @@ public class LiveBarRelay extends Study {
     long   earliestMs = 0;
     List<String> bars = null;
 
-    // 1. Try Instrument.forEachBar (deep history).
+    // 1. Try Instrument.getBars (deep history).
     try {
-      FeResult r = tryForEachBar(inst, fromMs, toMs);
+      BarsResult r = tryGetBars(inst, fromMs, toMs);
       if (r != null && r.count > 0) { bars = r.bars; earliestMs = r.earliestMs; source = "feed"; }
     } catch (Throwable t) {
-      System.out.println("[LiveBarRelay] forEachBar failed: " + t);
+      System.out.println("[LiveBarRelay] getBars failed: " + t);
     }
 
-    // 2. Auto-degrade to the loaded DataSeries slice when forEachBar is unavailable/empty
+    // 2. Auto-degrade to the loaded DataSeries slice when getBars is unavailable/empty
     //    and the requested range overlaps what the chart already has.
     if (bars == null || bars.isEmpty()) {
       int size = ds.size();
@@ -495,93 +507,94 @@ public class LiveBarRelay extends Study {
       id, count, earliestMs, source));
   }
 
-  /** forEachBar via reflection; returns null if the method does not exist. */
-  private FeResult tryForEachBar(Instrument inst, long fromMs, long toMs) throws Exception {
-    Method fe = null;
-    for (Method m : inst.getClass().getMethods()) {
-      if (m.getName().equals("forEachBar")) { fe = m; break; }
-    }
-    if (fe == null) return null;
+  /**
+   * getBars(long, long, BarSize, boolean) via reflection — the verified replacement for
+   * the (unusable) forEachBar callback path. Returns null when barSize is unknown or the
+   * method can't be found, so the caller degrades to the DataSeries slice.
+   */
+  private BarsResult tryGetBars(Instrument inst, long fromMs, long toMs) throws Exception {
+    Object bs = barSizeObj;
+    if (bs == null) return null; // no BarSize captured yet → fall back to DataSeries slice
 
-    Class<?>[] pts = fe.getParameterTypes();
-    final FeResult res = new FeResult();
-    Object[] args = new Object[pts.length];
-    int longs = 0;
-    for (int i = 0; i < pts.length; i++) {
-      Class<?> p = pts[i];
-      if (p == long.class || p == Long.class) {
-        args[i] = (longs++ == 0) ? fromMs : toMs;
-      } else if (p == boolean.class || p == Boolean.class) {
-        args[i] = Boolean.FALSE;                 // rth flag → false (all bars)
-      } else if (barSizeObj != null && p.isInstance(barSizeObj)) {
-        args[i] = barSizeObj;
-      } else if (p.isInterface()) {
-        args[i] = Proxy.newProxyInstance(p.getClassLoader(), new Class<?>[]{ p }, new InvocationHandler() {
-          @Override public Object invoke(Object proxy, Method method, Object[] callArgs) {
-            Object bar = firstBarArg(callArgs);
-            if (bar != null) {
-              long   t = lng(bar, "getStartTime", "getTime", "getEndTime");
-              double o = dbl(bar, "getOpen"), h = dbl(bar, "getHigh"),
-                     l = dbl(bar, "getLow"),  c = dbl(bar, "getClose");
-              double vv = dbl(bar, "getVolume");
-              if (t > 1_000_000_000L && o > 0 && h >= l && !Double.isNaN(c)) {
-                res.bars.add(barJson(t / 1000L, o, h, l, c, (long) vv));
-                res.count++;
-                if (res.earliestMs == 0 || t < res.earliestMs) res.earliestMs = t;
-              }
-            }
-            Class<?> rt = method.getReturnType();
-            if (rt == boolean.class || rt == Boolean.class) return Boolean.TRUE; // keep iterating
-            if (rt == int.class)  return 0;
-            if (rt == long.class) return 0L;
-            return null;
-          }
-        });
-      } else {
-        args[i] = null; // unknown param — best effort
-      }
+    if (!getBarsLookedUp) {
+      getBarsMethod   = findGetBars(inst.getClass(), bs);
+      getBarsLookedUp = true;
     }
-    fe.invoke(inst, args);
+    Method gb = getBarsMethod;
+    if (gb == null) return null;
+
+    Object result = gb.invoke(inst, fromMs, toMs, bs, Boolean.FALSE);
+    if (!(result instanceof List)) return null;
+
+    List<?> list = (List<?>) result;
+    final BarsResult res = new BarsResult();
+    for (Object bar : list) {
+      if (bar == null) continue;
+      resolveAccessors(bar.getClass());
+      long t = invLong(aTime, bar);
+      if (t <= 0) t = invLong(aTimeAlt, bar);               // getStartTime → getTime fallback
+      double o = invDbl(aOpen, bar), h = invDbl(aHigh, bar),
+             l = invDbl(aLow, bar),  c = invDbl(aClose, bar);
+      double v = (aVol != null) ? invDbl(aVol, bar)
+               : (aVolAlt != null) ? invDbl(aVolAlt, bar) : 0.0;
+      if (Double.isNaN(o) || Double.isNaN(h) || Double.isNaN(l) || Double.isNaN(c)) continue;
+      if (t <= 1_000_000_000L || o <= 0 || h < l) continue; // same validity rules as before
+      res.bars.add(barJson(t / 1000L, o, h, l, c, (long) v));
+      res.count++;
+      if (res.earliestMs == 0 || t < res.earliestMs) res.earliestMs = t;
+    }
     return res;
   }
 
-  private static class FeResult {
-    final List<String> bars = new ArrayList<>();
-    int  count = 0;
-    long earliestMs = 0;
-  }
-
-  private static Object firstBarArg(Object[] args) {
-    if (args == null) return null;
-    for (Object a : args) {
-      if (a != null && hasMethod(a, "getClose")) return a;
+  /** Locate getBars(long, long, <BarSize-assignable>, boolean). */
+  private static Method findGetBars(Class<?> cls, Object barSize) {
+    for (Method m : cls.getMethods()) {
+      if (!m.getName().equals("getBars")) continue;
+      Class<?>[] p = m.getParameterTypes();
+      if (p.length != 4) continue;
+      boolean p0 = (p[0] == long.class || p[0] == Long.class);
+      boolean p1 = (p[1] == long.class || p[1] == Long.class);
+      boolean p2 = p[2].isInstance(barSize);
+      boolean p3 = (p[3] == boolean.class || p[3] == Boolean.class);
+      if (p0 && p1 && p2 && p3) return m;
     }
-    for (Object a : args) if (a != null) return a;
     return null;
   }
 
-  private static boolean hasMethod(Object obj, String name) {
-    try { obj.getClass().getMethod(name); return true; } catch (Exception e) { return false; }
+  /** Resolve the per-bar accessor Methods once from the first element's class; reuse after. */
+  private void resolveAccessors(Class<?> cls) {
+    if (barAccessorClass == cls) return;
+    aTime    = findAccessor(cls, "getStartTime");
+    aTimeAlt = findAccessor(cls, "getTime");
+    aOpen    = findAccessor(cls, "getOpen");
+    aHigh    = findAccessor(cls, "getHigh");
+    aLow     = findAccessor(cls, "getLow");
+    aClose   = findAccessor(cls, "getClose");
+    aVol     = findAccessor(cls, "getVolume");
+    aVolAlt  = findAccessor(cls, "getVolumeAsFloat");
+    barAccessorClass = cls;
   }
 
-  private static double dbl(Object o, String... names) {
-    for (String n : names) {
-      try {
-        Object v = o.getClass().getMethod(n).invoke(o);
-        if (v instanceof Number) return ((Number) v).doubleValue();
-      } catch (Exception ignored) {}
-    }
-    return Double.NaN;
+  private static Method findAccessor(Class<?> cls, String name) {
+    try { return cls.getMethod(name); } catch (Exception e) { return null; }
   }
 
-  private static long lng(Object o, String... names) {
-    for (String n : names) {
-      try {
-        Object v = o.getClass().getMethod(n).invoke(o);
-        if (v instanceof Number) return ((Number) v).longValue();
-      } catch (Exception ignored) {}
-    }
-    return 0L;
+  private static long invLong(Method m, Object o) {
+    if (m == null) return 0L;
+    try { Object v = m.invoke(o); return (v instanceof Number) ? ((Number) v).longValue() : 0L; }
+    catch (Exception e) { return 0L; }
+  }
+
+  private static double invDbl(Method m, Object o) {
+    if (m == null) return Double.NaN;
+    try { Object v = m.invoke(o); return (v instanceof Number) ? ((Number) v).doubleValue() : Double.NaN; }
+    catch (Exception e) { return Double.NaN; }
+  }
+
+  private static class BarsResult {
+    final List<String> bars = new ArrayList<>();
+    int  count = 0;
+    long earliestMs = 0;
   }
 
   private static String barJson(long tSec, double o, double h, double l, double c, long v) {
