@@ -177,114 +177,288 @@ function isMarketClosed(timestampSec: number): boolean {
   return etMin >= 17 * 60 && etMin < 18 * 60;   // Mon–Thu daily maintenance halt
 }
 
-// Remove ISOLATED phantom bars — a bar whose entire body sits more than `fracThr` of price away
-// from BOTH its neighbours' closes, then price returns (a "spike-and-return" outlier, typically a
-// single low-volume print ~50pt off the real level from a bad data source / wrong contract). These
-// pass isSpikeBar (their own H-L range is tiny) yet render as spikes/gaps throughout the history.
-// Real directional moves are preserved: a true 30pt push is only flagged if the NEXT bar snaps back.
-function dropIsolatedSpikes<T extends { open: number; high: number; low: number; close: number; time?: number }>(
-  bars: T[], fracThr = 0.0025,
-): T[] {
+/**
+ * Minimal bar shape the spike filters operate on. Generic so both the DB-row path
+ * (mapped candles) and the in-memory MinBar path can share the same logic — the
+ * only fields that matter for spike detection are OHLC + volume + time.
+ */
+type SpikeBar = { open: number; high: number; low: number; close: number; volume: number | null; time: number };
+
+/**
+ * Drop a bar whose price track is displaced from its neighbours — a candle that jumped
+ * away and came right back. `isSpikeBar` (H-L range vs close) can't see this: a 20pt
+ * displaced body on a ~7500 instrument is only ~0.27%, nowhere near the 0.5-2.5% range
+ * thresholds, so it passes. A real move never fully retraces to its neighbours in one bar.
+ * Compared to `dropWickSpikes` this catches a displaced whole PRICE LEVEL (not a lone wick,
+ * which `dropWickSpikes` handles).
+ *
+ * TWO mechanisms, in order:
+ *
+ * (1) WINDOWED-MAJORITY CLUSTERING (primary). A naive single-pass "is my body above BOTH
+ *     immediate neighbours" test fails on the DENSE INTERLEAVED-PHANTOM pattern documented
+ *     on 2026-03-17: a wrong-contract feed bleeds in on alternating-ish minutes, producing
+ *     two interwoven price series ~90-100pt apart (real ~6744-53, phantom ~6798-6853). With
+ *     pairwise comparison the phantoms SHIELD EACH OTHER — a phantom whose immediate neighbour
+ *     is also a phantom looks "consistent" and survives, and worse, once a phantom survives it
+ *     can make the adjacent REAL bar look like the outlier and get it dropped instead. Pure
+ *     neighbour comparison can't resolve this because it trusts a single neighbour's implicit
+ *     classification. Instead, for each low-confidence candidate we take a window of nearby
+ *     bars, cluster their CLOSE prices into price tracks (within `clusterTol`), and find the
+ *     majority track. A bar off the dominant track whose OWN cluster is a tiny minority (a
+ *     lone/near-lone print) is the phantom — regardless of what its immediate neighbour is.
+ *     The dominant track is picked by TOTAL VOLUME (not count): real bars trade, phantoms are
+ *     thin single prints, so several interleaved phantom RUNS (2026-03-19) still can't out-vote
+ *     the real track. Bars proven ON the dominant-volume track are marked CONFIRMED so the
+ *     pairwise cleanup can't later re-drop them (protects real high-volume run bars).
+ *
+ * (2) PAIRWISE DISPLACED-BODY (secondary cleanup, multi-pass). The original test: a body
+ *     wholly above/below both surviving neighbour closes. Catches the sparse-region displaced
+ *     body the windowed pass skips for lack of context, plus the 2026-07-02T11:40Z V743 case.
+ *     Skips CONFIRMED bars. Runs on the survivors of pass (1); multi-pass so newly-isolated
+ *     bars get re-judged.
+ */
+function dropIsolatedSpikes<T extends SpikeBar>(bars: T[]): T[] {
   if (bars.length < 3) return bars;
-  // Infer the bar interval so we can tell a real spike (neighbours temporally adjacent) from a lone
-  // bar in a sparse region (neighbours hours away — its price differs by normal drift, not a spike,
-  // so it must NOT be dropped). Input is already bucket-aligned, so min positive delta == interval.
-  let interval = Infinity;
-  if (bars[0].time !== undefined) {
-    for (let i = 1; i < Math.min(bars.length, 300); i++) {
-      const d = (bars[i].time as number) - (bars[i - 1].time as number);
-      if (d > 0 && d < interval) interval = d;
+
+  const VOL_HARD_FLOOR = 500;   // at/above this a bar is a real move — never a low-vol phantom
+  const WINDOW = 9;             // bars considered around the candidate (±4)
+  const HALF = Math.floor(WINDOW / 2);
+
+  // Two closes belong to the same price track if within this tolerance. Consecutive real
+  // 1m/5m bars drift a few points; a wrong-contract phantom sits ~90-100pt away. Scale with
+  // price (0.15% ≈ 10pt at 6750) but floor at 12pt so ordinary volatility never splits a
+  // continuous trend into separate clusters.
+  const clusterTol = (px: number) => Math.max(12, px * 0.0015);
+
+  const isKept = new Array(bars.length).fill(true);
+  // Bars the windowed pass proves are on the dominant-volume track — the pairwise cleanup must
+  // not second-guess these (protects real high-volume run bars whose neighbours got thinned).
+  const confirmed = new Array(bars.length).fill(false);
+
+  // A large TIME gap means bars across it are legitimately at a different level (session
+  // reopen, weekend) — don't let the far side vote on this candidate. Infer the bar interval
+  // from the minimum array-adjacent dt, treat > 4x that as a boundary the window won't cross.
+  let minDt = Infinity;
+  for (let i = 1; i < bars.length; i++) {
+    const dt = bars[i].time - bars[i - 1].time;
+    if (dt > 0 && dt < minDt) minDt = dt;
+  }
+  if (!isFinite(minDt) || minDt <= 0) minDt = 60;
+  const GAP_DT = minDt * 4;
+
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i];
+    const vol = b.volume ?? 0;
+    // NOTE: no high-volume skip here. High-vol bars ARE evaluated so a genuine high-vol run bar
+    // gets CONFIRMED on the anchor track (protecting it from the pairwise cleanup); a high-vol
+    // bar that is a lone singleton far off the dominant track is still a phantom (wrong-contract
+    // bleed can carry real-looking volume).
+
+    // Gather window neighbours: array-adjacent, still-kept, not across a time gap from i.
+    const win: T[] = [];
+    for (let j = i - 1, steps = 0; j >= 0 && steps < HALF + 2; j--) {
+      if (!isKept[j]) continue;
+      if (bars[j + 1].time - bars[j].time > GAP_DT) break; // time gap between j and j+1
+      win.push(bars[j]);
+      steps++;
+    }
+    for (let j = i + 1, steps = 0; j < bars.length && steps < HALF + 2; j++) {
+      if (bars[j].time - bars[j - 1].time > GAP_DT) break;
+      win.push(bars[j]);
+      steps++;
+    }
+    if (win.length < 4) continue; // too little context (sparse/thin region) — leave to pass (2)
+
+    // Cluster candidate + neighbour closes greedily. Each cluster tracks count (n), close-sum
+    // (its centre), and total VOLUME. The real price track is the one carrying the most VOLUME
+    // — a far more reliable anchor than bare count when several phantom RUNS interleave with the
+    // real track (2026-03-19: a ~6583 real track vol 28-32 interwoven with ~6634 and ~6686
+    // phantom runs of vol 2-17 — no cluster is a count-majority, but the real one dominates vol).
+    const tol = clusterTol(b.close);
+    const clusters: { sum: number; n: number; vol: number }[] = [];
+    const place = (px: number, v: number) => {
+      for (const c of clusters) {
+        if (Math.abs(px - c.sum / c.n) <= tol) { c.sum += px; c.n++; c.vol += v; return c; }
+      }
+      const c = { sum: px, n: 1, vol: v };
+      clusters.push(c);
+      return c;
+    };
+    const ownCluster = place(b.close, vol);
+    for (const n of win) place(n.close, n.volume ?? 0);
+
+    const total = win.length + 1;
+    let anchor = clusters[0];
+    for (const c of clusters) if (c.vol > anchor.vol) anchor = c;
+    // Candidate is ON the dominant-volume track — confirm it real so the pairwise cleanup below
+    // can't later drop it. This protects a genuine high-volume RUN bar whose immediate
+    // neighbours were thinned by isSpikeBar (2026-02-20T15:03 MES 1m V11838, mid-rally: its body
+    // sits above the two surviving neighbour closes and the naive pairwise test would flag it,
+    // but the window shows it's squarely on the dominant-volume track).
+    if (ownCluster === anchor || Math.abs(b.close - anchor.sum / anchor.n) <= tol) {
+      confirmed[i] = true;
+      continue;
+    }
+
+    // Off the dominant track. Two PHANTOM signatures — drop on either:
+    //  (i)  own cluster is a tiny minority (lone/near-lone print) — catches interleaved phantoms
+    //       AND a lone high-vol wrong-contract print (a real fast move is never this isolated
+    //       against a full window of the dominant track), OR
+    //  (ii) own cluster carries far less volume than the anchor AND the candidate is ABSOLUTELY
+    //       thin (vol < floor) — a systematically-thin displaced run. The ABSOLUTE floor is
+    //       load-bearing: without it a legit price level sitting just before a giant-volume
+    //       news/settlement bar (which becomes the anchor) would be misread as a phantom run.
+    const VOL_ABS_FLOOR = 100;
+    const anchorMedVol = anchor.vol / anchor.n;
+    const tinyCluster = ownCluster.n <= Math.max(1, Math.floor(total / 3));
+    const thinDisplaced = vol < VOL_ABS_FLOOR && ownCluster.vol < 0.5 * anchor.vol && vol < 0.5 * anchorMedVol;
+    if (tinyCluster || thinDisplaced) {
+      isKept[i] = false;
     }
   }
-  const maxGap = isFinite(interval) ? interval * 3 + 1 : Infinity; // "adjacent" = within ~3 intervals
-  const adjacent = (a: T, b: T) =>
-    a.time === undefined || b.time === undefined || Math.abs((a.time as number) - (b.time as number)) <= maxGap;
-  const isSpike = (cur: T, a: T, b: T) => {
-    if (!adjacent(cur, a) || !adjacent(cur, b)) return false; // sparse neighbour → drift, not a spike
-    const tol = cur.close * fracThr;
-    return (cur.low - a.close > tol && cur.low - b.close > tol) ||   // up-spike: low above both refs
-           (a.close - cur.high > tol && b.close - cur.high > tol);   // down-spike: high below both refs
-  };
-  // Iterate until stable: interleaved phantoms (a wrong-contract feed bleeding in on alternate bars)
-  // shield each other on the first pass — once the outer phantoms are removed the inner one becomes
-  // isolated and is caught on the next pass. Also validates the FIRST/LAST bar of the window (no
-  // left/right neighbour) against its two same-side neighbours so a phantom at a pagination boundary
-  // can't leak.
-  let cur: T[] = bars;
-  for (let pass = 0; pass < 6 && cur.length >= 3; pass++) {
-    const out: T[] = [];
-    const start = isSpike(cur[0], cur[1], cur[2]) ? 1 : 0;
-    out.push(cur[start]);
-    for (let i = start + 1; i < cur.length - 1; i++) {
-      const prev = out[out.length - 1]; // last KEPT bar, so runs of phantoms don't anchor each other
-      if (isSpike(cur[i], prev, cur[i + 1])) continue; // drop the phantom
-      out.push(cur[i]);
+
+  // (2) Pairwise displaced-body cleanup on the survivors — multi-pass, early-stop.
+  let cur = bars.filter((_, i) => isKept[i]);
+  const confirmedSet = new WeakSet<object>(bars.filter((_, i) => confirmed[i]) as object[]);
+  for (let pass = 0; pass < 4; pass++) {
+    const kept: T[] = [];
+    let dropped = 0;
+    for (let i = 0; i < cur.length; i++) {
+      const b = cur[i];
+      const prev = kept.length ? kept[kept.length - 1] : undefined;
+      const next = cur[i + 1];
+      // Skip bars the windowed pass confirmed on the dominant-volume track — never re-drop them.
+      if (prev && next && !confirmedSet.has(b as object)) {
+        const lo = Math.min(prev.close, next.close);
+        const hi = Math.max(prev.close, next.close);
+        // Tolerance scales with price — 0.1% or 8pt, whichever is larger.
+        const tol = Math.max(8, b.close * 0.001);
+        const bodyLow = Math.min(b.open, b.close);
+        const bodyHigh = Math.max(b.open, b.close);
+        // Entire body sits above both neighbour closes, or below both.
+        if (bodyLow > hi + tol || bodyHigh < lo - tol) { dropped++; continue; }
+      }
+      kept.push(b);
     }
-    const last = cur[cur.length - 1];
-    const p1 = out[out.length - 1], p2 = out[out.length - 2];
-    if (!p2 || !isSpike(last, p1, p2)) out.push(last);
-    if (out.length === cur.length) { cur = out; break; } // stable — no more phantoms found
-    cur = out;
+    cur = kept;
+    if (dropped === 0) break;
   }
   return cur;
 }
 
-// Remove low-volume WICK/BODY spike glitches — a bar whose HIGH or LOW is an isolated outlier far
-// beyond its temporally-adjacent neighbours, with volume too low to be a real move. These render as
-// "thin vertical line" candles and slip past BOTH isSpikeBar (their total range is below the
-// absolute spikeThreshold, e.g. a 40pt wick << 4% of 7500) AND dropIsolatedSpikes (which only
-// catches a displaced BODY, not a lone wick). VOLUME is the discriminator: genuine news/settlement
-// moves carry large volume and are preserved; phantom prints are near-zero volume. This is the
-// permanent fallback that guarantees these glitches never render regardless of what's in the DB.
-function dropWickSpikes<T extends { open: number; high: number; low: number; close: number; time: number; volume: number | null }>(
-  bars: T[],
-): T[] {
-  if (bars.length < 5) return bars;
-  // A bar is a glitch when its HIGH or LOW is displaced beyond its TWO-SIDED neighbourhood AND its
-  // volume is anomalously low. Two-sided (±3) neighbours are key: a real session gap / weekend
-  // reopen is displaced only from the PRIOR side (the following bars sit at the new level), so it
-  // is NOT flagged — only a spike that pokes out and RETURNS is. Volume is the discriminator, tested
-  // both absolutely and RELATIVE to the local median so it works across intervals (a 60m phantom is
-  // ~V200 while real 60m bars are V10k+) and across sparse holiday/overnight sessions. No adjacency
-  // guard — that previously let sparse-session phantoms through.
-  const HARD_REAL_VOL = 500; // bars at/above this volume are never treated as phantoms
-  let cur: T[] = bars;
+/**
+ * Drop a low-volume LONE-WICK spike: a bar whose HIGH or LOW pokes out beyond a local
+ * high/low envelope built from its temporal neighbours, when volume says it can't be a
+ * real move. This is the primary glitch filter — the concrete case it targets is the
+ * 2026-07-02T11:40Z MES 5m bar `O7561.5 H7563.5 L7560.75 C7563` sitting among ~7546-47
+ * bars: a ~15pt displaced spike that `isSpikeBar` misses (range/close ≈ 0.037%) and
+ * `dropIsolatedSpikes` misses too (its BODY overlaps the neighbours, only the wick pokes).
+ *
+ * Discriminator is VOLUME — true glitches are near-zero volume; real news/settlement
+ * moves are V400+. We NEVER drop a bar on displacement alone.
+ *
+ * Envelope is TWO-SIDED with NO interval/adjacency gating: up to 3 already-kept bars
+ * before + up to 3 raw bars after. An earlier version gated neighbours to within ~3x the
+ * inferred bar interval to avoid flagging real session-gap/weekend-reopen bars — but that
+ * also let deep-overnight / holiday phantoms through, because the DB has GENUINE gaps in
+ * low-liquidity periods so their neighbours were "too far" and never compared. Union of
+ * both: no time gating, but volume is the guard against dropping a legitimate reopen.
+ *
+ * Two independent drop tests per low-poke candidate:
+ *   (1) relative/absolute low volume + extreme pokes out of the envelope, OR
+ *   (2) "lone wick" — the extreme pokes out but the BODY stays inside the envelope
+ *       (a spike that returned), dropped regardless of the relative-volume test, UNLESS
+ *       volume clears a hard floor that guarantees a real move.
+ *
+ * Multi-pass: interleaved phantoms shield each other on pass 1 and only become isolated
+ * once the outer ones are gone. Iterate a few passes, stop early when a pass drops nothing.
+ */
+function dropWickSpikes<T extends SpikeBar>(bars: T[]): T[] {
+  if (bars.length < 3) return bars;
+
+  const VOL_ABS_FLOOR = 100;        // volume below this is "low" on its own
+  const VOL_REL_FRAC = 0.15;        // ...or below 15% of the local median volume
+  const VOL_HARD_FLOOR = 500;       // volume at/above this is ALWAYS a real move — never dropped
+  const LONE_WICK_HARD_FLOOR = 500; // lone-wick test is skipped above this volume too
+
+  const median = (xs: number[]): number => {
+    if (!xs.length) return 0;
+    const s = [...xs].sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  };
+
+  let cur = bars;
   for (let pass = 0; pass < 4; pass++) {
-    const out: T[] = [];
+    const kept: T[] = [];
     let dropped = 0;
+
     for (let i = 0; i < cur.length; i++) {
       const b = cur[i];
       const vol = b.volume ?? 0;
-      if (vol >= HARD_REAL_VOL) { out.push(b); continue; } // real volume → never a phantom
-      // ±3 neighbours excluding self; left side uses already-KEPT bars so a run of phantoms
-      // doesn't anchor itself.
-      const nb: T[] = [];
-      for (let j = out.length - 1; j >= 0 && nb.length < 3; j--) nb.push(out[j]);
-      for (let j = i + 1; j < cur.length && nb.length < 6; j++) nb.push(cur[j]);
-      if (nb.length < 3) { out.push(b); continue; } // window edge → keep
-      let nHi = -Infinity, nLo = Infinity;
-      const vols: number[] = [];
-      for (const x of nb) { if (x.high > nHi) nHi = x.high; if (x.low < nLo) nLo = x.low; vols.push(x.volume ?? 0); }
-      const tol = Math.max(8, b.close * 0.001); // ~8pt / 0.1% of price
-      const upSpike = b.high - nHi > tol;
-      const downSpike = nLo - b.low > tol;
-      if (!upSpike && !downSpike) { out.push(b); continue; }
-      vols.sort((a, z) => a - z);
-      const medVol = vols[vols.length >> 1] || 0;
-      const lowVol = vol < 100 || (medVol > 0 && vol < 0.15 * medVol);
-      // Lone WICK: the extreme pokes out but the BODY stays within the neighbourhood — a spike that
-      // returned. A real move that large would carry the body (and volume) with it; a real pin/hammer
-      // is already protected by the HARD_REAL_VOL floor above. This catches big low-vol wicks even
-      // when the WHOLE overnight neighbourhood is low-volume (where the relative test alone misses).
-      const bodyHi = Math.max(b.open, b.close), bodyLo = Math.min(b.open, b.close);
-      const loneWick = (upSpike && bodyHi - nHi <= tol) || (downSpike && nLo - bodyLo <= tol);
-      if (lowVol || loneWick) { dropped++; continue; } // displaced extreme + (low vol OR lone wick) → glitch
-      out.push(b);
+
+      // High-volume bars are always real moves — never candidates.
+      if (vol >= VOL_HARD_FLOOR) { kept.push(b); continue; }
+
+      // Neighbour envelope: up to 3 already-kept before + up to 3 raw after. No time gating.
+      const before = kept.slice(-3);
+      const after = cur.slice(i + 1, i + 4);
+      const neigh = [...before, ...after];
+      if (neigh.length < 2) { kept.push(b); continue; }
+
+      const envHigh = Math.max(...neigh.map(n => n.high));
+      const envLow = Math.min(...neigh.map(n => n.low));
+      // Tighter tolerance for already-low-volume candidates (<100). A 2026-07-02 audit found
+      // ~100 isolated single-print glitches (volume 2-97, median ~15-20, scattered across 9
+      // months of history) whose poke was 6-8pt — just under the flat 8pt floor, so they slipped
+      // through. A real MES print is never the ONLY trade in a whole bucket while ALSO displaced
+      // several points from neighbours, so tightening here is low-risk. Unchanged for vol>=100.
+      const tol = vol < 100 ? Math.max(5, b.close * 0.0007) : Math.max(8, b.close * 0.001);
+
+      const pokesHigh = b.high > envHigh + tol;
+      const pokesLow = b.low < envLow - tol;
+      if (!pokesHigh && !pokesLow) { kept.push(b); continue; }
+
+      // Volume context.
+      const medVol = median(neigh.map(n => n.volume ?? 0));
+      const lowVol = vol < VOL_ABS_FLOOR || (medVol > 0 && vol < VOL_REL_FRAC * medVol);
+
+      // Test (2) — lone wick: extreme pokes but the BODY stays inside the envelope.
+      const bodyLow = Math.min(b.open, b.close);
+      const bodyHigh = Math.max(b.open, b.close);
+      const bodyInside = bodyLow >= envLow - tol && bodyHigh <= envHigh + tol;
+      const loneWick = bodyInside && vol < LONE_WICK_HARD_FLOOR;
+
+      // Test (1) — displaced extreme with genuinely low volume.
+      if ((lowVol && (pokesHigh || pokesLow)) || loneWick) {
+        dropped++;
+        continue;
+      }
+      kept.push(b);
     }
-    cur = out;
-    if (!dropped) break;
+
+    cur = kept;
+    if (dropped === 0) break;
   }
   return cur;
+}
+
+/**
+ * Drop any COMPLETED bar with volume 0/null outright — no poke/envelope test needed.
+ * MES is a heavily-traded micro future; a genuinely completed bar with zero contracts
+ * traded across the whole bucket is never real market data (it's a placeholder written
+ * while a data source was catching up, e.g. during a resync gap). `dropWickSpikes` only
+ * catches a zero-volume bar when it POKES relative to its neighbours — but most zero-vol
+ * bars sit in multi-bar RUNS where every neighbour is ALSO zero-vol, so nothing pokes and
+ * they all sail through undetected (found via a 2026-07-02 audit: 1,338 such 1m bars
+ * across 272 runs, only ~60 of which happened to poke and get caught). Exempts the LAST
+ * bar in the array — that's always the current forming/most-recent bar, which can
+ * legitimately show volume 0 for a moment before the next tick/relay update lands.
+ */
+function dropCompletedGhostBars<T extends SpikeBar>(bars: T[]): T[] {
+  if (bars.length < 2) return bars;
+  const lastIdx = bars.length - 1;
+  return bars.filter((b, i) => i === lastIdx || (b.volume != null && b.volume !== 0));
 }
 
 function mapQuotes(quotes: any[]): any[] {
@@ -925,12 +1099,12 @@ export async function registerRoutes(
 
     // Helper: convert MinBar[] to the candle shape the client expects
     function memBarsToCandles(bars: { timeSec: number; open: number; high: number; low: number; close: number; volume: number }[]) {
-      return dropWickSpikes(dropIsolatedSpikes(bars
+      return dropWickSpikes(dropIsolatedSpikes(dropCompletedGhostBars(bars
         .filter(b => (!fromN || b.timeSec >= fromN) && (!isFinite(toN) || b.timeSec <= toN))
         .filter(b => !(b.high === b.low)) // flat zero-range = no-body "dash" bar
         .filter(b => !isSpikeBar(b.open, b.high, b.low, b.close))
         .filter(b => !isMarketClosed(b.timeSec))
-        .map(b => ({ time: b.timeSec, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, rth: isRTH(b.timeSec) }))));
+        .map(b => ({ time: b.timeSec, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, rth: isRTH(b.timeSec) })))));
     }
 
     try {
@@ -959,12 +1133,12 @@ export async function registerRoutes(
         const resSec = (parseInt(usedRes, 10) || 5) * 60;
         // dropWickSpikes runs BEFORE any 15m aggregation so a glitchy 5m wick can't corrupt the
         // aggregated 15m high/low.
-        let candles = dropWickSpikes(dropIsolatedSpikes(rows
+        let candles = dropWickSpikes(dropIsolatedSpikes(dropCompletedGhostBars(rows
           .filter(r => r.timestamp % resSec === 0)
           .filter(r => !(r.high === r.low)) // flat zero-range = no-body "dash" bar (drop regardless of volume — no real MES bar is perfectly flat)
           .filter(r => !isSpikeBar(r.open, r.high, r.low, r.close))
           .filter(r => !isMarketClosed(r.timestamp))
-          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) }))));
+          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) })))));
 
         // 15m fallback: when native 15m bars are absent and we fell back to 5m rows, the client
         // receives raw 5m bars for a 15m chart request. Its `isAligned` filter would keep ONLY

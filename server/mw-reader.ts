@@ -24,7 +24,7 @@ import path from "path";
 import { db } from "./db";
 import { cachedCandles } from "@shared/schema";
 import { normalizeSymbol } from "@shared/symbol";
-import { isSaneBarTime } from "@shared/bar-time";
+import { isSaneBarTime, validateBar } from "@shared/bar-time";
 import { sql } from "drizzle-orm";
 import { type Express }    from "express";
 import { type Server as HttpServer } from "http";
@@ -109,28 +109,79 @@ function pickActiveDir(pattern: RegExp): string | null {
 // 300 days × 24 files/day × both contracts = ~14k files — reads in ~60s on first load.
 const TICK_HISTORY_MS = 300 * 24 * 3600 * 1000;
 
+// DST-safe CME futures trading-day key for a bar timestamp. The session runs 6:00 PM ET (prior
+// calendar day) through 5:00 PM ET the "labeled" day — matches the ETH/RTH convention used
+// elsewhere in the app (see CLAUDE.md). Needed so per-day volume comparison during contract-roll
+// merging (below) buckets bars the same way CME's trading day does, not by naive UTC calendar day
+// (which would split one overnight session across two different "days"). Must use
+// Intl.DateTimeFormat("America/New_York") — NEVER a hardcoded UTC offset (DST shifts it by 1h).
+const _sessionDayFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", hourCycle: "h23",
+});
+function sessionDayKey(timestampSec: number): string {
+  const parts = _sessionDayFmt.formatToParts(new Date(timestampSec * 1000));
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? "0";
+  const y = +get("year"), mo = +get("month"), d = +get("day"), h = +get("hour");
+  // Bars at/after 6:00 PM ET belong to the NEXT session day (the overnight leading into
+  // tomorrow's RTH open) — compute via UTC date math so month/year rollovers are automatic.
+  const dayUtc = h >= 18 ? new Date(Date.UTC(y, mo - 1, d + 1)) : new Date(Date.UTC(y, mo - 1, d));
+  return `${dayUtc.getUTCFullYear()}-${String(dayUtc.getUTCMonth() + 1).padStart(2, "0")}-${String(dayUtc.getUTCDate()).padStart(2, "0")}`;
+}
+
 async function loadMultiDir(symbol: string, instrDirs: string[]) {
-  // ── Step 1: Load all bar_data1 files (authoritative OHLCV) ─────────────────
-  const allMin: MinBar[] = [];
+  // ── Step 1: Load all bar_data1 files (authoritative OHLCV), GROUPED BY CONTRACT DIR ──
+  // Kept per-directory (not flattened) so Step 1b can pick one front-month contract per
+  // trading day using each contract's TOTAL daily volume.
+  const perDirBars: MinBar[][] = [];
   let totalBarFiles = 0;
 
   for (const instrDir of instrDirs) {
     const files = getBarFiles(instrDir);
     totalBarFiles += files.length;
+    const dirBars: MinBar[] = [];
     for (const fp of files) {
-      allMin.push(...parseBarFile(fp));
+      dirBars.push(...parseBarFile(fp));
       try { fileMTimes.set(fp, fs.statSync(fp).mtimeMs); } catch {}
     }
+    perDirBars.push(dirBars);
     console.log(`[mw-reader] Scanned ${path.basename(instrDir)}: ${files.length} bar files`);
   }
 
-  // Deduplicate bar file entries: prefer highest volume (front-month wins)
+  // ── Step 1b: CONTRACT ROLL — pick ONE front-month contract per trading day ─────────
+  // Previously this deduped per-MINUTE ("prefer highest volume") — during roll week the
+  // front-month and next-month contracts often have close volume, so the "winner" could
+  // flip back and forth minute-to-minute between two contracts trading at different price
+  // levels (normal contango/backwardation), producing jagged, self-contradictory candles.
+  // Comparing each contract's TOTAL volume for the whole trading day is stable — CME
+  // front-month status doesn't flip mid-session — so this reliably tracks the real front
+  // month. Splice is UNADJUSTED (raw prices): there may be a visible price step on the
+  // actual roll day, matching an unadjusted continuous-contract view (by design).
+  const dayVolumeByDir = new Map<string, number[]>(); // sessionDay → volume per dirIdx
+  perDirBars.forEach((bars, dirIdx) => {
+    for (const b of bars) {
+      const day = sessionDayKey(b.timeSec);
+      let vols = dayVolumeByDir.get(day);
+      if (!vols) { vols = new Array(perDirBars.length).fill(0); dayVolumeByDir.set(day, vols); }
+      vols[dirIdx] += b.volume;
+    }
+  });
+  const dayWinnerDir = new Map<string, number>();
+  for (const [day, vols] of dayVolumeByDir) {
+    let bestIdx = 0, bestVol = -1;
+    for (let i = 0; i < vols.length; i++) if (vols[i] > bestVol) { bestVol = vols[i]; bestIdx = i; }
+    dayWinnerDir.set(day, bestIdx);
+  }
+  const allMin: MinBar[] = [];
+  perDirBars.forEach((bars, dirIdx) => {
+    for (const b of bars) {
+      if (dayWinnerDir.get(sessionDayKey(b.timeSec)) === dirIdx) allMin.push(b);
+    }
+  });
+
   allMin.sort((a, b) => a.timeSec - b.timeSec);
   const minMap = new Map<number, MinBar>();
-  for (const b of allMin) {
-    const ex = minMap.get(b.timeSec);
-    if (!ex || b.volume > ex.volume) minMap.set(b.timeSec, b);
-  }
+  for (const b of allMin) minMap.set(b.timeSec, b); // each day now has exactly one contract — no volume race needed
 
   // ── Step 2: Detect and log intraday gaps (no synthetic fill) ─────────────
   // Only warn for genuine intraday gaps (> 2 min and < 55 min).
@@ -816,8 +867,12 @@ async function bulkUpsert(symbol: string, resolution: string, bars: MinBar[]) {
   // (512, 8192, 14336, 47104, etc.) before they reach the DB and distort chart auto-scale.
   const resSec = (parseInt(resolution, 10) || 1) * 60;
   const clean = bars.filter(b => {
-    if (b.volume == null || b.volume === 0) return false; // ghost bar — zero/absent volume
-    if (b.timeSec % resSec !== 0) return false;           // off-grid timestamp (not on bucket boundary)
+    // Ghost-bar (volume 0/null) + off-grid timestamp guards — neither existed in this
+    // write path before, which is how off-grid V0 phantom rows got persisted from tick files.
+    if (!validateBar(
+      { open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, time: b.timeSec },
+      { resSec },
+    )) return false;
     if (b.low < 1000 || b.high > 100_000) return false;
     if (b.open <= 0 || b.close <= 0) return false;
     if (b.high < b.low || b.high < b.open || b.high < b.close) return false;
