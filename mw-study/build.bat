@@ -8,20 +8,10 @@ REM ── Find JDK ────────────────────
 set "JAVAC="
 set "JAR_TOOL="
 
-REM Prefer JDK 26 (matches the MW SDK's Java-26 class files exactly — no version warning).
-for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-26*" "C:\Program Files\Java\jdk-26*") do (
+for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-25*" "C:\Program Files\Java\jdk-25*") do (
     if exist "%%d\bin\javac.exe" (
         set "JAVAC=%%d\bin\javac.exe"
         set "JAR_TOOL=%%d\bin\jar.exe"
-    )
-)
-REM JDK 25 also compiles against the v70 SDK (emits a harmless "major version 70" warning).
-for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-25*" "C:\Program Files\Java\jdk-25*") do (
-    if not defined JAVAC (
-        if exist "%%d\bin\javac.exe" (
-            set "JAVAC=%%d\bin\javac.exe"
-            set "JAR_TOOL=%%d\bin\jar.exe"
-        )
     )
 )
 for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-21*" "C:\Program Files\Java\jdk-21*") do (
@@ -83,23 +73,22 @@ REM ═════════════════════════�
 REM  1. LiveBarRelay
 REM ══════════════════════════════════════════════════════════════════════════════
 echo.
-echo --- Building LiveBarRelay.jar ---
+echo --- Building LiveBarRelay.jar (includes SdkProbe) ---
 mkdir "%OUT%"
 
-REM Compile LiveBarRelay ALONE. Do NOT bundle HistoryDumper here — it is built as its own jar
-REM below. Bundling it caused com.custom.HistoryDumper to live in TWO jars, so MotiveWave saw the
-REM HISTORY_DUMPER study id twice and dropped it from the Add-Study list (the duplicate-load bug).
-"%JAVAC%" --release 17 -cp "%SDK%" -d "%OUT%" "com\custom\LiveBarRelay.java"
+REM Compile LiveBarRelay + SdkProbe together into one JAR
+REM MW already loads LiveBarRelay.jar — bundling SdkProbe inside guarantees MW finds both studies
+"%JAVAC%" --release 17 -cp "%SDK%" -d "%OUT%" "com\custom\LiveBarRelay.java" "com\custom\SdkProbe.java"
 if errorlevel 1 goto FAIL_LBR
 
 if exist "LiveBarRelay.jar" del "LiveBarRelay.jar"
 "%JAR_TOOL%" cf "LiveBarRelay.jar" -C "%OUT%" .
 if errorlevel 1 goto FAIL_LBR_JAR
-echo LiveBarRelay.jar built OK (contains LiveBarRelay + HistoryDumper)
+echo LiveBarRelay.jar built OK (contains LiveBarRelay + SdkProbe)
 goto BUILD_AT
 
 :FAIL_LBR
-echo COMPILE FAILED: LiveBarRelay or HistoryDumper
+echo COMPILE FAILED: LiveBarRelay or SdkProbe
 pause & exit /b 1
 :FAIL_LBR_JAR
 echo JAR FAILED: LiveBarRelay
@@ -121,38 +110,13 @@ if exist "AutoTrader.jar" del "AutoTrader.jar"
 "%JAR_TOOL%" cf "AutoTrader.jar" -C "%OUT%" .
 if errorlevel 1 goto FAIL_AT_JAR
 echo AutoTrader.jar built OK
-goto BUILD_HD
+goto COPY_JARS
 
 :FAIL_AT
 echo COMPILE FAILED: AutoTrader
 pause & exit /b 1
 :FAIL_AT_JAR
 echo JAR FAILED: AutoTrader
-pause & exit /b 1
-
-REM ══════════════════════════════════════════════════════════════════════════════
-REM  3. HistoryDumper
-REM ══════════════════════════════════════════════════════════════════════════════
-:BUILD_HD
-echo.
-echo --- Building HistoryDumper.jar ---
-rmdir /s /q "%OUT%"
-mkdir "%OUT%"
-
-"%JAVAC%" --release 17 -cp "%SDK%" -d "%OUT%" "com\custom\HistoryDumper.java"
-if errorlevel 1 goto FAIL_HD
-
-if exist "HistoryDumper.jar" del "HistoryDumper.jar"
-"%JAR_TOOL%" cf "HistoryDumper.jar" -C "%OUT%" .
-if errorlevel 1 goto FAIL_HD_JAR
-echo HistoryDumper.jar built OK
-goto COPY_JARS
-
-:FAIL_HD
-echo COMPILE FAILED: HistoryDumper
-pause & exit /b 1
-:FAIL_HD_JAR
-echo JAR FAILED: HistoryDumper
 pause & exit /b 1
 
 REM ══════════════════════════════════════════════════════════════════════════════
@@ -164,16 +128,17 @@ echo --- Copying JARs to MotiveWave Extensions ---
 if not exist "%DEST%" mkdir "%DEST%"
 copy /y "LiveBarRelay.jar"  "%DEST%\LiveBarRelay.jar"
 copy /y "AutoTrader.jar"    "%DEST%\AutoTrader.jar"
-copy /y "HistoryDumper.jar" "%DEST%\HistoryDumper.jar"
 echo Copied to: %DEST%
 
 echo.
 echo === SUCCESS: All JARs built and installed ===
 echo.
 echo NOW: Restart MotiveWave completely (File ^> Exit, then reopen).
-echo After restart, right-click your MES chart ^> Add Study:
-echo   Search "Live Bar Relay"   ^> double-click ^> OK
-echo   Search "History Dumper"   ^> double-click ^> OK  (writes CSV to disk)
+echo After restart, right-click EACH chart (1m/5m/15m/60m) ^> Add Study:
+echo   Search "Live Bar Relay"   ^> double-click ^> OK   (upgraded v2 — server-driven backfill)
 echo   Search "Auto Trader"      ^> double-click ^> OK
+echo.
+echo ONE-TIME SDK verification: add "SDK Probe" to ONE chart, let it run once,
+echo then send back  %DEST%\sdk_probe.txt  (see mw-study\UPGRADE_NOTES.md).
 echo.
 pause

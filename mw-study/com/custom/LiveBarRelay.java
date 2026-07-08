@@ -4,9 +4,7 @@ import com.motivewave.platform.sdk.common.*;
 import com.motivewave.platform.sdk.common.desc.*;
 import com.motivewave.platform.sdk.study.*;
 
-import java.io.File;
-import java.io.FileWriter;
-import java.io.PrintWriter;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
@@ -19,58 +17,83 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+/**
+ * LiveBarRelay v2 — server-driven backfill.
+ *
+ * Changes from v1:
+ *  - Resolution is resolved ONCE (ground truth via DataSeries.getBarSize reflection,
+ *    else the MEDIAN of the first 50 consecutive bar deltas). Never re-inferred per bar.
+ *  - On WS open + resolution known, sends a `hello` handshake; the server then drives
+ *    all history backfill via `backfill` requests (no more connect-time auto-dump).
+ *  - Outgoing messages go through a single daemon sender thread (outbox). Ticks and
+ *    forming bars use one-slot latest-wins references so they can never flood or block
+ *    protocol/complete-bar traffic. Java WebSocket forbids concurrent sendText(), so
+ *    ALL sends (including backfill bulk batches) are serialized through this one thread.
+ *  - `backfill` requests are serviced on the scheduler thread via Instrument.getBars
+ *    (reflection — plain List return; the forEachBar callback proxy is unusable because
+ *    the obfuscated BarOperation interface can't be reflect.Proxy'd). If getBars is
+ *    unavailable/empty it degrades to the loaded DataSeries slice.
+ *
+ * onTick + footprint accumulation are unchanged from v1.
+ */
 @StudyHeader(
   namespace      = "com.custom",
   id             = "LIVE_BAR_RELAY",
   name           = "Live Bar Relay",
   label          = "LiveBarRelay",
-  desc           = "Dumps full OHLCV history + relays live bars to localhost:5000. Use Data page to download.",
+  desc           = "Relays live bars + services server-driven history backfills to localhost:5000.",
   overlay        = true,
   requiresVolume = true,
   signals        = false
 )
 public class LiveBarRelay extends Study {
 
-  private static final String WS_ENDPOINT   = "ws://localhost:5000/ws/mw-feed";
-  private static final int    BATCH_SIZE    = 500;   // bars per bulk_bars message
-  private static final int    MAX_HISTORY   = Integer.MAX_VALUE; // no cap — dump everything MW has loaded
+  private static final String WS_ENDPOINT = "ws://localhost:5000/ws/mw-feed";
+  private static final int    BATCH_SIZE  = 500;   // bars per bulk_bars message
 
   private final HttpClient http = HttpClient.newBuilder()
     .connectTimeout(Duration.ofSeconds(4))
     .build();
 
-  private final AtomicReference<WebSocket>            wsRef         = new AtomicReference<>();
-  private final AtomicReference<CompletableFuture<?>> pendingSend   =
-    new AtomicReference<>(CompletableFuture.completedFuture(null));
+  private final AtomicReference<WebSocket> wsRef = new AtomicReference<>();
 
-  // Set to true when WS connects — next calculate() call triggers a full history dump
-  private final AtomicBoolean pendingHistoryDump = new AtomicBoolean(false);
-  // Set to true once history has been dumped for the current connection
-  private final AtomicBoolean historyDumped      = new AtomicBoolean(false);
+  // ── Outbox / sender ──────────────────────────────────────────────────────────
+  // Protocol + complete-bar messages are queued (never dropped). Ticks and forming
+  // bars use latest-wins single slots so they self-throttle and never starve the queue.
+  private final ConcurrentLinkedQueue<String> outbox        = new ConcurrentLinkedQueue<>();
+  private final AtomicReference<String>       latestTick    = new AtomicReference<>();
+  private final AtomicReference<String>       latestForming = new AtomicReference<>();
+  private final Object                        senderSignal  = new Object();
 
-  // Stored from the most recent calculate() call so onOpen() can dump history
-  // immediately without waiting for a new bar (critical on weekends / closed markets).
-  private volatile DataSeries lastDs     = null;
-  private volatile String     lastSymbol = null;
+  // ── Resolution ground truth (resolved once) ──────────────────────────────────
+  private volatile String  resolution   = null;
+  private volatile Object  barSizeObj   = null;
+  private final AtomicBoolean pendingHello = new AtomicBoolean(false);
+
+  // ── getBars reflection cache ──────────────────────────────────────────────────
+  // The getBars(long,long,BarSize,boolean) Method is resolved once; the per-bar
+  // accessors are resolved once from the first element's class and reused.
+  private volatile Method getBarsMethod  = null;
+  private volatile boolean getBarsLookedUp = false;
+  private volatile Class<?> barAccessorClass = null;
+  private volatile Method aTime, aTimeAlt, aOpen, aHigh, aLow, aClose, aVol, aVolAlt;
+
+  // Latest chart context (set in calculate, read by backfill servicer)
+  private volatile String     symbol     = "";
+  private volatile DataSeries dataSeries = null;
+  private volatile Instrument instrument = null;
+
+  // Incoming-text accumulator for the WS listener
+  private final StringBuilder textBuf = new StringBuilder();
 
   // ── Footprint accumulator — per-price bid/ask volume for the current 5m bucket ──
   private final TreeMap<Float, long[]> footprintLevels = new TreeMap<>(); // price → [bidVol, askVol]
   private volatile long   footprintBucketMs  = 0;   // current 5-min bucket start (epoch ms)
   private volatile String footprintSymbol    = "";   // symbol of current bucket
 
-  // ── Per-tick forming-bar relay ──────────────────────────────────────────────
-  // The price-only tick already lets the client update the last bar's CLOSE on every
-  // tick, but it never carries the forming candle's OPEN/HIGH/LOW/VOLUME. We now read
-  // the live (incomplete) bar straight from MW's DataSeries on every tick and send a
-  // {type:"bar",complete:false} so the forming candle's wicks/body match MotiveWave.
-  // Capped to FORMING_BAR_THROTTLE_MS to avoid the documented React re-render flood
-  // (LEARNINGS: "Forming bars … throttled to 1/second").
-  private volatile long lastFormingBarMs = 0;
-  private static final long FORMING_BAR_THROTTLE_MS = 200;
-
   private final ScheduledExecutorService scheduler =
     Executors.newSingleThreadScheduledExecutor(r -> {
-      Thread t = new Thread(r, "LiveBarRelay-reconnect");
+      Thread t = new Thread(r, "LiveBarRelay-scheduler");
       t.setDaemon(true);
       return t;
     });
@@ -78,6 +101,9 @@ public class LiveBarRelay extends Study {
   @Override
   public void initialize(Defaults defaults) {
     createSD();
+    Thread sender = new Thread(this::senderLoop, "LiveBarRelay-sender");
+    sender.setDaemon(true);
+    sender.start();
     connect();
     // Reconnect every 5 seconds if the WebSocket drops
     scheduler.scheduleAtFixedRate(this::reconnectIfNeeded, 5, 5, TimeUnit.SECONDS);
@@ -94,19 +120,23 @@ public class LiveBarRelay extends Study {
         public void onOpen(WebSocket ws) {
           wsRef.set(ws);
           ws.request(Long.MAX_VALUE);
-          historyDumped.set(false);
-          pendingHistoryDump.set(true);
+          synchronized (textBuf) { textBuf.setLength(0); }
+          // (Re)send hello once resolution is known — calculate() fires it.
+          pendingHello.set(true);
           System.out.println("[LiveBarRelay] Connected to " + WS_ENDPOINT);
+        }
 
-          // Fire history dump immediately using the stored DataSeries so it works even
-          // on weekends/closed markets when calculate() is never called after reconnect.
-          final DataSeries ds  = lastDs;
-          final String     sym = lastSymbol;
-          if (ds != null && sym != null && historyDumped.compareAndSet(false, true)) {
-            pendingHistoryDump.set(false);
-            final int tot = ds.size();
-            scheduler.execute(() -> dumpHistory(ds, sym, tot));
+        @Override
+        public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
+          synchronized (textBuf) {
+            textBuf.append(data);
+            if (last) {
+              String s = textBuf.toString();
+              textBuf.setLength(0);
+              handleIncoming(s);
+            }
           }
+          return null;
         }
 
         @Override
@@ -135,7 +165,39 @@ public class LiveBarRelay extends Study {
     }
   }
 
-  // ── Tick callback ─────────────────────────────────────────────────────────────
+  // ── Sender thread ───────────────────────────────────────────────────────────
+  // Single writer: drains outbox first (protocol + complete bars), then the latest
+  // forming bar, then the latest tick. Each send is awaited so we never call
+  // sendText concurrently (Java WebSocket forbids it).
+  private void senderLoop() {
+    while (!Thread.currentThread().isInterrupted()) {
+      String msg = outbox.poll();
+      if (msg == null) msg = latestForming.getAndSet(null);
+      if (msg == null) msg = latestTick.getAndSet(null);
+      if (msg == null) {
+        synchronized (senderSignal) {
+          try { senderSignal.wait(200); } catch (InterruptedException e) { return; }
+        }
+        continue;
+      }
+      WebSocket w = wsRef.get();
+      if (w == null) continue; // disconnected — drop; server re-audits on reconnect
+      try {
+        w.sendText(msg, true).get(10, TimeUnit.SECONDS);
+      } catch (Exception e) {
+        wsRef.set(null);
+      }
+    }
+  }
+
+  private void wakeSender() {
+    synchronized (senderSignal) { senderSignal.notifyAll(); }
+  }
+
+  private void enqueue(String json)   { outbox.add(json);      wakeSender(); }
+  private void setForming(String json){ latestForming.set(json); wakeSender(); }
+
+  // ── Tick callback (UNCHANGED from v1) ─────────────────────────────────────────
 
   @Override
   public void onTick(DataContext ctx, Tick tick) {
@@ -148,63 +210,27 @@ public class LiveBarRelay extends Study {
       "{\"type\":\"tick\",\"symbol\":\"%s\",\"price\":%.4f,\"time\":%d}",
       symbol, price, now));
 
-    // ── Forming-bar OHLCV on every tick (throttled) ───────────────────────────
-    // Send the live candle straight from MW's DataSeries so its open/high/low/volume
-    // track the tick in near-real-time (not just on the periodic calculate() pass).
-    if (now - lastFormingBarMs >= FORMING_BAR_THROTTLE_MS) {
-      lastFormingBarMs = now;
-      DataSeries ds  = ctx.getDataSeries();
-      int        idx = ds.size() - 1;
-      if (idx >= 0) {
-        long  tMs = ds.getStartTime(idx);
-        float o   = ds.getOpen(idx);
-        // close := freshest tick; high/low reconciled with it so OHLC is never malformed
-        // (close > high / close < low would be rejected server-side) and the wick always
-        // includes the latest print.
-        float c   = price;
-        float h   = Math.max(ds.getHigh(idx), price);
-        float l   = Math.min(ds.getLow(idx),  price);
-        long  vol = (long) ds.getVolume(idx);
-        boolean complete = ds.isBarComplete(idx);
-        String res       = inferResolution(ds, idx);
-        if (h >= l && o > 0) {
-          sendWs(String.format(
-            "{\"type\":\"bar\",\"symbol\":\"%s\",\"resolution\":\"%s\"" +
-            ",\"time\":%d,\"open\":%.4f,\"high\":%.4f,\"low\":%.4f,\"close\":%.4f" +
-            ",\"volume\":%d,\"complete\":%b}",
-            symbol, res, tMs / 1000L, o, h, l, c, vol, complete));
-        }
-      }
-    }
-
     // ── Footprint accumulation ────────────────────────────────────────────
     long intervalMs = 5L * 60L * 1000L;                         // 5-minute buckets
     long bucketMs   = (now / intervalMs) * intervalMs;
 
     // On bucket boundary: flush previous footprint bar then start fresh
     synchronized (footprintLevels) {
-      boolean bucketRolled  = footprintBucketMs != 0 && bucketMs != footprintBucketMs;
-      boolean symbolChanged = !footprintSymbol.isEmpty() && !symbol.equals(footprintSymbol);
-      if (bucketRolled || symbolChanged) {
+      if (footprintBucketMs != 0 && bucketMs != footprintBucketMs) {
         flushFootprintBar(footprintSymbol, footprintBucketMs);
         footprintLevels.clear();
       }
       footprintBucketMs = bucketMs;
       footprintSymbol   = symbol;
 
-      // REAL footprint straight from the MotiveWave SDK Tick (filled from Rithmic's live trade
-      // feed) — no reflection, no guessing:
-      //   getVolume()  → actual trade size; 0 on quote-only ticks (bid/ask change, no trade)
-      //   isAskTick()  → true when the trade LIFTED the ask (aggressive BUY), false when it HIT
-      //                  the bid (aggressive SELL). This is the genuine aggressor side. The old
-      //                  code guessed method names ("isAsk"/"askTick"/"isBuyTick") that don't
-      //                  exist, so every trade defaulted to "bid" → fabricated sell-biased delta.
-      int vol = tick.getVolume();
-      if (vol > 0) { // ignore quote-only ticks so they don't pollute the footprint with phantom volume
-        long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
-        if (tick.isAskTick()) arr[1] += vol; // aggressive buy  → ask volume
-        else                  arr[0] += vol; // aggressive sell → bid volume
-      }
+      // Extract volume and direction from the Tick object via reflection
+      long    vol   = extractLong(tick, "getVolume", "getSize", "getQuantity", "getLastSize");
+      boolean isAsk = extractBool(tick, "isAsk", "askTick", "isBuyTick");
+      if (vol <= 0) vol = 1; // treat unknown as 1 contract
+
+      long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
+      if (isAsk) arr[1] += vol; // ask volume (aggressive buy)
+      else       arr[0] += vol; // bid volume (aggressive sell)
     }
   }
 
@@ -225,188 +251,405 @@ public class LiveBarRelay extends Study {
       symbol, bucketMs / 1000L, levels));
   }
 
+  /** Extracts a long value from an object by trying method names in order (reflection). */
+  private static long extractLong(Object obj, String... methodNames) {
+    for (String name : methodNames) {
+      try {
+        java.lang.reflect.Method m = obj.getClass().getMethod(name);
+        Object v = m.invoke(obj);
+        if (v instanceof Number) return ((Number) v).longValue();
+      } catch (Exception ignored) {}
+    }
+    return 0L;
+  }
+
+  /** Extracts a boolean from an object by trying method names in order (reflection). */
+  private static boolean extractBool(Object obj, String... methodNames) {
+    for (String name : methodNames) {
+      try {
+        java.lang.reflect.Method m = obj.getClass().getMethod(name);
+        Object v = m.invoke(obj);
+        if (v instanceof Boolean) return (Boolean) v;
+      } catch (Exception ignored) {}
+    }
+    return false; // default: treat as bid (sell aggression) if direction unknown
+  }
+
   // ── Bar callback ──────────────────────────────────────────────────────────────
 
   @Override
   protected void calculate(int index, DataContext ctx) {
     DataSeries ds     = ctx.getDataSeries();
     int        total  = ds.size();
-    String     symbol = ctx.getInstrument().getSymbol();
+    String     sym    = ctx.getInstrument().getSymbol();
 
-    // Always keep the reference fresh so onOpen() can dump history on reconnect
-    // even when markets are closed and calculate() won't be called again.
-    lastDs     = ds;
-    lastSymbol = symbol;
+    // Stash context for the backfill servicer (runs off the calc thread)
+    this.dataSeries = ds;
+    this.instrument = ctx.getInstrument();
+    this.symbol     = sym;
 
-    // ── History dump: fires once per WS connection (fallback if onOpen fired before first calculate()) ──
-    if (pendingHistoryDump.compareAndSet(true, false) && !historyDumped.get()) {
-      historyDumped.set(true);
-      final DataSeries snap = ds;
-      final String    sym   = symbol;
-      final int       tot   = total;
-      scheduler.execute(() -> dumpHistory(snap, sym, tot));
+    // Resolve resolution ONCE (ground truth) before anything is sent.
+    if (resolution == null) resolveResolution(ds);
+
+    // Fire the hello handshake once resolution is known AND the socket is open.
+    if (resolution != null && pendingHello.compareAndSet(true, false)) {
+      long seriesStart = total > 0 ? ds.getStartTime(0)         : System.currentTimeMillis();
+      long seriesEnd   = total > 0 ? ds.getStartTime(total - 1) : System.currentTimeMillis();
+      enqueue(String.format(
+        "{\"type\":\"hello\",\"symbol\":\"%s\",\"resolution\":\"%s\",\"seriesStartMs\":%d,\"seriesEndMs\":%d,\"ver\":2}",
+        sym, resolution, seriesStart, seriesEnd));
+      System.out.println("[LiveBarRelay] hello sent res=" + resolution);
     }
 
     // ── Live bar update (last bar only) ──────────────────────────────────────────
     if (index != total - 1) return;
 
-    long    timeMs     = ds.getStartTime(index);
-    float   open       = ds.getOpen(index);
-    float   high       = ds.getHigh(index);
-    float   low        = ds.getLow(index);
-    float   close      = ds.getClose(index);
-    long    volume     = (long) ds.getVolume(index);
-    boolean complete   = ds.isBarComplete(index);
-    String  resolution = inferResolution(ds, index);
+    long    timeMs   = ds.getStartTime(index);
+    float   open     = ds.getOpen(index);
+    float   high     = ds.getHigh(index);
+    float   low      = ds.getLow(index);
+    float   close    = ds.getClose(index);
+    long    volume   = (long) ds.getVolume(index);
+    boolean complete = ds.isBarComplete(index);
 
-    sendWs(String.format(
+    String barJson = String.format(
       "{\"type\":\"bar\",\"symbol\":\"%s\",\"resolution\":\"%s\"" +
       ",\"time\":%d,\"open\":%.4f,\"high\":%.4f,\"low\":%.4f,\"close\":%.4f" +
       ",\"volume\":%d,\"complete\":%b}",
-      symbol, resolution,
-      timeMs / 1000L, open, high, low, close, volume, complete));
+      sym, resolution, timeMs / 1000L, open, high, low, close, volume, complete);
+
+    // Complete bars must never be dropped → outbox. Forming bars are latest-wins.
+    if (complete) enqueue(barJson);
+    else          setForming(barJson);
   }
 
-  // ── History dump ─────────────────────────────────────────────────────────────
+  // ── Resolution resolution ─────────────────────────────────────────────────────
+
+  private void resolveResolution(DataSeries ds) {
+    String r = resolveViaBarSize(ds);
+    if (r == null) r = resolveViaMedianDelta(ds);
+    if (r == null) r = "1";
+    resolution = r;
+    System.out.println("[LiveBarRelay] resolution resolved = " + r);
+  }
 
   /**
-   * Sends all historical bars (complete bars only) to the server in batches.
-   * Skips the last bar (live/forming). Uses bulk_bars messages so the server
-   * can batch-insert into cached_candles efficiently.
+   * Ground truth via DataSeries.getBarSize() interval accessors (reflection).
+   * Verified on the real object: getIntervalMinutes()=5, getIntervalSeconds()=300,
+   * getInterval()=5 for a 5-min chart. Try in that order.
    */
-  private void dumpHistory(DataSeries ds, String symbol, int total) {
-    // Skip the very last bar (it's the forming live bar — sent via calculate())
-    int end   = total - 1;
-    int start = Math.max(0, end - MAX_HISTORY);
-
-    // Robust resolution inference: the true bar interval is the SMALLEST positive gap between
-    // consecutive bars. Sampling only the first pair can land on a session/weekend gap and
-    // mis-infer (e.g. tag 1m bars as 60m), after which the server's alignment filter discards
-    // 4 of every 5 genuine bars — leaving huge holes in the chart.
-    String resolution = "1";
-    long minDelta = Long.MAX_VALUE;
-    for (int i = start + 1; i < end && i < start + 500; i++) {
-      long d = ds.getStartTime(i) - ds.getStartTime(i - 1);
-      if (d > 0 && d < minDelta) minDelta = d;
-    }
-    if (minDelta != Long.MAX_VALUE) resolution = inferResolutionFromDelta(minDelta);
-
-    int barCount = end - start;
-    System.out.printf("[LiveBarRelay] Dumping history: %d bars (%s) for %s%n",
-      barCount, resolution, symbol);
-
-    // Write CSV to disk so the web app can import bulk history without WS size limits
-    String dumpPath = System.getProperty("user.home") + File.separator
-      + "MotiveWave Extensions" + File.separator
-      + "dump_" + symbol + "_" + resolution + ".csv";
-    PrintWriter csvWriter = null;
+  private String resolveViaBarSize(DataSeries ds) {
     try {
-      new File(System.getProperty("user.home") + File.separator + "MotiveWave Extensions").mkdirs();
-      csvWriter = new PrintWriter(new FileWriter(dumpPath));
-      csvWriter.println("timestamp,open,high,low,close,volume");
-    } catch (Exception e) {
-      System.out.println("[LiveBarRelay] CSV write failed: " + e.getMessage());
-    }
-
-    List<String> batch = new ArrayList<>(BATCH_SIZE);
-
-    for (int i = start; i < end; i++) {
-      long  timeMs = ds.getStartTime(i);
-      float open   = ds.getOpen(i);
-      float high   = ds.getHigh(i);
-      float low    = ds.getLow(i);
-      float close  = ds.getClose(i);
-      long  volume = (long) ds.getVolume(i);
-
-      if (high < low || open <= 0) continue;
-
-      batch.add(String.format(
-        "{\"t\":%d,\"o\":%.4f,\"h\":%.4f,\"l\":%.4f,\"c\":%.4f,\"v\":%d}",
-        timeMs / 1000L, open, high, low, close, volume));
-
-      if (csvWriter != null) {
-        csvWriter.printf("%d,%.4f,%.4f,%.4f,%.4f,%d%n",
-          timeMs / 1000L, open, high, low, close, volume);
+      Method gbs = ds.getClass().getMethod("getBarSize");
+      Object bs  = gbs.invoke(ds);
+      if (bs == null) return null;
+      barSizeObj = bs; // cache for getBars backfills
+      long minutes = -1;
+      Object v;
+      if ((v = tryCall(bs, "getIntervalMinutes")) instanceof Number) {
+        minutes = ((Number) v).longValue();
+      } else if ((v = tryCall(bs, "getIntervalSeconds")) instanceof Number) {
+        minutes = ((Number) v).longValue() / 60L;
+      } else if ((v = tryCall(bs, "getInterval")) instanceof Number) {
+        minutes = ((Number) v).longValue(); // verified: getInterval() is in minutes
       }
-
-      if (batch.size() >= BATCH_SIZE) {
-        flushBatch(symbol, resolution, batch);
-        batch = new ArrayList<>(BATCH_SIZE);
+      if (minutes >= 1) {
+        System.out.println("[LiveBarRelay] BarSize minutes = " + minutes);
+        return mapMinutes(minutes);
       }
-    }
-
-    if (!batch.isEmpty()) {
-      flushBatch(symbol, resolution, batch);
-    }
-
-    if (csvWriter != null) {
-      csvWriter.close();
-      System.out.printf("[LiveBarRelay] CSV written → %s%n", dumpPath);
-    }
-
-    System.out.printf("[LiveBarRelay] History dump complete (%d bars sent)%n", barCount);
+    } catch (Exception ignored) {}
+    return null;
   }
 
-  private void flushBatch(String symbol, String resolution, List<String> bars) {
-    WebSocket w = wsRef.get();
-    if (w == null) return;
-    String json = String.format(
-      "{\"type\":\"bulk_bars\",\"symbol\":\"%s\",\"resolution\":\"%s\",\"bars\":[%s]}",
-      symbol, resolution, String.join(",", bars));
-    try {
-      // Block until this batch is fully sent — sendWs() drops when previous is in-flight,
-      // which causes all but the first batch to be silently lost during a history dump.
-      w.sendText(json, true).get(10, TimeUnit.SECONDS);
-    } catch (Exception e) {
-      System.out.println("[LiveBarRelay] flushBatch error: " + e.getMessage());
-      wsRef.set(null);
-    }
+  /** Map minutes → wire resolution. Known intervals get canonical strings; the server
+   *  parses any other "N" as N minutes, so pass unknown minutes through verbatim. */
+  private static String mapMinutes(long m) {
+    if (m < 1) return null; // sub-minute / bad median → let caller default to "1"
+    if (m == 1)  return "1";
+    if (m == 5)  return "5";
+    if (m == 15) return "15";
+    if (m == 60) return "60";
+    return String.valueOf(m);
   }
 
-  // ── Helpers ──────────────────────────────────────────────────────────────────
+  /** Zero-arg reflection call returning the value or null on any failure. */
+  private static Object tryCall(Object obj, String name) {
+    if (obj == null) return null;
+    try { return obj.getClass().getMethod(name).invoke(obj); }
+    catch (Throwable t) { return null; }
+  }
 
-  private String inferResolution(DataSeries ds, int index) {
-    long minDelta = Long.MAX_VALUE;
-    int from = Math.max(1, index - 50);
-    for (int i = from; i <= index; i++) {
+  /** Fallback: median of the first 50 consecutive bar deltas (robust across session gaps). */
+  private String resolveViaMedianDelta(DataSeries ds) {
+    int size = ds.size();
+    if (size < 2) return null;
+    int n = Math.min(50, size - 1);
+    long[] deltas = new long[n];
+    int cnt = 0;
+    for (int i = 1; i <= n; i++) {
       long d = ds.getStartTime(i) - ds.getStartTime(i - 1);
-      if (d > 0 && d < minDelta) minDelta = d;
+      if (d > 0) deltas[cnt++] = d;
     }
-    return minDelta == Long.MAX_VALUE ? "1" : inferResolutionFromDelta(minDelta);
+    if (cnt == 0) return null;
+    long[] valid = java.util.Arrays.copyOf(deltas, cnt);
+    java.util.Arrays.sort(valid);
+    long median = valid[cnt / 2];
+    return mapMinutes(median / 60_000L);
   }
 
-  private static String inferResolutionFromDelta(long deltaMs) {
-    long minutes = deltaMs / 60_000L;
-    if (minutes >= 50) return "60";
-    if (minutes >= 12) return "15";
-    if (minutes >= 3)  return "5";
-    return "1";
+  // ── Incoming protocol handling ────────────────────────────────────────────────
+
+  /** Extracts a string field value ("field":"value") from a JSON message. */
+  private static String extractString(String json, String field) {
+    String key = "\"" + field + "\":\"";
+    int i = json.indexOf(key);
+    if (i < 0) return null;
+    int start = i + key.length();
+    int end = json.indexOf('"', start);
+    if (end < 0) return null;
+    return json.substring(start, end);
   }
 
-  // ── WebSocket send ────────────────────────────────────────────────────────────
+  /** Extracts a numeric field value ("field":12345) from a JSON message; -1 if absent. */
+  private static long extractLongField(String json, String field) {
+    String key = "\"" + field + "\":";
+    int i = json.indexOf(key);
+    if (i < 0) return -1;
+    int p = i + key.length();
+    boolean neg = false;
+    if (p < json.length() && json.charAt(p) == '-') { neg = true; p++; }
+    long v = 0;
+    boolean any = false;
+    while (p < json.length() && Character.isDigit(json.charAt(p))) {
+      v = v * 10 + (json.charAt(p) - '0');
+      p++;
+      any = true;
+    }
+    if (!any) return -1;
+    return neg ? -v : v;
+  }
 
-  private final java.util.concurrent.ConcurrentLinkedQueue<String> sendQueue =
-      new java.util.concurrent.ConcurrentLinkedQueue<>();
-  private static final int MAX_QUEUE = 1000;
+  private void handleIncoming(String s) {
+    try {
+      if (s.contains("\"backfill\"") && s.contains("\"fromMs\"")) {
+        final String id = extractString(s, "id");
+        final long fromMs = extractLongField(s, "fromMs");
+        final long toMs   = extractLongField(s, "toMs");
+        if (id != null && fromMs >= 0 && toMs > 0) {
+          scheduler.execute(() -> serviceBackfill(id, fromMs, toMs));
+        }
+      }
+      // bulk_report messages are informational — no action needed.
+    } catch (Exception ignored) {}
+  }
+
+  // ── Backfill servicing ────────────────────────────────────────────────────────
+
+  // Deep ranges (e.g. the server's 0 → earliest-stored probe) must not become one
+  // giant getBars call — that could block for minutes or hammer the data feed.
+  // Instead walk backward in 30-day windows, streaming each window out as it
+  // arrives, and stop after MAX_EMPTY_WINDOWS consecutive empty windows (the
+  // provider history cap — ~6 months of silence means there is nothing older).
+  private static final long DEEP_WINDOW_MS     = 30L * 24L * 3600_000L;
+  private static final int  MAX_EMPTY_WINDOWS  = 6;
+
+  private void serviceBackfill(String id, long fromMs, long toMs) {
+    DataSeries ds   = dataSeries;
+    Instrument inst = instrument;
+    if (ds == null || inst == null) { sendBackfillDone(id, 0, 0, "feed"); return; }
+
+    String source = "feed";
+    long   earliestMs = 0;
+    int    totalSent  = 0;
+    int    seq        = 0;
+
+    // 1. Try Instrument.getBars (deep history), windowed for large ranges.
+    try {
+      if (toMs - fromMs <= DEEP_WINDOW_MS + 5L * 24L * 3600_000L) {
+        BarsResult r = tryGetBars(inst, fromMs, toMs);
+        if (r != null && r.count > 0) {
+          earliestMs = r.earliestMs;
+          seq        = emitBatches(id, r.bars, seq);
+          totalSent += r.count;
+        }
+      } else {
+        int  empties = 0;
+        long winEnd  = toMs;
+        while (winEnd > fromMs && empties < MAX_EMPTY_WINDOWS) {
+          long winStart = Math.max(fromMs, winEnd - DEEP_WINDOW_MS);
+          BarsResult r = tryGetBars(inst, winStart, winEnd);
+          if (r != null && r.count > 0) {
+            empties = 0;
+            if (earliestMs == 0 || r.earliestMs < earliestMs) earliestMs = r.earliestMs;
+            seq        = emitBatches(id, r.bars, seq);
+            totalSent += r.count;
+          } else {
+            empties++;
+          }
+          winEnd = winStart;
+          // Backpressure: don't let the fetch loop run far ahead of the sender.
+          while (outbox.size() > 20) {
+            try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+          }
+        }
+      }
+    } catch (Throwable t) {
+      System.out.println("[LiveBarRelay] getBars failed: " + t);
+    }
+
+    // 2. Auto-degrade to the loaded DataSeries slice when getBars produced nothing
+    //    and the requested range overlaps what the chart already has.
+    if (totalSent == 0) {
+      int size = ds.size();
+      if (size > 1) {
+        long chartStart = ds.getStartTime(0);
+        long chartEnd   = ds.getStartTime(size - 1);
+        if (fromMs <= chartEnd && toMs >= chartStart) {
+          List<String> bars = new ArrayList<>();
+          for (int i = 0; i < size - 1; i++) { // skip forming last bar
+            long t = ds.getStartTime(i);
+            if (t < fromMs || t > toMs) continue;
+            float o = ds.getOpen(i), h = ds.getHigh(i), l = ds.getLow(i), c = ds.getClose(i);
+            long  v = (long) ds.getVolume(i);
+            if (h < l || o <= 0) continue;
+            bars.add(barJson(t / 1000L, o, h, l, c, v));
+            if (earliestMs == 0 || t < earliestMs) earliestMs = t;
+          }
+          if (!bars.isEmpty()) {
+            seq        = emitBatches(id, bars, seq);
+            totalSent += bars.size();
+            source = "chart";
+          }
+        }
+      }
+    }
+
+    sendBackfillDone(id, totalSent, earliestMs, source);
+    System.out.printf("[LiveBarRelay] backfill %s done: %d bars source=%s%n", id, totalSent, source);
+  }
+
+  /** Enqueues the given bars as bulk_bars batches; returns the next seq number. */
+  private int emitBatches(String id, List<String> bars, int seq) {
+    int total = bars.size();
+    for (int i = 0; i < total; i += BATCH_SIZE) {
+      List<String> chunk = new ArrayList<>(bars.subList(i, Math.min(total, i + BATCH_SIZE)));
+      enqueue(String.format(
+        "{\"type\":\"bulk_bars\",\"id\":\"%s\",\"symbol\":\"%s\",\"resolution\":\"%s\",\"seq\":%d,\"final\":false,\"bars\":[%s]}",
+        id, symbol, resolution, seq++, String.join(",", chunk)));
+    }
+    return seq;
+  }
+
+  private void sendBackfillDone(String id, int count, long earliestMs, String source) {
+    enqueue(String.format(
+      "{\"type\":\"backfill_done\",\"id\":\"%s\",\"count\":%d,\"earliestAvailableMs\":%d,\"source\":\"%s\"}",
+      id, count, earliestMs, source));
+  }
+
+  /**
+   * getBars(long, long, BarSize, boolean) via reflection — the verified replacement for
+   * the (unusable) forEachBar callback path. Returns null when barSize is unknown or the
+   * method can't be found, so the caller degrades to the DataSeries slice.
+   */
+  private BarsResult tryGetBars(Instrument inst, long fromMs, long toMs) throws Exception {
+    Object bs = barSizeObj;
+    if (bs == null) return null; // no BarSize captured yet → fall back to DataSeries slice
+
+    if (!getBarsLookedUp) {
+      getBarsMethod   = findGetBars(inst.getClass(), bs);
+      getBarsLookedUp = true;
+    }
+    Method gb = getBarsMethod;
+    if (gb == null) return null;
+
+    Object result = gb.invoke(inst, fromMs, toMs, bs, Boolean.FALSE);
+    if (!(result instanceof List)) return null;
+
+    List<?> list = (List<?>) result;
+    final BarsResult res = new BarsResult();
+    for (Object bar : list) {
+      if (bar == null) continue;
+      resolveAccessors(bar.getClass());
+      long t = invLong(aTime, bar);
+      if (t <= 0) t = invLong(aTimeAlt, bar);               // getStartTime → getTime fallback
+      double o = invDbl(aOpen, bar), h = invDbl(aHigh, bar),
+             l = invDbl(aLow, bar),  c = invDbl(aClose, bar);
+      double v = (aVol != null) ? invDbl(aVol, bar)
+               : (aVolAlt != null) ? invDbl(aVolAlt, bar) : 0.0;
+      if (Double.isNaN(o) || Double.isNaN(h) || Double.isNaN(l) || Double.isNaN(c)) continue;
+      if (t <= 1_000_000_000L || o <= 0 || h < l) continue; // same validity rules as before
+      res.bars.add(barJson(t / 1000L, o, h, l, c, (long) v));
+      res.count++;
+      if (res.earliestMs == 0 || t < res.earliestMs) res.earliestMs = t;
+    }
+    return res;
+  }
+
+  /** Locate getBars(long, long, <BarSize-assignable>, boolean). */
+  private static Method findGetBars(Class<?> cls, Object barSize) {
+    for (Method m : cls.getMethods()) {
+      if (!m.getName().equals("getBars")) continue;
+      Class<?>[] p = m.getParameterTypes();
+      if (p.length != 4) continue;
+      boolean p0 = (p[0] == long.class || p[0] == Long.class);
+      boolean p1 = (p[1] == long.class || p[1] == Long.class);
+      boolean p2 = p[2].isInstance(barSize);
+      boolean p3 = (p[3] == boolean.class || p[3] == Boolean.class);
+      if (p0 && p1 && p2 && p3) return m;
+    }
+    return null;
+  }
+
+  /** Resolve the per-bar accessor Methods once from the first element's class; reuse after. */
+  private void resolveAccessors(Class<?> cls) {
+    if (barAccessorClass == cls) return;
+    aTime    = findAccessor(cls, "getStartTime");
+    aTimeAlt = findAccessor(cls, "getTime");
+    aOpen    = findAccessor(cls, "getOpen");
+    aHigh    = findAccessor(cls, "getHigh");
+    aLow     = findAccessor(cls, "getLow");
+    aClose   = findAccessor(cls, "getClose");
+    aVol     = findAccessor(cls, "getVolume");
+    aVolAlt  = findAccessor(cls, "getVolumeAsFloat");
+    barAccessorClass = cls;
+  }
+
+  private static Method findAccessor(Class<?> cls, String name) {
+    try { return cls.getMethod(name); } catch (Exception e) { return null; }
+  }
+
+  private static long invLong(Method m, Object o) {
+    if (m == null) return 0L;
+    try { Object v = m.invoke(o); return (v instanceof Number) ? ((Number) v).longValue() : 0L; }
+    catch (Exception e) { return 0L; }
+  }
+
+  private static double invDbl(Method m, Object o) {
+    if (m == null) return Double.NaN;
+    try { Object v = m.invoke(o); return (v instanceof Number) ? ((Number) v).doubleValue() : Double.NaN; }
+    catch (Exception e) { return Double.NaN; }
+  }
+
+  private static class BarsResult {
+    final List<String> bars = new ArrayList<>();
+    int  count = 0;
+    long earliestMs = 0;
+  }
+
+  private static String barJson(long tSec, double o, double h, double l, double c, long v) {
+    return String.format("{\"t\":%d,\"o\":%.4f,\"h\":%.4f,\"l\":%.4f,\"c\":%.4f,\"v\":%d}", tSec, o, h, l, c, v);
+  }
+
+  // ── WebSocket send (routes by message type into the outbox / tick slot) ────────
 
   private void sendWs(String json) {
-    WebSocket w = wsRef.get();
-    if (w == null) return;
-    if (sendQueue.size() >= MAX_QUEUE) sendQueue.poll(); // bound memory: drop OLDEST under pressure
-    sendQueue.offer(json);
-    pump(w);
-  }
-
-  private void pump(WebSocket w) {
-    if (!pendingSend.get().isDone()) return; // a send is in flight; it will re-pump on completion
-    String next = sendQueue.poll();
-    if (next == null) return;
-    CompletableFuture<?> f = w.sendText(next, true).whenComplete((r, e) -> {
-      if (e != null) { wsRef.set(null); return; }
-      WebSocket ww = wsRef.get();
-      if (ww != null) pump(ww);
-    });
-    pendingSend.set(f);
+    // Ticks are latest-wins (fast path, never queued); everything else is queued.
+    if (json.startsWith("{\"type\":\"tick\"")) {
+      latestTick.set(json);
+      wakeSender();
+    } else {
+      enqueue(json);
+    }
   }
 
   @Override
