@@ -521,6 +521,7 @@ function applyTick(symbol: string, price: number) {
     prev1m.close = price;
     if (price > prev1m.high) prev1m.high = price;
     if (price < prev1m.low)  prev1m.low  = price;
+    prev1m.volume += 1; // tick count as volume proxy (see notifyExternalTick) — v0 bars get ghost-rejected at persist
   } else {
     // CANDLE FIX: only chain prev close as open when consecutive buckets — gap means self-seed
     const is1mContiguous = prev1m != null && (bucket1m - prev1m.timeSec <= 60);
@@ -530,7 +531,7 @@ function applyTick(symbol: string, price: number) {
       high:  price,
       low:   price,
       close: price,
-      volume: 0,
+      volume: 1, // tick count
     });
   }
 
@@ -540,6 +541,7 @@ function applyTick(symbol: string, price: number) {
     prev5m.close = price;
     if (price > prev5m.high) prev5m.high = price;
     if (price < prev5m.low)  prev5m.low  = price;
+    prev5m.volume += 1; // tick count
   } else {
     // CANDLE FIX: only chain prev close as open when consecutive buckets — gap means self-seed
     const is5mContiguous = prev5m != null && (bucket5m - prev5m.timeSec <= 300);
@@ -549,7 +551,7 @@ function applyTick(symbol: string, price: number) {
       high:  price,
       low:   price,
       close: price,
-      volume: 0,
+      volume: 1, // tick count
     });
   }
 
@@ -561,9 +563,10 @@ function applyTick(symbol: string, price: number) {
     prev60m.close = price;
     if (price > prev60m.high) prev60m.high = price;
     if (price < prev60m.low)  prev60m.low  = price;
+    prev60m.volume += 1; // tick count
   } else {
     const is60mContiguous = prev60m != null && (bucket60m - prev60m.timeSec <= 3600);
-    inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 0 });
+    inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 1 }); // tick count
   }
 
   if (!_broadcast) return;
@@ -682,9 +685,23 @@ export function notifyExternalTick(symbol: string, price: number) {
 
   const prev1m = inProgressBar1m.get(sym);
   if (prev1m && prev1m.timeSec === bucket1m) {
-    prev1m.close = price;
-    if (prev1m.high < price) prev1m.high = price;
-    if (prev1m.low  > price) prev1m.low  = price;
+    // volume===0 marks a BOOT-SEEDED bar (stale tick-file price) that has never received a real
+    // tick — RESEED it wholesale at this tick's price instead of merely updating close. Merely
+    // updating left the stale seed as open/high, persisting phantom-open bars (e.g. the 07-08
+    // 19:42Z 1m bar that opened 35pt above the market at the old 7559.25 seed price).
+    if (prev1m.volume === 0) {
+      prev1m.open = price; prev1m.high = price; prev1m.low = price; prev1m.close = price;
+      prev1m.volume = 1;
+    } else {
+      prev1m.close = price;
+      if (prev1m.high < price) prev1m.high = price;
+      if (prev1m.low  > price) prev1m.low  = price;
+      // Tick count as volume proxy (same convention as the tick-file parser). Without this the
+      // completed bar carries volume 0 and bulkUpsert's validateBar ghost-guard rejects it — the
+      // exact bug that froze 1m DB persistence while ticks were flowing fine. Real MW volume
+      // overwrites via onConflictDoUpdate when a bar-file flush covers this bucket.
+      prev1m.volume += 1;
+    }
   } else {
     // Completed 1m bar — persist and broadcast
     if (prev1m && prev1m.timeSec > 0 && prev1m.open > 0) {
@@ -695,14 +712,21 @@ export function notifyExternalTick(symbol: string, price: number) {
     }
     // CANDLE FIX: only chain prev close as open when consecutive buckets — gap means self-seed
     const is1mContiguous = prev1m != null && (bucket1m - prev1m.timeSec <= 60);
-    inProgressBar1m.set(sym, { timeSec: bucket1m, open: is1mContiguous ? prev1m.close : price, high: price, low: price, close: price, volume: 0 }); // CANDLE FIX: gap-safe open
+    inProgressBar1m.set(sym, { timeSec: bucket1m, open: is1mContiguous ? prev1m.close : price, high: price, low: price, close: price, volume: 1 }); // volume = tick count (see above)
   }
 
   const prev5m = inProgressBar5m.get(sym);
   if (prev5m && prev5m.timeSec === bucket5m) {
-    prev5m.close = price;
-    if (price > prev5m.high) prev5m.high = price;
-    if (price < prev5m.low)  prev5m.low  = price;
+    if (prev5m.volume === 0) {
+      // Boot-seeded bar (stale price, no real tick yet) — reseed at this tick. See 1m note.
+      prev5m.open = price; prev5m.high = price; prev5m.low = price; prev5m.close = price;
+      prev5m.volume = 1;
+    } else {
+      prev5m.close = price;
+      if (price > prev5m.high) prev5m.high = price;
+      if (price < prev5m.low)  prev5m.low  = price;
+      prev5m.volume += 1; // tick count as volume proxy — see 1m note above
+    }
   } else {
     // Bucket rolled over — persist and broadcast the completed bar
     if (prev5m && prev5m.timeSec > 0 && prev5m.open > 0) {
@@ -717,7 +741,7 @@ export function notifyExternalTick(symbol: string, price: number) {
     }
     // CANDLE FIX: only chain prev close as open when consecutive buckets — gap means self-seed
     const is5mContiguous = prev5m != null && (bucket5m - prev5m.timeSec <= 300);
-    inProgressBar5m.set(sym, { timeSec: bucket5m, open: is5mContiguous ? prev5m.close : price, high: price, low: price, close: price, volume: 0 }); // CANDLE FIX: gap-safe open
+    inProgressBar5m.set(sym, { timeSec: bucket5m, open: is5mContiguous ? prev5m.close : price, high: price, low: price, close: price, volume: 1 }); // volume = tick count
   }
 
   // ── 60-min in-progress bar ────────────────────────────────────────────────
@@ -725,9 +749,16 @@ export function notifyExternalTick(symbol: string, price: number) {
   const bucket60m = agg60mBucket(nowSec);
   const prev60m = inProgressBar60m.get(sym);
   if (prev60m && prev60m.timeSec === bucket60m) {
-    prev60m.close = price;
-    if (price > prev60m.high) prev60m.high = price;
-    if (price < prev60m.low)  prev60m.low  = price;
+    if (prev60m.volume === 0) {
+      // Boot-seeded bar (stale price, no real tick yet) — reseed at this tick. See 1m note.
+      prev60m.open = price; prev60m.high = price; prev60m.low = price; prev60m.close = price;
+      prev60m.volume = 1;
+    } else {
+      prev60m.close = price;
+      if (price > prev60m.high) prev60m.high = price;
+      if (price < prev60m.low)  prev60m.low  = price;
+      prev60m.volume += 1; // tick count as volume proxy — see 1m note above
+    }
   } else {
     if (prev60m && prev60m.timeSec > 0 && prev60m.open > 0) {
       bulkUpsert(sym, "60", [prev60m]).catch(() => {});
@@ -736,7 +767,7 @@ export function notifyExternalTick(symbol: string, price: number) {
       }
     }
     const is60mContiguous = prev60m != null && (bucket60m - prev60m.timeSec <= 3600);
-    inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 0 });
+    inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 1 }); // volume = tick count
   }
 
   // Broadcast the forming bars so the browser's liveCandles stays in sync (for signal computation).
