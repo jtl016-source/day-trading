@@ -403,6 +403,22 @@ export function onBackfillDone(
       study.queue.push(range); // retry once more later
     }
   } else {
+    // Productive fill — but cap repeat attempts for the SAME range. MW can answer a range with
+    // bars our validation rejects every time (v0 / off-grid filler bars MW synthesizes for thin
+    // 2019-era minutes): the grid still sees gaps, the hourly re-audit re-requests, MW answers,
+    // validation rejects — an infinite slow churn (observed as an endless parade of tiny 2019 1m
+    // backfills). Three answered attempts without the gaps closing = permanently unfillable
+    // (retryable-clearable via the existing /api/data/unfillable endpoint like no_data).
+    const pk = `${symbol}:${resolution}:${range.fromTs}:${range.toTs}`;
+    const n = (zeroAttempts.get(pk) ?? 0) + 1;
+    zeroAttempts.set(pk, n);
+    if (n >= 3) {
+      db.$client.prepare(
+        `INSERT INTO unfillable_ranges (symbol, resolution, from_ts, to_ts, attempts, reason) VALUES (?,?,?,?,?,?)`,
+      ).run(symbol, resolution, range.fromTs, range.toTs, n, "rejected_bars");
+      zeroAttempts.delete(pk);
+      console.log(`[gap-audit] ${symbol}:${resolution} [${range.fromTs}..${range.toTs}] answered ${n}x without closing — marked unfillable (rejected_bars)`);
+    }
     // Refresh stored bounds after a productive fill.
     upsertSyncState(symbol, resolution);
   }
