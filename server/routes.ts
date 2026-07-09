@@ -13,7 +13,7 @@ import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
 import { reconnectMWStudies } from "./live-bars";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus, broadcast } from "./live-bars";
-import { getCompleteness } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting
+import { getCompleteness, requestFullResync } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting + full-history reconcile
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, deepBackReadAll, reparseAllZones } from "./discord-reader";
 import { tradeSettings, pushTokens, getCurrentTrade, setCurrentTrade, clearCurrentTrade } from "./trade-state";
@@ -1108,6 +1108,40 @@ export async function registerRoutes(
         .map(b => ({ time: b.timeSec, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, rth: isRTH(b.timeSec) })))));
     }
 
+    // MW-RECONCILE: the timestamp (epoch sec) at/after which this (SYM:RES) is MW-authoritative.
+    // sync_state.earliest_ts is the provider's proven earliest bar; every stored bar at/after it
+    // came from MW's getBars backfill (validated + validateBar-guarded on ingest) and has already
+    // been reconcile-deleted against MW. Those bars must be served AS-IS — the heavy heuristic
+    // filters (dropWickSpikes/dropIsolatedSpikes/dropCompletedGhostBars) were built for the OLD
+    // untrusted stitched pipeline and risk dropping thin-but-real overnight MW bars. We keep only
+    // the malformed-guard (isSpikeBar) + always-closed (isMarketClosed) + flat/off-grid guards on
+    // MW-covered bars; older-than-coverage bars keep the FULL chain (they predate MW authority).
+    function mwCoverageTs(res: string): number {
+      try {
+        const r = db.$client.prepare(
+          `SELECT earliest_ts FROM sync_state WHERE symbol=? AND resolution=?`,
+        ).get(sym, res) as { earliest_ts: number | null } | undefined;
+        return r?.earliest_ts ?? Infinity; // no sync_state → treat nothing as MW-covered (full filter)
+      } catch { return Infinity; }
+    }
+
+    /**
+     * Apply the serve-time filter chain with MW-coverage gating. Bars whose timestamp is
+     * >= coverTs bypass the heavy heuristic filters (serve every MW bar); older bars get the
+     * full chain. Runs the heavy filters ONLY over the older subset, then merges (time order).
+     */
+    function serveFilter<T extends { time: number; open: number; high: number; low: number; close: number; volume: number | null }>(
+      mapped: T[], coverTs: number,
+    ): T[] {
+      const covered: T[] = [], older: T[] = [];
+      for (const b of mapped) (b.time >= coverTs ? covered : older).push(b);
+      const olderClean = dropWickSpikes(dropIsolatedSpikes(dropCompletedGhostBars(older)));
+      if (covered.length === 0) return olderClean;
+      const merged = olderClean.concat(covered);
+      merged.sort((a, b) => a.time - b.time);
+      return merged;
+    }
+
     try {
       // For 15m: try "15" first, fall back to "5"
       const resolutionsToTry = interval === "15m" ? ["15", "5"] : [resolution];
@@ -1132,14 +1166,18 @@ export async function registerRoutes(
         // at odd seconds are foreign-source artifacts — typically a zero-range / volume-0 single
         // print that renders as a "no-body dash" candle. Drop anything off the bucket grid.
         const resSec = (parseInt(usedRes, 10) || 5) * 60;
+        // MW-RECONCILE: gate the heavy heuristic filters behind MW coverage — bars newer than the
+        // provider's earliest bar are MW-authoritative and served as-is (only cheap malformed/
+        // closed/flat/off-grid guards apply); older bars keep the full heuristic chain.
         // dropWickSpikes runs BEFORE any 15m aggregation so a glitchy 5m wick can't corrupt the
         // aggregated 15m high/low.
-        let candles = dropWickSpikes(dropIsolatedSpikes(dropCompletedGhostBars(rows
+        const coverTs = mwCoverageTs(usedRes);
+        let candles = serveFilter(rows
           .filter(r => r.timestamp % resSec === 0)
           .filter(r => !(r.high === r.low)) // flat zero-range = no-body "dash" bar (drop regardless of volume — no real MES bar is perfectly flat)
           .filter(r => !isSpikeBar(r.open, r.high, r.low, r.close))
           .filter(r => !isMarketClosed(r.timestamp))
-          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) })))));
+          .map(r => ({ time: r.timestamp, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume, rth: isRTH(r.timestamp) })), coverTs);
 
         // 15m fallback: when native 15m bars are absent and we fell back to 5m rows, the client
         // receives raw 5m bars for a 15m chart request. Its `isAligned` filter would keep ONLY
@@ -2332,6 +2370,59 @@ export async function registerRoutes(
       res.json({ ok: true, cleared: info.changes });
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? "clear failed" });
+    }
+  });
+
+  // MW-RECONCILE: request a one-time FULL-history reconciliation + backfill for (SYM:RES).
+  // Sweeps [provider-earliest .. now] in reconcile-enabled chunks so the whole MW-covered range
+  // is made bar-for-bar identical (phantoms deleted, holes filled) once the study is connected.
+  app.post("/api/data/full-resync/:symbol/:resolution", (req, res) => {
+    try {
+      const symbol = String(req.params.symbol || "").toUpperCase();
+      const resolution = String(req.params.resolution || "").replace("m", "");
+      // Clear retryable no_data so wrongly-marked holes get re-requested during the sweep.
+      db.$client.prepare(
+        `DELETE FROM unfillable_ranges WHERE symbol=? AND resolution=? AND reason='no_data'`,
+      ).run(symbol, resolution);
+      const ranNow = requestFullResync(symbol, resolution);
+      res.json({ ok: true, ranImmediately: ranNow, pending: !ranNow });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "resync failed" });
+    }
+  });
+
+  // MW-RECONCILE: one-time direct cleanup of rows at ALWAYS-closed timestamps (Saturday, Fri>17ET,
+  // Sun<18ET, the 17-18ET daily maintenance halt). No real bar can exist at these times, so this is
+  // safe across ALL history independent of MW retention. Counts + deletes per (SYM:RES). Uses the
+  // SAME isMarketClosed classifier the serving path uses. Pass ?dryRun=1 to only count.
+  app.post("/api/data/purge-closed", (req, res) => {
+    try {
+      const dryRun = String(req.query.dryRun ?? "") === "1";
+      const symbols = ["MES", "ES"];
+      const resolutions = ["1", "5", "15", "60"];
+      const report: Array<{ symbol: string; resolution: string; closed: number; deleted: number }> = [];
+      const delStmt = db.$client.prepare(
+        `DELETE FROM cached_candles WHERE symbol=? AND resolution=? AND timestamp=?`,
+      );
+      for (const symbol of symbols) {
+        for (const resolution of resolutions) {
+          const all = db.$client.prepare(
+            `SELECT timestamp FROM cached_candles WHERE symbol=? AND resolution=?`,
+          ).all(symbol, resolution) as { timestamp: number }[];
+          const closed = all.filter(r => isMarketClosed(r.timestamp)).map(r => r.timestamp);
+          if (closed.length === 0) continue;
+          let deleted = 0;
+          if (!dryRun) {
+            const tx = db.$client.transaction((ts: number[]) => { for (const t of ts) deleted += delStmt.run(symbol, resolution, t).changes; });
+            tx(closed);
+            console.log(`[routes] purge-closed ${symbol}:${resolution} deleted ${deleted} always-closed rows`);
+          }
+          report.push({ symbol, resolution, closed: closed.length, deleted });
+        }
+      }
+      res.json({ ok: true, dryRun, report });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "purge failed" });
     }
   });
 

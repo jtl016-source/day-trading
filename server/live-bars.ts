@@ -20,7 +20,7 @@ import { cacheInvalidate } from "./cache";
 // MW-SYNC (v2): server-driven getBars backfill. gap-audit drives per-(SYM:RES) backfill
 // requests on study `hello`; roll-heal reconciles continuous-contract roll re-adjustments
 // against the overlap before v2 backfill bars overwrite existing rows.
-import { onStudyConnected, onStudyDisconnected, onBackfillDone } from "./gap-audit";
+import { onStudyConnected, onStudyDisconnected, onBackfillDone, recordBackfillBars } from "./gap-audit";
 import { detectAndHeal } from "./roll-heal";
 
 // Pre-load the footprint engine once at startup so footprint_bar messages
@@ -381,6 +381,13 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
             ...b,
             t: b.t > 10_000_000_000 ? Math.floor(b.t / 1000) : b.t,
           }));
+
+          // MW-RECONCILE: record the timestamps MW RETURNED for this backfill id (v2 only),
+          // BEFORE validation/body-anomaly drops any. gap-audit's onBackfillDone reconcile-
+          // deletes rows in the requested range MW did NOT return; recording the raw returned
+          // set (not the validated subset) guarantees a real MW bar our guard happens to reject
+          // is never treated as a phantom and deleted.
+          if (isV2 && id) recordBackfillBars(id, normalizedBars.map(b => b.t));
 
           // CATCH-UP CANDLE FIX: validate every bar before persisting.
           // Reject bars that are not interval-aligned or have corrupt OHLCV.

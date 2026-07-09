@@ -62,7 +62,7 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 const intervalSec = (resolution: string) => Math.max(1, parseInt(resolution, 10)) * 60;
 const key = (symbol: string, resolution: string) => `${symbol}:${resolution}`;
 
-interface Range { fromTs: number; toTs: number; deep?: boolean }
+interface Range { fromTs: number; toTs: number; deep?: boolean; reconcile?: boolean }
 
 // ── Audit ───────────────────────────────────────────────────────────────────
 export function auditGaps(symbol: string, resolution: string): Range[] {
@@ -136,6 +136,24 @@ const inflightById = new Map<string, StudySync>();  // backfill id → owning st
 const zeroAttempts = new Map<string, number>();     // "SYM:RES:from:to" → count of empty responses
 let idCounter = 0;
 
+// MW-RECONCILE: per in-flight backfill id, the set of bar timestamps (epoch seconds) MW
+// actually RETURNED. live-bars feeds these via recordBackfillBars as bulk_bars arrive.
+// We record what MW SENT (pre-validation), never the validated subset — so a real MW bar
+// our validator happens to reject can never be reconcile-deleted as a "phantom".
+const returnedByBackfill = new Map<string, Set<number>>();
+
+/**
+ * MW-RECONCILE: called by live-bars when a v2 bulk_bars batch tagged with `id` arrives.
+ * Accumulates the timestamps MW returned for that backfill so onBackfillDone can delete
+ * our rows in the requested range that MW did NOT return.
+ */
+export function recordBackfillBars(id: string, timestampsSec: number[]): void {
+  if (!id || timestampsSec.length === 0) return;
+  let set = returnedByBackfill.get(id);
+  if (!set) { set = new Set<number>(); returnedByBackfill.set(id, set); }
+  for (const t of timestampsSec) set.add(t);
+}
+
 function upsertSyncState(symbol: string, resolution: string): boolean {
   const existing = db.$client.prepare(
     `SELECT symbol FROM sync_state WHERE symbol=? AND resolution=?`,
@@ -201,7 +219,63 @@ export function onStudyConnected(symbol: string, resolution: string, ws: WebSock
     study.queue.unshift({ fromTs: 0, toTs: cap, deep: true });
   }
 
+  // MW-RECONCILE: if a full-history resync was requested for this (SYM:RES) while its study
+  // was offline, run it now that the study is connected (reconciliation makes the whole
+  // MW-covered range bar-for-bar identical: phantoms deleted, holes filled).
+  if (forceResyncPending.delete(k)) enqueueFullResync(study);
+
   dispatchNext(study);
+}
+
+// MW-RECONCILE: (SYM:RES) marked for a one-time full-coverage resync on next `hello`.
+const forceResyncPending = new Set<string>();
+
+/**
+ * MW-RECONCILE: build a chunked, reconcile-enabled sweep over the WHOLE MW-covered range
+ * ([provider-earliest .. now]) and prepend it to the study's queue. Unlike the normal
+ * gap audit (which requests only MISSING session-open runs and therefore skips over
+ * closed-period phantoms), this walks the entire covered span so every chunk MW answers
+ * (count>0) reconcile-deletes the phantom rows MW omits inside it — including the
+ * closed-session "floating candles" between real bars. Chunked to MAX_RANGE_BARS.
+ */
+function enqueueFullResync(study: StudySync) {
+  const step = intervalSec(study.resolution);
+  const sr = db.$client.prepare(
+    `SELECT earliest_ts FROM sync_state WHERE symbol=? AND resolution=?`,
+  ).get(study.symbol, study.resolution) as { earliest_ts: number | null } | undefined;
+  const stored = db.$client.prepare(
+    `SELECT MIN(timestamp) AS mn FROM cached_candles WHERE symbol=? AND resolution=?`,
+  ).get(study.symbol, study.resolution) as { mn: number | null };
+  // Start at the provider cap if known, else our earliest stored bar (older is unfillable anyway).
+  let start = sr?.earliest_ts ?? stored.mn ?? (nowSec() - 30 * 86400);
+  start = Math.floor(start / step) * step;
+  const end = Math.floor(nowSec() / step) * step;
+  if (end <= start) return;
+
+  const sweep: Range[] = [];
+  for (let s = start; s <= end; s += step * MAX_RANGE_BARS) {
+    sweep.push({ fromTs: s, toTs: Math.min(end, s + step * (MAX_RANGE_BARS - 1)), reconcile: true });
+  }
+  // Prepend so the reconciliation sweep runs ahead of the normal (post-audit) gap fills.
+  study.queue.unshift(...sweep);
+  console.log(`[gap-audit] FULL-RESYNC ${study.symbol}:${study.resolution} → ${sweep.length} reconcile chunks [${start}..${end}]`);
+}
+
+/**
+ * MW-RECONCILE: request a one-time full-history reconciliation + backfill for (SYM:RES).
+ * If the study is connected now, sweep immediately; otherwise remember it and sweep on the
+ * study's next `hello`. Returns whether it ran immediately.
+ */
+export function requestFullResync(symbol: string, resolution: string): boolean {
+  const k = key(symbol, resolution);
+  const study = studies.get(k);
+  if (study && study.ws.readyState === WebSocket.OPEN) {
+    enqueueFullResync(study);
+    dispatchNext(study);
+    return true;
+  }
+  forceResyncPending.add(k);
+  return false;
 }
 
 /** Called by live-bars on socket close. */
@@ -214,6 +288,69 @@ export function onStudyDisconnected(ws: WebSocket) {
   }
 }
 
+/**
+ * MW-RECONCILE: after MW answers a backfill for [a..b] on SYM:RES, DELETE our cached_candles
+ * rows in [a..b] whose timestamp MW did NOT return — those are phantom bars (closed-period
+ * "floating candles", identical-wick clusters) the pure-upsert backfill overwrote-but-never-
+ * removed. MW's getBars is authoritative, so any timestamp inside a range MW answered for
+ * which MW has no bar cannot be a real bar.
+ *
+ * SAFETY RULE (why this can never wipe real data):
+ *   Reconcile ONLY when we can PROVE MW's answer is authoritative, and ONLY within the span MW
+ *   actually returned — never the raw requested range. Concretely:
+ *     (1) count > 0 — MW returned real bars, proving its chart is active and serving bars. But
+ *         we clamp the deletion window to [min(returned)..max(returned)] (the span MW genuinely
+ *         covered) and delete only timestamps INSIDE it that MW omitted. This defends against
+ *         the study's `source:"chart"` degrade path (LiveBarRelay serviceBackfill step 2): when
+ *         getBars returns nothing it falls back to the chart-loaded DataSeries slice, which may
+ *         cover only PART of the requested range — clamping to the returned span means we never
+ *         delete real DB bars outside what MW could actually see.
+ *     (2) count === 0 — a 0-bar answer means "chart inactive / getBars unavailable" (MW studies
+ *         only compute on an active, ticking chart), which is indistinguishable from a real
+ *         closure without extra proof. We DO NOT reconcile a 0-bar range at all: with no returned
+ *         bars there is no proven-covered span to clean, and treating the whole range as "MW has
+ *         nothing here" could wipe a genuine overnight session an idle chart simply couldn't serve.
+ *         (Always-closed phantoms are handled separately by the isMarketClosed direct cleanup.)
+ *   The deep [0..cap] probe range is NEVER reconciled (it spans pre-history / provider cap).
+ * Returns the number of rows deleted (logged by the caller).
+ */
+function reconcileRange(
+  id: string,
+  symbol: string,
+  resolution: string,
+  range: Range,
+  count: number,
+): number {
+  if (range.deep) return 0;
+  if (count <= 0) return 0; // safety rule (2): never reconcile a 0-bar (possibly-inactive) answer
+  const returned = returnedByBackfill.get(id);
+  if (!returned || returned.size === 0) return 0; // count>0 but no timestamps recorded — bail safe
+
+  // Clamp the deletion window to the span MW ACTUALLY returned (safety rule (1)).
+  let lo = Infinity, hi = -Infinity;
+  for (const t of returned) { if (t < lo) lo = t; if (t > hi) hi = t; }
+  // Intersect the returned span with the requested range so we never reach outside either.
+  const from = Math.max(range.fromTs, lo);
+  const to   = Math.min(range.toTs, hi);
+  if (to < from) return 0;
+
+  // Delete rows in the proven-covered span MW did not return. onConflictDoUpdate already healed
+  // the ones it DID return; this removes the leftover phantoms at timestamps MW has no bar for.
+  const rows = db.$client.prepare(
+    `SELECT timestamp FROM cached_candles WHERE symbol=? AND resolution=? AND timestamp>=? AND timestamp<=?`,
+  ).all(symbol, resolution, from, to) as { timestamp: number }[];
+  const toDelete: number[] = [];
+  for (const r of rows) if (!returned.has(r.timestamp)) toDelete.push(r.timestamp);
+  if (toDelete.length === 0) return 0;
+
+  const del = db.$client.prepare(
+    `DELETE FROM cached_candles WHERE symbol=? AND resolution=? AND timestamp=?`,
+  );
+  const tx = db.$client.transaction((ts: number[]) => { for (const t of ts) del.run(symbol, resolution, t); });
+  tx(toDelete);
+  return toDelete.length;
+}
+
 /** Called by live-bars on `backfill_done` (and after a final:true bulk batch). */
 export function onBackfillDone(
   id: string,
@@ -222,13 +359,25 @@ export function onBackfillDone(
   _source: string,
 ) {
   const study = inflightById.get(id);
-  if (!study) return;
+  if (!study) { returnedByBackfill.delete(id); return; }
   const range = study.inflight?.range;
   inflightById.delete(id);
   study.inflight = undefined;
-  if (!range) { dispatchNext(study); return; }
+  if (!range) { returnedByBackfill.delete(id); dispatchNext(study); return; }
 
   const { symbol, resolution } = study;
+
+  // MW-RECONCILE: remove phantom rows MW did not return within the span it actually covered.
+  try {
+    const deleted = reconcileRange(id, symbol, resolution, range, count);
+    if (deleted > 0) {
+      console.log(`[gap-audit] RECONCILE ${symbol}:${resolution} deleted ${deleted} phantom rows within MW-returned span of [${range.fromTs}..${range.toTs}] (${new Date(range.fromTs * 1000).toISOString()}..${new Date(range.toTs * 1000).toISOString()}) — MW returned ${count} bars`);
+    }
+  } catch (e: any) {
+    console.error(`[gap-audit] RECONCILE ${symbol}:${resolution} failed for [${range.fromTs}..${range.toTs}]: ${e?.message}`);
+  } finally {
+    returnedByBackfill.delete(id);
+  }
 
   if (range.deep) {
     if (earliestAvailableMs > 0) {
