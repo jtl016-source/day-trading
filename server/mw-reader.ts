@@ -42,6 +42,18 @@ const DEFAULT_TICK_SIZE      = 0.25;
 const MAX_TICK_DEVIATION     = 200;
 const DEFAULT_MAX_TICK_DEVIATION = 200;
 
+// MW-SYNC (v2 architecture change, 2026-07-09): MotiveWave is now the SINGLE SOURCE OF TRUTH
+// for chart candles via the server-driven getBars backfill protocol (see live-bars.ts / gap-audit.ts).
+// The disk-file reconstruction (.bar_data1 bulk load + .tick_data fs.watch/poll → bulkUpsert) was the
+// "phantom factory" behind this week's glitch classes (phantom bars, stale opens, splice corruption,
+// frozen intervals). It is DISABLED here so it no longer WRITES to the DB. What stays live:
+//   - notifyExternalTick (TickRelay WS tick path): provides the live forming bar + provisional
+//     completed bars that MW's authoritative backfill later overwrites via onConflictDoUpdate.
+//   - setMWBroadcast / setTickRelayConnected / getMemBars / getLatestBar* exports (routes.ts fallback).
+// One-line revertible: flip to true to restore disk ingestion. getMemBars may return empty/stale after
+// this demotion (acceptable per the plan) but must never throw.
+const DISK_INGEST_ENABLED = false;
+
 // TODO: make configurable for distribution (e.g. via MW_DATA_ROOT env var)
 const MW_DATA_ROOT = process.env.MW_DATA_ROOT ?? path.join(
   process.env.USERPROFILE ?? "C:\\Users\\jacks",
@@ -587,6 +599,10 @@ function applyTick(symbol: string, price: number) {
  * Reads only the last 45 bytes of the active tick file — sub-millisecond.
  */
 function onTickFileChange(symbol: string, instrDir: string, changedFilename: string | null) {
+  // MW-SYNC: disk tick reconstruction is disabled — live prices come from the TickRelay WS
+  // (notifyExternalTick) and history from MW's server-driven backfill. This path used to feed
+  // applyTick → bulkUpsert, writing provisional/phantom bars from stale disk bytes.
+  if (!DISK_INGEST_ENABLED) return;
   // TickRelay WebSocket is active — its prices are authoritative; skip disk reads.
   if (tickRelayConnected) return;
   const sym0 = symbol.toUpperCase();
@@ -1178,13 +1194,17 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         console.log(`[mw-reader] No contract dirs found for ${symbol} (pattern ${dirPattern})`);
       }
 
-      // Initial load from ALL contract dirs (merges history across expirations)
-      if (allContractDirs.length) {
+      // Initial load from ALL contract dirs (merges history across expirations).
+      // MW-SYNC: DISABLED — this .bar_data1 disk bulk load was the phantom factory. MW's
+      // server-driven backfill (gap-audit → bulk_bars) is now the authoritative history source.
+      if (DISK_INGEST_ENABLED && allContractDirs.length) {
         try {
           await loadMultiDir(symbol, allContractDirs);
         } catch (err: any) {
           console.error(`[mw-reader] Initial load failed for ${symbol}:`, err.message);
         }
+      } else if (allContractDirs.length) {
+        console.log(`[mw-reader] disk bulk load SKIPPED for ${symbol} (DISK_INGEST_ENABLED=false; MW backfill is authoritative)`);
       }
 
       const dirExists = fs.existsSync(instrDir);
@@ -1284,14 +1304,18 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         }
       }
 
-      // Bar-file polling (1 s) — updates completed 5-min/60-min bars in DB
-      setInterval(async () => {
-        try {
-          await pollChanged(symbol, instrDir);
-        } catch (err: any) {
-          console.error(`[mw-reader] Poll error for ${symbol}:`, err.message);
-        }
-      }, POLL_INTERVAL_MS);
+      // Bar-file polling (1 s) — updates completed 5-min/60-min bars in DB.
+      // MW-SYNC: DISABLED — this disk bar-file poll wrote provisional/phantom bars into the DB.
+      // MW's authoritative bulk_bars backfill supersedes it.
+      if (DISK_INGEST_ENABLED) {
+        setInterval(async () => {
+          try {
+            await pollChanged(symbol, instrDir);
+          } catch (err: any) {
+            console.error(`[mw-reader] Poll error for ${symbol}:`, err.message);
+          }
+        }, POLL_INTERVAL_MS);
+      }
 
       // fs.watch — OS-level notification, fires within milliseconds of MW writing a tick
       try {
@@ -1349,13 +1373,18 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
       // 1s bar-state heartbeat — updates in-progress OHLCV bars and broadcasts them.
       // 1s cadence matches notifyExternalTick's forming-bar throttle so disk mode and
       // TickRelay mode behave consistently for the React signal-computation chain.
-      setInterval(() => {
-        const sym = symbol.toUpperCase();
-        const p   = lastTickPrice.get(sym);
-        if (p === undefined) return;
-        if (Date.now() - (lastExternalTickMs.get(sym) ?? 0) < 5_000) return;
-        try { applyTick(sym, p); } catch { /* silent */ }
-      }, 1_000);
+      // MW-SYNC: DISABLED — applyTick synthesizes bars from the last disk price and writes them
+      // via bulkUpsert when the feed goes quiet (a phantom-bar source). Live bars now come from
+      // notifyExternalTick (TickRelay WS) and history from MW backfill.
+      if (DISK_INGEST_ENABLED) {
+        setInterval(() => {
+          const sym = symbol.toUpperCase();
+          const p   = lastTickPrice.get(sym);
+          if (p === undefined) return;
+          if (Date.now() - (lastExternalTickMs.get(sym) ?? 0) < 5_000) return;
+          try { applyTick(sym, p); } catch { /* silent */ }
+        }, 1_000);
+      }
     }
 
     // Feed staleness monitor — checks every 15 s and broadcasts status changes.

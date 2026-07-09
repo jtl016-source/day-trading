@@ -186,6 +186,38 @@ export const tradeJournal = sqliteTable("trade_journal", {
   createdAt:    text("created_at").default(sql`(datetime('now'))`),
 });
 
+// MW-SYNC: per (symbol, resolution) sync bookkeeping for the server-driven backfill protocol
+export const syncState = sqliteTable("sync_state", {
+  symbol:      text("symbol").notNull(),
+  resolution:  text("resolution").notNull(),
+  earliestTs:  integer("earliest_ts"),
+  latestTs:    integer("latest_ts"),
+  lastAuditTs: integer("last_audit_ts"),
+}, (t) => [
+  uniqueIndex("sync_state_sym_res").on(t.symbol, t.resolution),
+]);
+
+// MW-SYNC: ranges the provider could not fill (deep-history cap, no-data) — skipped by the auditor
+export const unfillableRanges = sqliteTable("unfillable_ranges", {
+  id:         integer("id").primaryKey({ autoIncrement: true }),
+  symbol:     text("symbol").notNull(),
+  resolution: text("resolution").notNull(),
+  fromTs:     integer("from_ts").notNull(),
+  toTs:       integer("to_ts").notNull(),
+  attempts:   integer("attempts").notNull().default(0),
+  reason:     text("reason"),
+});
+
+// MW-SYNC: audit log of continuous-contract roll re-adjustments detected by roll-heal
+export const adjustmentLog = sqliteTable("adjustment_log", {
+  id:         integer("id").primaryKey({ autoIncrement: true }),
+  symbol:     text("symbol").notNull(),
+  resolution: text("resolution").notNull(),
+  detectedAt: integer("detected_at").notNull(),
+  delta:      real("delta").notNull(),
+  pivotTs:    integer("pivot_ts").notNull(),
+});
+
 // FOOTPRINT-STRATEGY: durable per-candle footprint store. The footprint engine builds bid/ask
 // ladders in RAM (capped, lost on restart); this table persists each finalized + forming candle
 // as a JSON blob so past sessions survive restarts and the 50-candle in-memory cap.

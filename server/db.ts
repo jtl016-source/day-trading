@@ -229,6 +229,38 @@ sqlite.exec(`
   );
 `); // FOOTPRINT-STRATEGY:
 
+// MW-SYNC: server-driven backfill bookkeeping tables (additive, idempotent — never drops data).
+// sync_state tracks the earliest/latest bar per (symbol, resolution) and the deep-history cap;
+// unfillable_ranges remembers ranges MW cannot supply so the auditor stops re-requesting them;
+// adjustment_log records continuous-contract roll re-adjustments applied by roll-heal.
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS sync_state (
+    symbol        TEXT NOT NULL,
+    resolution    TEXT NOT NULL,
+    earliest_ts   INTEGER,
+    latest_ts     INTEGER,
+    last_audit_ts INTEGER,
+    PRIMARY KEY (symbol, resolution)
+  );
+  CREATE TABLE IF NOT EXISTS unfillable_ranges (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    from_ts    INTEGER NOT NULL,
+    to_ts      INTEGER NOT NULL,
+    attempts   INTEGER DEFAULT 0,
+    reason     TEXT
+  );
+  CREATE TABLE IF NOT EXISTS adjustment_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT NOT NULL,
+    resolution  TEXT NOT NULL,
+    detected_at INTEGER NOT NULL,
+    delta       REAL NOT NULL,
+    pivot_ts    INTEGER NOT NULL
+  );
+`); // MW-SYNC:
+
 // STORAGE FIX: Do NOT wipe cached_candles on startup.
 // MW's persistBulk/persistBar use onConflictDoUpdate — they overwrite individual rows when
 // MW re-syncs, so historical Polygon-downloaded data is never lost across server restarts.

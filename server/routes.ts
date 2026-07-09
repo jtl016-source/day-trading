@@ -13,6 +13,7 @@ import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
 import { reconnectMWStudies } from "./live-bars";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus, broadcast } from "./live-bars";
+import { getCompleteness } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, deepBackReadAll, reparseAllZones } from "./discord-reader";
 import { tradeSettings, pushTokens, getCurrentTrade, setCurrentTrade, clearCurrentTrade } from "./trade-state";
@@ -2306,6 +2307,32 @@ export async function registerRoutes(
 
   app.get("/api/mw/sync-status", (_req, res) => {
     res.json(getMWSyncStatus());
+  });
+
+  // MW-SYNC (v2): per (symbol, resolution) backfill completeness — stored vs expected bars + gaps.
+  app.get("/api/data/gaps/:symbol/:resolution", (req, res) => {
+    try {
+      const symbol = String(req.params.symbol || "").toUpperCase();
+      const resolution = String(req.params.resolution || "").replace("m", "");
+      if (!symbol || !resolution) { res.status(400).json({ error: "symbol/resolution required" }); return; }
+      res.json(getCompleteness(symbol, resolution));
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "gap audit failed" });
+    }
+  });
+
+  // MW-SYNC (v2): clear retryable unfillable ranges (e.g. transient no-data) so the auditor re-asks.
+  app.delete("/api/data/unfillable/:symbol/:resolution", (req, res) => {
+    try {
+      const symbol = String(req.params.symbol || "").toUpperCase();
+      const resolution = String(req.params.resolution || "").replace("m", "");
+      const info = db.$client.prepare(
+        `DELETE FROM unfillable_ranges WHERE symbol = ? AND resolution = ? AND reason = 'no_data'`
+      ).run(symbol, resolution);
+      res.json({ ok: true, cleared: info.changes });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "clear failed" });
+    }
   });
 
   // GET /api/trade/settings — current auto-trade config

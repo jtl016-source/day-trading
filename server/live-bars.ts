@@ -17,6 +17,11 @@ import { normalizeSymbol } from "@shared/symbol";
 import { isSaneBarTime, validateBar } from "@shared/bar-time";
 import { setMWBroadcast, notifyExternalTick, setTickRelayConnected } from "./mw-reader";
 import { cacheInvalidate } from "./cache";
+// MW-SYNC (v2): server-driven getBars backfill. gap-audit drives per-(SYM:RES) backfill
+// requests on study `hello`; roll-heal reconciles continuous-contract roll re-adjustments
+// against the overlap before v2 backfill bars overwrite existing rows.
+import { onStudyConnected, onStudyDisconnected, onBackfillDone } from "./gap-audit";
+import { detectAndHeal } from "./roll-heal";
 
 // Pre-load the footprint engine once at startup so footprint_bar messages
 // don't trigger module resolution on every received bar.
@@ -80,6 +85,11 @@ const lastDumpMaxTs = new Map<string, number>();
 
 // Throttle "bar without resolution" warnings — the study emits a forming bar every tick.
 const noResWarnAt = new Map<string, number>();
+
+// MW-SYNC (v2): upgraded LiveBarRelay studies that completed the `hello` handshake.
+// Keyed by "SYM:RES" — one study instance per MW chart (1m/5m/15m/60m). The gap-audit
+// dispatcher sends backfill requests through each study's socket; cleaned up on close.
+const studySockets = new Map<string, WebSocket>();
 
 export function getMWSyncStatus() {
   return { status: mwSyncStatus, symbol: mwSyncSymbol, barsReceived: mwSyncBarsReceived, startedAt: mwSyncStartedAt };
@@ -208,6 +218,12 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
     console.log("[mw-feed] MotiveWave study connected");
     setTickRelayConnected(true);
 
+    // MW-SYNC (v2): per-connection handshake state. `registeredKeys` tracks the SYM:RES
+    // entries this socket owns so they can be unregistered on close. (The current `bar`
+    // handler already requires an explicit resolution from both relays, so no separate
+    // helloSeen gate is needed here — untagged bars are handled by that path.)
+    const registeredKeys = new Set<string>();
+
     let mwIsAlive = true;
     ws.on("pong", () => { mwIsAlive = true; });
     const mwPingInterval = setInterval(() => {
@@ -237,6 +253,30 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           broadcast({ type: "tick", symbol, price, time: time ?? Date.now() });
           // Keep mw-reader's internal bar state in sync and suppress its disk heartbeat
           notifyExternalTick(symbol, price);
+
+        } else if (msg.type === "hello") {
+          // MW-SYNC (v2): handshake — register the study socket for this (SYM:RES) and
+          // kick a gap audit that drives server → study `backfill` requests.
+          const hm = msg as any;
+          const sym = normalizeSymbol(hm.symbol ?? "");
+          const res = String(hm.resolution ?? "").replace("m", "");
+          if (!sym || !res) return;
+          const k = `${sym}:${res}`;
+          registeredKeys.add(k);
+          studySockets.set(k, ws);
+          console.log(`[mw-feed] hello ${k} ver=${hm.ver ?? "?"} series=[${hm.seriesStartMs ?? "?"}..${hm.seriesEndMs ?? "?"}]`);
+          onStudyConnected(sym, res, ws);
+
+        } else if (msg.type === "backfill_done") {
+          // MW-SYNC (v2): study finished servicing a backfill request. Advances the
+          // gap-audit dispatcher (records provider cap / no-data, dispatches next range).
+          const bd = msg as any;
+          const id = bd.id as string | undefined;
+          if (!id) return;
+          const count = Number(bd.count) || 0;
+          const earliestAvailableMs = Number(bd.earliestAvailableMs) || 0;
+          const source = typeof bd.source === "string" ? bd.source : "feed";
+          onBackfillDone(id, count, earliestAvailableMs, source);
 
         } else if (msg.type === "bar") {
           const bar = msg as LiveBar;
@@ -294,21 +334,30 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           } // FOOTPRINT-STRATEGY:
 
         } else if (msg.type === "bulk_bars") {
-          // History dump from LiveBarRelay — batch upsert into cached_candles
+          // History dump / backfill batch from LiveBarRelay — batch upsert into cached_candles.
+          // v2 batches carry id/seq (server-requested backfill); legacy v1 dumps (no id) still
+          // flow through the same path but keep the re-dump high-water guard.
           const bulk = msg as any;
           const sym  = normalizeSymbol(bulk.symbol) || undefined;
           const rawRes = (bulk.resolution as string | undefined) ?? "1";
           const res = rawRes.replace("m", "");
+          const id  = typeof bulk.id === "string" && bulk.id.length > 0 ? bulk.id as string : undefined;
+          const seq = typeof bulk.seq === "number" ? bulk.seq : 0;
+          const isV2 = id !== undefined; // v2 server-driven backfill (authoritative, heals old rows)
           const bars = bulk.bars as Array<{ t: number; o: number; h: number; l: number; c: number; v: number }> | undefined;
-          if (!sym || !Array.isArray(bars) || bars.length === 0) return;
+          if (!sym || !Array.isArray(bars) || bars.length === 0) {
+            // Still ack an empty v2 batch so the study's seq accounting stays consistent.
+            if (id) { try { ws.send(JSON.stringify({ type: "bulk_report", id, seq, accepted: 0, rejected: 0 })); } catch {} }
+            return;
+          }
 
           // ── Fast re-dump rejection (BEFORE expensive validation) ─────────────────────
-          // The study re-dumps its full history constantly. Compute the batch's newest
-          // timestamp cheaply; if we already have everything up to it, drop the batch
-          // immediately — no normalization, no per-bar spike/anomaly filtering, no DB write.
-          // This keeps the event loop free for HTTP requests (chart loads). The high-water
-          // mark is seeded lazily from the DB so even the first post-restart dump is skipped.
-          {
+          // The study re-dumps its full history constantly (LEGACY v1 path only). Compute the
+          // batch's newest timestamp cheaply; if we already have everything up to it, drop the
+          // batch immediately. SKIPPED for v2: gap-audit only requests ranges the DB is MISSING,
+          // and v2 bars are authoritative — they must overwrite existing rows to heal history to
+          // MW-identical values, so an "older than watermark" v2 bar must NOT be dropped here.
+          if (!isV2) {
             const dumpKey = `${sym}:${res}`;
             if (!lastDumpMaxTs.has(dumpKey)) {
               let dbMax = 0;
@@ -377,36 +426,61 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           const bodySkipped = sortedBatch.length - cleanBars.length;
           if (bodySkipped > 0) console.log(`[mw-feed] bulk_bars: rejected ${bodySkipped} body-anomaly bars for ${sym} res=${res}`);
 
+          // MW-SYNC (v2): counted-reject reply so the study/server can track batch health.
+          // accepted = bars that survived validation + body-anomaly; rejected = everything else.
+          if (id) {
+            const accepted = cleanBars.length;
+            const rejected = bars.length - accepted;
+            try { ws.send(JSON.stringify({ type: "bulk_report", id, seq, accepted, rejected })); } catch {}
+          }
+
           // ── Re-dump guard: only persist bars NEWER than the high-water mark ──────────
           // The study re-dumps its full history on every reconnect (constantly). Persist
           // only bars we don't already have, so repeated dumps become near-instant no-ops
           // instead of re-writing 80k rows and starving the event loop. Initialize the
           // high-water mark lazily from the DB so even the first dump after a restart skips
           // already-stored bars (no startup flood).
-          const dumpKey = `${sym}:${res}`;
-          if (!lastDumpMaxTs.has(dumpKey)) {
-            let dbMax = 0;
-            try {
-              const row = db.$client.prepare(
-                `SELECT MAX(timestamp) AS mx FROM cached_candles WHERE symbol = ? AND resolution = ?`
-              ).get(sym, res) as { mx: number | null } | undefined;
-              dbMax = row?.mx ?? 0;
-            } catch { /* DB unavailable — treat as 0 so we persist normally */ }
-            lastDumpMaxTs.set(dumpKey, dbMax);
+          //
+          // SKIPPED for v2: server-driven backfill bars are authoritative and OVERWRITE existing
+          // rows (onConflictDoUpdate) — that is the mechanism that heals history to MW-identical.
+          // gap-audit only requests missing ranges, so there is no re-dump flood to guard against.
+          let toPersist: typeof cleanBars;
+          if (isV2) {
+            toPersist = cleanBars;
+          } else {
+            const dumpKey = `${sym}:${res}`;
+            if (!lastDumpMaxTs.has(dumpKey)) {
+              let dbMax = 0;
+              try {
+                const row = db.$client.prepare(
+                  `SELECT MAX(timestamp) AS mx FROM cached_candles WHERE symbol = ? AND resolution = ?`
+                ).get(sym, res) as { mx: number | null } | undefined;
+                dbMax = row?.mx ?? 0;
+              } catch { /* DB unavailable — treat as 0 so we persist normally */ }
+              lastDumpMaxTs.set(dumpKey, dbMax);
+            }
+            const watermark = lastDumpMaxTs.get(dumpKey) ?? 0;
+            toPersist = cleanBars.filter(b => b.t > watermark);
+            // Advance the high-water mark to the newest bar seen in this batch.
+            const batchMax = cleanBars.reduce((m, b) => (b.t > m ? b.t : m), watermark);
+            if (batchMax > watermark) lastDumpMaxTs.set(dumpKey, batchMax);
           }
-          const watermark = lastDumpMaxTs.get(dumpKey) ?? 0;
-          const newBars = cleanBars.filter(b => b.t > watermark);
-          // Advance the high-water mark to the newest bar seen in this batch.
-          const batchMax = cleanBars.reduce((m, b) => (b.t > m ? b.t : m), watermark);
-          if (batchMax > watermark) lastDumpMaxTs.set(dumpKey, batchMax);
-          if (newBars.length === 0) return; // pure re-dump of known history — skip entirely
+          if (toPersist.length === 0) return; // pure re-dump of known history — skip entirely
 
           // Track sync state
           if (mwSyncStatus === "pending") { mwSyncStatus = "syncing"; mwSyncStartedAt = Date.now(); }
           mwSyncSymbol = sym;
-          mwSyncBarsReceived += newBars.length;
+          mwSyncBarsReceived += toPersist.length;
           broadcast({ type: "mw_sync_progress", symbol: sym, barsReceived: mwSyncBarsReceived });
-          persistBulk(sym, res, newBars)
+
+          // MW-SYNC (v2): heal continuous-contract roll re-adjustments BEFORE upserting the
+          // overlap, so older stored bars are shifted by the roll δ instead of leaving a price
+          // cliff. Legacy v1 dumps skip this (they only append newer bars, never heal old ones).
+          const healThen = isV2
+            ? detectAndHeal(sym, res, toPersist).catch(() => null)
+            : Promise.resolve(null);
+          healThen
+            .then(() => persistBulk(sym, res, toPersist))
             .then(() => {
               mwSyncStatus = "done";
               broadcast({ type: "data_updated", symbol: sym });
@@ -421,6 +495,11 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
 
     ws.on("close", () => {
       clearInterval(mwPingInterval);
+      // MW-SYNC (v2): unregister this study's (SYM:RES) entries and stop its backfills.
+      for (const k of registeredKeys) {
+        if (studySockets.get(k) === ws) studySockets.delete(k);
+      }
+      onStudyDisconnected(ws);
       const remaining = mwWss!.clients.size;
       console.log(`[mw-feed] MotiveWave study disconnected (remaining: ${remaining})`);
       if (remaining === 0) setTickRelayConnected(false);
