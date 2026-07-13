@@ -12,6 +12,7 @@
  */
 import { WebSocket } from "ws";
 import { db } from "./db";
+import { deriveForDeletedOneMin } from "./derive-bars"; // 1M-DERIVE: heal 5m/15m/60m after phantom 1m reconcile-deletes
 
 // ── CME Globex session (ES) ─────────────────────────────────────────────────
 // Open Sun 17:00 CT → Fri 16:00 CT, with a daily 16:00–17:00 CT maintenance break.
@@ -62,10 +63,20 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 const intervalSec = (resolution: string) => Math.max(1, parseInt(resolution, 10)) * 60;
 const key = (symbol: string, resolution: string) => `${symbol}:${resolution}`;
 
+// 1M-DERIVE: for MES the higher resolutions (5m/15m/60m) are now COMPUTED from 1m (see
+// derive-bars.ts) — 1m is the only backfill resolution that needs MW. A native backfill of a
+// derived resolution would re-introduce the mutually-inconsistent per-chart history the 1m
+// derivation exists to replace, so we skip audits/backfills for them. Their hellos are still
+// accepted (harmless) and their sync_state.latest_ts still refreshes. Only MES is derived;
+// ES and contract-keyed symbols keep native backfill on every resolution.
+const isDerivedRes = (symbol: string, resolution: string) => symbol === "MES" && resolution !== "1";
+
 interface Range { fromTs: number; toTs: number; deep?: boolean; reconcile?: boolean }
 
 // ── Audit ───────────────────────────────────────────────────────────────────
 export function auditGaps(symbol: string, resolution: string): Range[] {
+  // 1M-DERIVE: MES 5m/15m/60m are derived from 1m — never request native backfill for them.
+  if (isDerivedRes(symbol, resolution)) return [];
   const step = intervalSec(resolution);
   const stored = db.$client.prepare(
     `SELECT timestamp FROM cached_candles WHERE symbol=? AND resolution=? ORDER BY timestamp ASC`,
@@ -209,9 +220,10 @@ export function onStudyConnected(symbol: string, resolution: string, ws: WebSock
   const firstEver = upsertSyncState(symbol, resolution);
   enqueue(study, auditGaps(symbol, resolution));
 
-  if (firstEver) {
+  if (firstEver && !isDerivedRes(symbol, resolution)) {
     // Deep-history probe: ask for everything before the earliest bar we have so
-    // we learn the provider's history cap (recorded via backfill_done).
+    // we learn the provider's history cap (recorded via backfill_done). Skipped for MES
+    // derived resolutions — their history comes from 1m derivation, not a native probe.
     const earliest = db.$client.prepare(
       `SELECT MIN(timestamp) AS mn FROM cached_candles WHERE symbol=? AND resolution=?`,
     ).get(symbol, resolution) as { mn: number | null };
@@ -223,6 +235,12 @@ export function onStudyConnected(symbol: string, resolution: string, ws: WebSock
   // was offline, run it now that the study is connected (reconciliation makes the whole
   // MW-covered range bar-for-bar identical: phantoms deleted, holes filled).
   if (forceResyncPending.delete(k)) enqueueFullResync(study);
+
+  // 1M-DERIVE phantom-heal: targeted reconcile ranges queued while this study was offline
+  // (e.g. the ~106 15m/60m buckets whose 1m carries residual +60pt phantom prints). Prepend so
+  // MW's authoritative answer overwrites/deletes those 1m prints ahead of the normal gap fills.
+  const pend = reconcilePending.get(k);
+  if (pend && pend.length) { reconcilePending.delete(k); study.queue.unshift(...pend); }
 
   dispatchNext(study);
 }
@@ -275,6 +293,57 @@ export function requestFullResync(symbol: string, resolution: string): boolean {
     return true;
   }
   forceResyncPending.add(k);
+  return false;
+}
+
+// 1M-DERIVE phantom-heal: (SYM:RES) → reconcile ranges to run on the study's next `hello`.
+const reconcilePending = new Map<string, Range[]>();
+
+/**
+ * 1M-DERIVE phantom-heal: normalize a set of raw ranges into grid-aligned, merged,
+ * MAX_RANGE_BARS-chunked reconcile ranges for `resolution`. Merging collapses overlapping /
+ * adjacent phantom buckets so we issue the fewest backfills.
+ */
+function buildReconcileRanges(resolution: string, ranges: { fromTs: number; toTs: number }[]): Range[] {
+  const step = intervalSec(resolution);
+  const aligned = ranges
+    .map(r => ({ fromTs: Math.floor(r.fromTs / step) * step, toTs: Math.floor(r.toTs / step) * step }))
+    .filter(r => r.toTs >= r.fromTs)
+    .sort((a, b) => a.fromTs - b.fromTs);
+  const merged: { fromTs: number; toTs: number }[] = [];
+  for (const r of aligned) {
+    const last = merged[merged.length - 1];
+    if (last && r.fromTs <= last.toTs + step) { if (r.toTs > last.toTs) last.toTs = r.toTs; }
+    else merged.push({ ...r });
+  }
+  const out: Range[] = [];
+  for (const r of merged) {
+    for (let s = r.fromTs; s <= r.toTs; s += step * MAX_RANGE_BARS) {
+      out.push({ fromTs: s, toTs: Math.min(r.toTs, s + step * (MAX_RANGE_BARS - 1)), reconcile: true });
+    }
+  }
+  return out;
+}
+
+/**
+ * 1M-DERIVE phantom-heal: force-enqueue targeted reconcile backfills for (SYM:RES). When MW
+ * answers each range (count>0), onBackfillDone → reconcileRange overwrites/deletes the phantom
+ * rows MW omits, and the derivation hook re-derives the affected higher-TF buckets. Runs
+ * immediately if the study is connected, else on its next `hello`. Returns whether it ran now.
+ */
+export function requestReconcile(symbol: string, resolution: string, ranges: { fromTs: number; toTs: number }[]): boolean {
+  const built = buildReconcileRanges(resolution, ranges);
+  if (built.length === 0) return false;
+  const k = key(symbol, resolution);
+  const study = studies.get(k);
+  if (study && study.ws.readyState === WebSocket.OPEN) {
+    study.queue.unshift(...built);
+    dispatchNext(study);
+    return true;
+  }
+  const pend = reconcilePending.get(k) ?? [];
+  pend.push(...built);
+  reconcilePending.set(k, pend);
   return false;
 }
 
@@ -348,6 +417,20 @@ function reconcileRange(
   );
   const tx = db.$client.transaction((ts: number[]) => { for (const t of ts) del.run(symbol, resolution, t); });
   tx(toDelete);
+
+  // 1M-DERIVE: the reconcile just removed phantom 1m prints — re-derive the 5m/15m/60m buckets
+  // that contained them so the derived rows heal (or, if a bucket lost ALL its 1m bars, its
+  // derived row is deleted too). MES 1m only; other (SYM:RES) deletes don't feed derivation.
+  if (symbol === "MES" && resolution === "1") {
+    try {
+      const { rederived, deleted: derDeleted } = deriveForDeletedOneMin(symbol, toDelete);
+      if (rederived > 0 || derDeleted > 0) {
+        console.log(`[gap-audit] 1M-DERIVE reconcile-heal ${symbol}: re-derived ${rederived} buckets, deleted ${derDeleted} now-empty derived rows`);
+      }
+    } catch (e: any) {
+      console.error(`[gap-audit] 1M-DERIVE reconcile-heal ${symbol} failed: ${e?.message}`);
+    }
+  }
   return toDelete.length;
 }
 

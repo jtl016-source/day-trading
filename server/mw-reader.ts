@@ -25,6 +25,7 @@ import { db } from "./db";
 import { cachedCandles } from "@shared/schema";
 import { normalizeSymbol } from "@shared/symbol";
 import { isSaneBarTime, validateBar } from "@shared/bar-time";
+import { deriveRange } from "./derive-bars"; // 1M-DERIVE: re-derive 5m/15m/60m from 1m on every 1m write
 import { sql } from "drizzle-orm";
 import { type Express }    from "express";
 import { type Server as HttpServer } from "http";
@@ -721,7 +722,13 @@ export function notifyExternalTick(symbol: string, price: number) {
   } else {
     // Completed 1m bar — persist and broadcast
     if (prev1m && prev1m.timeSec > 0 && prev1m.open > 0) {
-      bulkUpsert(sym, "1", [prev1m]).catch(() => {});
+      const completed1mTs = prev1m.timeSec;
+      // 1M-DERIVE: 1m is the single source of truth; recompute the 5m/15m/60m buckets containing
+      // this just-completed 1m bar AFTER it commits. MES only — ES/contract-keyed symbols have
+      // sparse 1m and their native higher-TF rows must not be overwritten by a thin derivation.
+      bulkUpsert(sym, "1", [prev1m])
+        .then(() => { if (sym === "MES") deriveRange(sym, completed1mTs, completed1mTs); })
+        .catch(() => {});
       if (_broadcast) {
         _broadcast({ type: "bar", resolution: "1", bar: { symbol: sym, time: prev1m.timeSec, open: prev1m.open, high: prev1m.high, low: prev1m.low, close: prev1m.close, volume: prev1m.volume, complete: true } });
       }

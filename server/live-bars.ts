@@ -22,6 +22,7 @@ import { cacheInvalidate } from "./cache";
 // against the overlap before v2 backfill bars overwrite existing rows.
 import { onStudyConnected, onStudyDisconnected, onBackfillDone, recordBackfillBars } from "./gap-audit";
 import { detectAndHeal } from "./roll-heal";
+import { deriveRange } from "./derive-bars"; // 1M-DERIVE: re-derive 5m/15m/60m from freshly-backfilled 1m
 
 // Pre-load the footprint engine once at startup so footprint_bar messages
 // don't trigger module resolution on every received bar.
@@ -489,6 +490,14 @@ export function setupLiveBars(httpServer: HttpServer, app: Express) {
           healThen
             .then(() => persistBulk(sym, res, toPersist))
             .then(() => {
+              // 1M-DERIVE: whenever MW backfills 1m bars, re-derive the 5m/15m/60m buckets they
+              // compose (one batched pass over the message's 1m span, not per-bar). MES only —
+              // deriving from ES/contract-keyed sparse 1m would clobber their native higher-TF rows.
+              if (sym === "MES" && res === "1" && toPersist.length > 0) {
+                let lo = Infinity, hi = -Infinity;
+                for (const b of toPersist) { if (b.t < lo) lo = b.t; if (b.t > hi) hi = b.t; }
+                try { deriveRange(sym, lo, hi); } catch (e: any) { console.error("[mw-feed] derive-after-1m-backfill error:", e?.message); }
+              }
               mwSyncStatus = "done";
               broadcast({ type: "data_updated", symbol: sym });
               broadcast({ type: "mw_sync_done", symbol: sym, barsReceived: mwSyncBarsReceived });

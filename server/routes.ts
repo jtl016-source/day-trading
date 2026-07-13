@@ -13,7 +13,8 @@ import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
 import { reconnectMWStudies } from "./live-bars";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus, broadcast } from "./live-bars";
-import { getCompleteness, requestFullResync } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting + full-history reconcile
+import { getCompleteness, requestFullResync, requestReconcile } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting + full-history reconcile + targeted phantom reconcile
+import { deriveRange } from "./derive-bars"; // 1M-DERIVE: on-demand re-derive of 5m/15m/60m from 1m
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, deepBackReadAll, reparseAllZones } from "./discord-reader";
 import { tradeSettings, pushTokens, getCurrentTrade, setCurrentTrade, clearCurrentTrade } from "./trade-state";
@@ -2403,6 +2404,42 @@ export async function registerRoutes(
       res.json({ ok: true, ranImmediately: ranNow, pending: !ranNow });
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? "resync failed" });
+    }
+  });
+
+  // 1M-DERIVE phantom-heal: force targeted reconcile backfills over specific 1m ranges (the ~106
+  // 15m/60m buckets whose 1m carries residual +60pt phantom prints). Body: {ranges:[{fromTs,toTs}]}.
+  // When MW's 1m study answers, reconcileRange overwrites/deletes the phantom prints and the
+  // derivation hook re-derives the affected higher-TF buckets. Epoch SECONDS.
+  app.post("/api/data/reconcile-ranges/:symbol/:resolution", (req, res) => {
+    try {
+      const symbol = String(req.params.symbol || "").toUpperCase();
+      const resolution = String(req.params.resolution || "").replace("m", "");
+      const ranges = Array.isArray(req.body?.ranges) ? req.body.ranges : [];
+      const clean = ranges
+        .map((r: any) => ({ fromTs: Number(r.fromTs), toTs: Number(r.toTs) }))
+        .filter((r: any) => Number.isFinite(r.fromTs) && Number.isFinite(r.toTs) && r.toTs >= r.fromTs);
+      const ranNow = requestReconcile(symbol, resolution, clean);
+      res.json({ ok: true, ranges: clean.length, ranImmediately: ranNow, pending: !ranNow });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "reconcile-ranges failed" });
+    }
+  });
+
+  // 1M-DERIVE: on-demand re-derive of 5m/15m/60m from 1m over [from,to] (epoch seconds). Used to
+  // rebuild derived rows without a full sweep. Body/query: from,to. Defaults to full 1m coverage.
+  app.post("/api/data/derive/:symbol", (req, res) => {
+    try {
+      const symbol = String(req.params.symbol || "").toUpperCase();
+      const bounds = db.$client.prepare(
+        `SELECT MIN(timestamp) AS mn, MAX(timestamp) AS mx FROM cached_candles WHERE symbol=? AND resolution='1'`,
+      ).get(symbol) as { mn: number | null; mx: number | null };
+      const from = Number(req.query.from ?? req.body?.from ?? bounds.mn ?? 0);
+      const to = Number(req.query.to ?? req.body?.to ?? bounds.mx ?? 0);
+      const result = deriveRange(symbol, from, to);
+      res.json({ ok: true, symbol, from, to, result });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "derive failed" });
     }
   });
 
