@@ -2,6 +2,7 @@ import type { Express } from "express";
 import type { Server } from "http";
 import fs from "fs";
 import path from "path";
+import { execFile } from "child_process";
 import Anthropic from "@anthropic-ai/sdk";
 import { cacheGet, cacheSet, cacheInvalidate, cacheFlushAll, TTL } from "./cache";
 import { XMLParser } from "fast-xml-parser";
@@ -2476,6 +2477,45 @@ export async function registerRoutes(
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? "purge failed" });
     }
+  });
+
+  // PROGRAM-BACKUP: mirror the project SOURCE into the user's Desktop backup folder
+  // ("DAY TRADING PC - DO NOT TOUCH\Milks-Yellow-Box-Strategy"). Robocopy /MIR keeps the
+  // destination an exact up-to-date copy on every press of the in-app "Back Up Program"
+  // button. Heavy/rebuildable/runtime items are excluded: node_modules (npm install
+  // restores it), .git (versioned in the main folder + GitHub), the live DB + WAL/SHM and
+  // its multi-GB .backup files (the DB has its own snapshot flow), logs, build output.
+  // /XD-excluded dirs are also left untouched in the DESTINATION, so the old data/ copy
+  // already sitting in the backup folder survives mirroring. Exit codes 0-7 = success
+  // (robocopy uses a bitmask; >=8 is a real failure).
+  app.post("/api/backup/program", (_req, res) => {
+    const src = process.cwd();
+    const dest = process.env.PROGRAM_BACKUP_DIR
+      ?? "C:\\Users\\Jackson\\OneDrive\\Desktop\\DAY TRADING PC - DO NOT TOUCH\\Milks-Yellow-Box-Strategy";
+    const args = [
+      src, dest, "/MIR", "/R:1", "/W:1", "/NFL", "/NDL", "/NP", "/NJH",
+      "/XD", "node_modules", ".git", "data", "dist", "__pycache__", ".expo", ".local", ".vite", "out",
+      "/XF", "*.log", "*.db", "*.db-wal", "*.db-shm", "*.db.backup*", "*.bak", "*.corrupted*",
+    ];
+    execFile("robocopy", args, { windowsHide: true, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+      const code = err && typeof (err as any).code === "number" ? (err as any).code : 0;
+      if (code >= 8) {
+        console.error(`[backup] program backup FAILED (robocopy exit ${code})`);
+        res.status(500).json({ ok: false, code, error: "robocopy failed" });
+        return;
+      }
+      // Robocopy summary: " Files :   copied  skipped ..." — pull the copied count for the toast.
+      let copied: number | null = null;
+      const m = /Files\s*:\s*\d+\s+(\d+)/.exec(stdout ?? "");
+      if (m) copied = parseInt(m[1], 10);
+      try {
+        fs.writeFileSync(path.join(dest, "BACKUP_MANIFEST.txt"),
+          `Program backup of ${src}\nUpdated: ${new Date().toISOString()}\n` +
+          `Restore: copy folder back, then 'npm install' and 'npm run dev'.\n`);
+      } catch { /* manifest is best-effort */ }
+      console.log(`[backup] program mirrored to backup folder (exit ${code}${copied != null ? `, ${copied} files copied` : ""})`);
+      res.json({ ok: true, code, copied, changed: code !== 0 });
+    });
   });
 
   // GET /api/trade/settings — current auto-trade config

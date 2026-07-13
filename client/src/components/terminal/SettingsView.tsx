@@ -19,6 +19,57 @@ type AutoDir = "both" | "long" | "short";
 
 const ALL_INTERVALS = ["1m", "5m", "15m", "60m"] as const;
 
+// PROGRAM-BACKUP: one-press mirror of the project source into the Desktop backup folder
+// ("DAY TRADING PC - DO NOT TOUCH"). The server does the copy (robocopy /MIR) so the same
+// button always refreshes the same folder — press it whenever the program is in a state
+// worth keeping.
+function BackupCard() {
+  const [state, setState] = useState<"idle" | "running" | "ok" | "err">("idle");
+  const [detail, setDetail] = useState("");
+
+  const run = async () => {
+    if (state === "running") return;
+    setState("running");
+    setDetail("");
+    try {
+      const r = await fetch("/api/backup/program", { method: "POST" });
+      const d = await r.json();
+      if (d?.ok) {
+        setState("ok");
+        setDetail(d.changed ? (d.copied != null ? `${d.copied} files updated` : "backup updated") : "already up to date");
+      } else {
+        setState("err");
+        setDetail(d?.error ?? "backup failed");
+      }
+    } catch {
+      setState("err");
+      setDetail("server unreachable");
+    }
+    setTimeout(() => setState("idle"), 6000);
+  };
+
+  const color = state === "ok" ? "#26c87a" : state === "err" ? "#ef4444" : C.accent;
+  return (
+    <Card icon={Ico.sliders()} title="Program Backup">
+      <Row label="Back Up Program" hint="mirrors the program into the Desktop backup folder">
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {detail && <span style={{ fontSize: 11, color }}>{detail}</span>}
+          <button
+            onClick={run}
+            disabled={state === "running"}
+            style={{
+              padding: "6px 16px", borderRadius: 6, border: `1px solid ${color}88`,
+              background: color + "1a", color, fontWeight: 600, fontSize: 12,
+              cursor: state === "running" ? "wait" : "pointer", transition: "all .2s",
+            }}>
+            {state === "running" ? "BACKING UP…" : state === "ok" ? "BACKED UP ✓" : state === "err" ? "FAILED — RETRY" : "BACK UP NOW"}
+          </button>
+        </div>
+      </Row>
+    </Card>
+  );
+}
+
 function AutoTraderCard() {
   const [connected, setConnected] = useState(false);
   const [hasActiveTrade, setHasActiveTrade] = useState(false);
@@ -320,6 +371,7 @@ export function SettingsView({
       </Card>
 
       <AutoTraderCard />
+      <BackupCard />
       <DiscordCard />
     </div>
   );
