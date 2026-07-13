@@ -1066,10 +1066,25 @@ export async function registerRoutes(
     const { symbol, interval } = req.params;
     const sym = normalizeSymbol(symbol);
     const resolution = interval === "60m" ? "60" : interval === "1m" ? "1" : "5";
-    const fromN = req.query.from ? Number(req.query.from) : 0;
+    let fromN = req.query.from ? Number(req.query.from) : 0;
     // Never serve bars dated in the future (corrupt rows) — clamp the upper bound.
     const maxTs = Math.floor(Date.now() / 1000) + 36 * 3600;
     const toN   = Math.min(req.query.to ? Number(req.query.to) : Infinity, maxTs);
+
+    // SERVING BOUND: the MW deep resync grew the store to millions of rows (MES 1m alone is
+    // ~2.4M back to 2019). An unbounded fetch (the client's deep-history load sends no `from`)
+    // would read+filter+JSON-serialize all of them — tens of seconds of blocking CPU on the
+    // single-threaded server, starving EVERY other request (observed: 8.6s for a trivial
+    // endpoint; charts "not loading"). Cap each response to the most recent N bars per
+    // resolution; the caps still cover years of history and the chart windows far less.
+    const SERVE_CAP: Record<string, number> = { "1": 250_000, "5": 500_000, "15": 200_000, "60": 60_000 };
+    const cap = SERVE_CAP[resolution] ?? 250_000;
+    if (!fromN) {
+      const capRow = db.$client.prepare(
+        `SELECT timestamp FROM cached_candles WHERE symbol=? AND resolution=? ORDER BY timestamp DESC LIMIT 1 OFFSET ?`,
+      ).get(sym, resolution, cap - 1) as { timestamp: number } | undefined;
+      if (capRow) fromN = capRow.timestamp; // serve at most the newest `cap` rows
+    }
 
     const cacheKey = `${sym}:continuous:${interval}:${fromN}:${isFinite(toN) ? Math.round(toN / 3600) : "inf"}`;
     const cached = cacheGet<object>(cacheKey);
