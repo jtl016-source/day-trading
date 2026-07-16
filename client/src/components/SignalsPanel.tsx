@@ -4,7 +4,7 @@ import { GraduationCap, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
 import {
   EXIT_STRATEGY_PROFILES as ENGINE_EXIT_PROFILES,
-  detectMilkZones as detectEngineZones,
+  computeYellowBoxZones,
   computeEngineSignalsBothSessions,
 } from "@/lib/signal-engine"; // SHARED-ENGINE: single signal source of truth (matches Backtest page)
 
@@ -211,14 +211,15 @@ type MLZone = { from_ts: number; to_ts: number; top: number; bottom: number; is_
 
 // SHARED-ENGINE: standalone signal computation delegates to the shared engine —
 // the EXACT code path the Backtest page runs — so the Signals tab always shows
-// the SAME EXACT signals as the backtest. Zones are detected from the candles
-// by the engine's detectMilkZones (same zone source as the backtest). Exit
-// levels use the "safe" (Tight) profile — the Backtest page default.
+// the SAME EXACT signals as the backtest. Zones come from the engine's Yellow
+// Box strategy (per-day open-centered box + percentage R/S zones — same zone
+// source as the backtest). Exit levels use the "safe" (Tight) profile — the
+// Backtest page default.
 function computeSignals(candles: CandleBar[]): RawSignal[] {
   if (!candles.length) return [];
   const sorted  = [...candles].sort((a, b) => a.time - b.time);
   const openMap = new Map(sorted.map(c => [c.time, c.open]));
-  const zones   = detectEngineZones(sorted);
+  const zones   = computeYellowBoxZones(sorted);
   return computeEngineSignalsBothSessions(sorted, zones, ENGINE_EXIT_PROFILES.safe).map(s => ({
     time: s.time,
     open: openMap.get(s.time) ?? s.price,

@@ -51,7 +51,8 @@ import {
 import { analyzeFootprint, buildProxyFootprintCandle, setFootprintDataConfirmed, FOOTPRINT_DATA_CONFIRMED, IMBALANCE_THRESHOLD, MW_IMBALANCE_THRESHOLDS, NET_THRESHOLDS, PROXY_TIER2, PROXY_TIER3, getCurrentSessionType, getLastCompletedSession, buildFrozenImbalances, updateMitigation, type FrozenImbalanceZone, type FootprintCandle, type ImbalanceCluster, type FootprintReading, type PriceLevelData } from "@/lib/footprint-analysis"; // FOOTPRINT-STRATEGY:
 import {
   EXIT_STRATEGY_PROFILES as ENGINE_EXIT_PROFILES,
-  detectMilkZones as detectEngineZones,
+  computeYellowBoxZones,
+  computeYellowBoxDisplayBands,
   computeEngineSignals,
   computeEngineSignalsBothSessions,
   type ExitProfile,
@@ -330,7 +331,7 @@ function computeBgSignals(
   profile: ExitProfile,
 ): Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; riskLevel: "safe" | "risky" | "riskiest" }> {
   if (candles.length < 22) return [];
-  const zones = detectEngineZones(candles);
+  const zones = computeYellowBoxZones(candles);
   return computeEngineSignals(candles, zones, profile, "rth").map(s => ({
     time: s.time, direction: s.direction, price: s.price,
     tp1: s.tp1, tp2: s.tp2, sl: s.sl, riskLevel: s.tier as "safe" | "risky" | "riskiest",
@@ -2076,11 +2077,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     staleTime: 30 * 60_000,
   });
 
-  // Client-side milk zones detected from candlestick patterns (FVG, Order Blocks, Structural S/R).
+  // Client-side zones: Yellow Box strategy display bands (the per-day box plus
+  // its support/resistance zones — the zones that drive signals).
   // Fallback only — used when no Discord zones are available.
   const clientMilkZones = useMemo((): ZoneBand[] => {
     if (!windowedCandles.length) return [];
-    return detectMilkZones(windowedCandles);
+    return computeYellowBoxDisplayBands(windowedCandles) as ZoneBand[];
   }, [windowedCandles]);
 
   // Discord zones — exact levels posted by Milk in Discord (highest authority).
@@ -2188,12 +2190,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // outcomes). RTH and ETH sessions are computed separately (mirroring the
   // backtest's session modes) and merged chronologically, so the chart and the
   // Signals tab always show the SAME EXACT signals as the backtest.
-  // Zones are detected from the candles by the engine's detectMilkZones — the
-  // same zone source the backtest uses (NOT the Discord/MWML display zones).
+  // Zones come from the engine's Yellow Box strategy (per-day open-centered box
+  // + percentage R/S zones) — the same zone source the backtest uses (NOT the
+  // Discord/MWML display zones).
   const allConfluenceSignals = useMemo((): CSig[] => {
     if (!allBarsForVector.length) return [];
     const sorted = [...allBarsForVector].sort((a, b) => a.time - b.time);
-    const zones  = detectEngineZones(sorted);
+    const zones  = computeYellowBoxZones(sorted);
     const engineSigs = computeEngineSignalsBothSessions(sorted, zones, ENGINE_EXIT_PROFILES[exitStrategy]);
     return engineSigs.map((s): CSig => ({
       time: s.time, price: s.price, high: s.high, low: s.low,

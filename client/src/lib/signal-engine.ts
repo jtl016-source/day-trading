@@ -192,6 +192,109 @@ export function detectMilkZones(candles: EngineCandle[]): EngineZone[] {
 export const isBullZone = (z: EngineZone): boolean =>
   z.color === "#22c55e" || z.color === "#3b82f6" || z.color === "#14b8a6";
 
+// ── Yellow Box strategy (per-day, percentage-based) ───────────────────────────
+// Implements Milk's Yellow Box spec (attached_assets/Pasted-Build-an-algorithm-…):
+// for EACH trading day a fresh yellow box is drawn, centered on the day's
+// OPENING price, with width = the average daily candle range (H−L) over the
+// last 14 trading days. Support/resistance zones start a percentage distance
+// away from the box edges, where the percentage is how far today's open moved
+// from the previous day's open (raw_diff, floored at 0.1%).
+export interface YellowBoxDay {
+  dayKey: number;          // UTC day index (unix / 86400)
+  open: number;            // day's opening price = yellow box center (POC)
+  prevOpen: number;
+  rawDiff: number;         // max(|open − prevOpen| / open, minRawDiff)
+  avgRange: number;        // mean daily H−L over the lookback window
+  yellowTop: number; yellowBottom: number;
+  resistanceLevel: number; resistanceTop: number; resistanceBot: number;
+  supportLevel: number;    supportTop: number;    supportBot: number;
+  fromTime: number;        // first RTH bar of the day
+  toTime: number;          // session settle (20:30 UTC)
+}
+
+export interface YellowBoxOptions {
+  avgRangeLookback?: number;      // default 14 trading days
+  zoneThicknessFraction?: number; // default 0.3
+  minRawDiff?: number;            // default 0.001 (0.1%)
+}
+
+export function computeYellowBoxDays(candles: EngineCandle[], opts: YellowBoxOptions = {}): YellowBoxDay[] {
+  const lookback  = opts.avgRangeLookback ?? 14;
+  const thickFrac = opts.zoneThicknessFraction ?? 0.3;
+  const minDiff   = opts.minRawDiff ?? 0.001;
+
+  // Build daily OHLC from RTH bars (a "trading day" = the RTH session)
+  const sorted = [...candles].sort((a, b) => a.time - b.time);
+  const days = new Map<number, { open: number; high: number; low: number; firstTime: number }>();
+  for (const c of sorted) {
+    if (!isRTH(c.time)) continue;
+    const dk = Math.floor(c.time / 86400);
+    const d = days.get(dk);
+    if (!d) days.set(dk, { open: c.open, high: c.high, low: c.low, firstTime: c.time });
+    else { d.high = Math.max(d.high, c.high); d.low = Math.min(d.low, c.low); }
+  }
+  const dayList = [...days.entries()].sort((a, b) => a[0] - b[0]);
+  const ranges  = dayList.map(([, d]) => d.high - d.low);
+
+  const result: YellowBoxDay[] = [];
+  // Spec: start from the THIRD trading day (needs prev open + range history)
+  for (let i = 2; i < dayList.length; i++) {
+    const [dayKey, d] = dayList[i];
+    const prevOpen = dayList[i - 1][1].open;
+    const open     = d.open;
+    if (!(open > 0)) continue;
+
+    const rawDiff  = Math.max(Math.abs(open - prevOpen) / open, minDiff);
+    const rangeWin = ranges.slice(Math.max(0, i - lookback), i);
+    const avgRange = rangeWin.reduce((a, b) => a + b, 0) / rangeWin.length;
+
+    const yellowTop    = open + avgRange / 2;
+    const yellowBottom = open - avgRange / 2;
+    const pctDist      = rawDiff * open;
+    const thickness    = pctDist * thickFrac;
+
+    const rStart = yellowTop + pctDist;
+    const sStart = yellowBottom - pctDist;
+
+    result.push({
+      dayKey, open, prevOpen, rawDiff, avgRange, yellowTop, yellowBottom,
+      resistanceLevel: rStart, resistanceBot: rStart, resistanceTop: rStart + thickness,
+      supportLevel: sStart,    supportTop: sStart,    supportBot: sStart - thickness,
+      fromTime: d.firstTime,
+      toTime: rthSettleOfDay(d.firstTime),
+    });
+  }
+  return result;
+}
+
+/** Yellow Box SIGNAL zones: each day's support zone (bullish) and resistance
+ *  zone (bearish). These replace the old milk zones as the program's zone
+ *  confirmation source — "zone test and hold" semantics are unchanged. */
+export function computeYellowBoxZones(candles: EngineCandle[], opts: YellowBoxOptions = {}): EngineZone[] {
+  const zones: EngineZone[] = [];
+  for (const yb of computeYellowBoxDays(candles, opts)) {
+    zones.push({ topPrice: yb.supportTop,    bottomPrice: yb.supportBot,    color: "#22c55e", label: "YB SUPPORT", fromTime: yb.fromTime, toTime: yb.toTime });
+    zones.push({ topPrice: yb.resistanceTop, bottomPrice: yb.resistanceBot, color: "#ef4444", label: "YB RESIST",  fromTime: yb.fromTime, toTime: yb.toTime });
+  }
+  return zones;
+}
+
+/** Yellow Box DISPLAY bands: the box itself plus its R/S zones, for chart overlays. */
+export function computeYellowBoxDisplayBands(candles: EngineCandle[], opts: YellowBoxOptions = {}): EngineZone[] {
+  const bands: EngineZone[] = [];
+  for (const yb of computeYellowBoxDays(candles, opts)) {
+    bands.push({ topPrice: yb.yellowTop,     bottomPrice: yb.yellowBottom,  color: "#eab308", label: "YELLOW BOX", fromTime: yb.fromTime, toTime: yb.toTime });
+    bands.push({ topPrice: yb.supportTop,    bottomPrice: yb.supportBot,    color: "#22c55e", label: "YB SUPPORT", fromTime: yb.fromTime, toTime: yb.toTime });
+    bands.push({ topPrice: yb.resistanceTop, bottomPrice: yb.resistanceBot, color: "#ef4444", label: "YB RESIST",  fromTime: yb.fromTime, toTime: yb.toTime });
+  }
+  return bands;
+}
+
+/** ICT zones — Fair Value Gaps, Order Blocks and structural swing levels.
+ *  This is the original zone detector (previously called "milk zones"); it is
+ *  kept as an explicit ICT strategy component for backtesting/combos. */
+export const detectIctZones = detectMilkZones;
+
 // ── Walk-forward outcome (identical rules to backtest.tsx btWalkForward) ──────
 export function btWalkForward(
   sorted: EngineCandle[], startIdx: number,
@@ -223,7 +326,7 @@ export function btWalkForward(
 // gates the emitted signals are bit-identical to the Backtest page.
 export function computeEngineSignals(
   candles: EngineCandle[],
-  milkZones: EngineZone[],
+  milkZones: EngineZone[] | EngineZone[][],
   profile: ExitProfile,
   session: EngineSession,
   gates: EngineGates = {},
@@ -266,28 +369,41 @@ export function computeEngineSignals(
     hodRunning.set(dayKey, Math.max(prevHod, c.high));
   }
 
-  // Index zones by UTC day for O(zonesPerDay) lookups. detectMilkZones only emits
-  // same-day zones; anything spanning multiple days (or open-ended) falls back to a
-  // global list so the result is IDENTICAL to a linear scan — just much faster,
-  // which matters when the Market chart re-runs the engine on live bar updates.
-  const zonesByDay = new Map<number, EngineZone[]>();
-  const globalZones: EngineZone[] = [];
-  for (const z of milkZones) {
-    const f = z.fromTime ?? 0, t = z.toTime ?? Infinity;
-    const fd = Math.floor(f / 86400);
-    if (f > 0 && isFinite(t) && Math.floor(t / 86400) === fd) {
-      let arr = zonesByDay.get(fd);
-      if (!arr) zonesByDay.set(fd, arr = []);
-      arr.push(z);
-    } else {
-      globalZones.push(z);
+  // Zone SETS: the app passes one zone list; the combo backtester may pass
+  // several (e.g. Yellow Box zones + ICT zones). In "required" mode EVERY set
+  // must confirm independently; in "tier" mode ANY set confirming counts
+  // (identical to the original single-list behavior).
+  const zoneSets: EngineZone[][] =
+    milkZones.length && Array.isArray(milkZones[0])
+      ? (milkZones as EngineZone[][])
+      : [milkZones as EngineZone[]];
+
+  // Index each set's zones by UTC day for O(zonesPerDay) lookups. Zone detectors
+  // only emit same-day zones; anything spanning multiple days (or open-ended)
+  // falls back to a global list so the result is IDENTICAL to a linear scan —
+  // just much faster, which matters when the Market chart re-runs the engine
+  // on live bar updates.
+  const indexed = zoneSets.map(set => {
+    const zonesByDay = new Map<number, EngineZone[]>();
+    const globalZones: EngineZone[] = [];
+    for (const z of set) {
+      const f = z.fromTime ?? 0, t = z.toTime ?? Infinity;
+      const fd = Math.floor(f / 86400);
+      if (f > 0 && isFinite(t) && Math.floor(t / 86400) === fd) {
+        let arr = zonesByDay.get(fd);
+        if (!arr) zonesByDay.set(fd, arr = []);
+        arr.push(z);
+      } else {
+        globalZones.push(z);
+      }
     }
-  }
-  const zonesActiveAt = (ts: number): EngineZone[] => {
-    const arr = zonesByDay.get(Math.floor(ts / 86400));
-    if (!arr) return globalZones;
-    return globalZones.length ? [...arr, ...globalZones] : arr;
-  };
+    const zonesActiveAt = (ts: number): EngineZone[] => {
+      const arr = zonesByDay.get(Math.floor(ts / 86400));
+      if (!arr) return globalZones;
+      return globalZones.length ? [...arr, ...globalZones] : arr;
+    };
+    return { zonesActiveAt };
+  });
 
   const exitProfile = profile[session];
   const signals: EngineSignal[] = [];
@@ -304,13 +420,25 @@ export function computeEngineSignals(
     if (lb == null) continue;
     const prevLb = vecMap.get(sorted[i - 1].time);
 
-    const zonesHere  = gZone !== "off" ? zonesActiveAt(c.time) : [];
-    const milkBullOk = gZone !== "off" && zonesHere.some(z =>
-      isBullZone(z) && c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
-      c.low <= z.topPrice + MILK_TOLERANCE && c.close >= z.bottomPrice - MILK_TOLERANCE);
-    const milkBearOk = gZone !== "off" && zonesHere.some(z =>
-      !isBullZone(z) && c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
-      c.high >= z.bottomPrice - MILK_TOLERANCE && c.close <= z.topPrice + MILK_TOLERANCE);
+    // Per-set zone confirmations ("zone test and hold" semantics)
+    let bullSets = 0, bearSets = 0;
+    if (gZone !== "off") {
+      for (const { zonesActiveAt } of indexed) {
+        const zonesHere = zonesActiveAt(c.time);
+        if (zonesHere.some(z =>
+          isBullZone(z) && c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
+          c.low <= z.topPrice + MILK_TOLERANCE && c.close >= z.bottomPrice - MILK_TOLERANCE)) bullSets++;
+        if (zonesHere.some(z =>
+          !isBullZone(z) && c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
+          c.high >= z.bottomPrice - MILK_TOLERANCE && c.close <= z.topPrice + MILK_TOLERANCE)) bearSets++;
+      }
+    }
+    // ANY set confirming (tier semantics / single-list behavior)…
+    const milkBullOk = gZone !== "off" && bullSets > 0;
+    const milkBearOk = gZone !== "off" && bearSets > 0;
+    // …vs EVERY set confirming (required-gate semantics for strategy combos)
+    const allBullOk = gZone !== "off" && bullSets === indexed.length;
+    const allBearOk = gZone !== "off" && bearSets === indexed.length;
 
     // HOD suppression: skip long entries within 5 pts of pre-bar HOD
     const prevHod = hodBeforeBar.get(c.time) ?? -Infinity;
@@ -321,7 +449,7 @@ export function computeEngineSignals(
 
     // ── LONG ──────────────────────────────────────────────────────────────
     const longVecOk  = !gVector || (c.close > lb && (prevLb == null || lb >= prevLb));
-    const longZoneOk = gZone === "required" ? milkBullOk : true;
+    const longZoneOk = gZone === "required" ? allBullOk : true;
     const longBodyOk = !gBody || c.close >= c.open;
     if (longVecOk && longZoneOk && longBodyOk && i - lastLongBar >= COOLDOWN_BARS && !nearHodLong && !vec60mVetoed) {
       // Require bullish close: bearish candles touching a zone are rejections, not bounces
@@ -353,7 +481,7 @@ export function computeEngineSignals(
 
     // ── SHORT — zone-confirmed only (backtest rule), bearish close required ──
     const shortVecOk  = !gVector || (c.close < lb && (prevLb == null || lb <= prevLb));
-    const shortZoneOk = gZone === "off" ? true : milkBearOk;
+    const shortZoneOk = gZone === "off" ? true : gZone === "required" ? allBearOk : milkBearOk;
     const shortBodyOk = !gBody || c.close <= c.open;
     if (shortZoneOk && shortVecOk && shortBodyOk && i - lastShortBar >= COOLDOWN_BARS) {
       let fp: ReturnType<typeof analyzeFootprint> | null = null;
@@ -389,7 +517,7 @@ export function computeEngineSignals(
  *  Each session's subset is exactly what the Backtest page produces in that session mode. */
 export function computeEngineSignalsBothSessions(
   candles: EngineCandle[],
-  milkZones: EngineZone[],
+  milkZones: EngineZone[] | EngineZone[][],
   profile: ExitProfile,
   gates: EngineGates = {},
   nowSec: number = Math.floor(Date.now() / 1000),

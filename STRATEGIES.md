@@ -71,6 +71,30 @@ Zones do NOT reset every day — they represent actual structural price levels.
 
 ---
 
+## 2b. Yellow Box Zones — CURRENT zone-confirmation source (replaces §2 for signals)
+
+**Implementation:** `computeYellowBoxZones` / `computeYellowBoxDays` in `client/src/lib/signal-engine.ts`
+
+A fresh Yellow Box is computed for EACH trading day — never reused across days:
+- **Center (POC)** = the day's OPENING price
+- **Width** = average daily candle range (H−L) over the last 14 trading days
+  (`yellow_top = open + avg_range/2`, `yellow_bottom = open − avg_range/2`)
+- **raw_diff** = `max(|open − prev_open| / open, 0.001)` — percentage move of today's open
+  from yesterday's box center
+- **Support/Resistance zones** start `raw_diff × open` points beyond the box edges;
+  zone thickness = 30% of that distance
+  (`R: [yellow_top + pct_dist, +thickness]`, `S: [yellow_bottom − pct_dist, −thickness]`)
+
+**Signal use:** the support zone is the bullish confirmation zone, the resistance zone the
+bearish one — the "zone test and hold" check (±2 pts tolerance) is unchanged from §2.
+Zones are valid from the day's first RTH bar until session settle (20:30 UTC), then expire.
+
+**ICT zones (§2's FVG + Order Block + structural detector)** remain available as
+`detectIctZones` and as the "I" component in `scripts/generate-backtest-xlsx.ts`,
+but no longer feed live signals.
+
+---
+
 ## 3. Confluence Signal Tier System
 
 **Three bonus components (beyond the vector hard gate):**

@@ -2,17 +2,21 @@
 // Runs the SHARED signal engine (client/src/lib/signal-engine.ts — the exact
 // code path the Backtest page, Market chart and Signals tab use) over 1 month
 // of MES=F data on the 5m and 15m intervals, once for every possible
-// combination of the four composable strategy components:
+// combination of the five composable strategy components:
 //
-//   V — Vector        (HL20 primary vector hard gate + slope)
-//   Z — Milk Zones    (zone test-and-hold confirmation, required when enabled)
-//   B — Candle Body   (bullish close for Longs / bearish close for Shorts)
-//   F — Footprint     (proxy delta agreement + divergence veto + exit adjustments)
+//   V — Vector          (HL20 primary vector hard gate + slope)
+//   Y — Yellow Box      (per-day box centered on the day's OPEN; percentage-based
+//                        support/resistance zones — the program's zone strategy)
+//   I — ICT Zones       (Fair Value Gaps + Order Blocks + structural swing levels)
+//   B — Candle Body     (bullish close for Longs / bearish close for Shorts)
+//   F — Footprint       (proxy delta agreement + divergence veto + exit adjustments)
 //
-// 15 sheets = 4 solo strategies + 11 multi-strategy combos, plus a
+// 31 sheets = 5 solo strategies + 26 multi-strategy combos, plus a
 // "Program (Backtest)" sheet that reproduces the app's Backtest page exactly
-// (zone acts as a tier upgrade for Longs / hard gate for Shorts, everything
-// else enabled), a Summary sheet and a README sheet.
+// (Yellow Box zones as tier upgrade for Longs / hard gate for Shorts, with
+// V+B+F enabled), a Summary sheet, a Probability sheet (expectancy, Wilson
+// confidence intervals, profit factor, max drawdown, bootstrap Monte Carlo EV)
+// and a README sheet.
 //
 // Always-on risk filters (all sheets, mirroring the backtest): 10-bar cooldown,
 // HOD long suppression (5 pts), 60m declining-vector long veto, CME settlement
@@ -26,38 +30,33 @@ import YahooFinance from "yahoo-finance2";
 import {
   EXIT_STRATEGY_PROFILES,
   aggregateToInterval,
-  detectMilkZones,
+  computeYellowBoxZones,
+  detectIctZones,
   computeEngineSignals,
   isRTH,
   type EngineCandle,
   type EngineGates,
   type EngineSignal,
   type EngineSession,
+  type EngineZone,
 } from "../client/src/lib/signal-engine";
 
-const SYMBOL      = "MES=F";
+const SYMBOL         = "MES=F";
 const DOLLARS_PER_PT = 5;         // MES micro contract
-const MONTH_DAYS  = 30;
-const WARMUP_DAYS = 2;            // extra lead-in so vector/zones/cooldown are warm at month start
-const EXIT_PROFILE = EXIT_STRATEGY_PROFILES.safe; // Backtest page default ("Tight")
+const MONTH_DAYS     = 30;
+const WARMUP_DAYS    = 2;         // extra lead-in so vector/zones/cooldown are warm at month start
+const EXIT_PROFILE   = EXIT_STRATEGY_PROFILES.safe; // Backtest page default ("Tight")
+const BOOT_ITERS     = 1000;      // bootstrap Monte Carlo resamples
 
 // ── Strategy components ───────────────────────────────────────────────────────
 interface Component { code: string; name: string }
 const COMPONENTS: Component[] = [
   { code: "V", name: "Vector" },
-  { code: "Z", name: "Milk Zones" },
+  { code: "Y", name: "Yellow Box" },
+  { code: "I", name: "ICT Zones" },
   { code: "B", name: "Candle Body" },
   { code: "F", name: "Footprint" },
 ];
-
-function gatesFor(codes: Set<string>): EngineGates {
-  return {
-    vector:    codes.has("V"),
-    zone:      codes.has("Z") ? "required" : "off",
-    body:      codes.has("B"),
-    footprint: codes.has("F"),
-  };
-}
 
 /** All non-empty subsets of COMPONENTS, solos first, then by size. */
 function allCombos(): Array<{ codes: string[]; label: string }> {
@@ -67,7 +66,8 @@ function allCombos(): Array<{ codes: string[]; label: string }> {
     const codes = COMPONENTS.filter((_, i) => mask & (1 << i)).map(c => c.code);
     combos.push({ codes, label: codes.join("+") });
   }
-  combos.sort((a, b) => a.codes.length - b.codes.length || a.label.localeCompare(b.label));
+  const order = (c: { codes: string[] }) => c.codes.length;
+  combos.sort((a, b) => order(a) - order(b) || a.label.localeCompare(b.label));
   return combos;
 }
 
@@ -109,6 +109,41 @@ function outcomeLabel(o: EngineSignal["outcome"]): string {
   return o === "win_tp2" ? "Win (TP2)" : o === "win_tp1" ? "Win (TP1)" : o === "win_trailer" ? "Win (Trail)" : o === "loss" ? "Loss" : "Open";
 }
 
+// ── Probability helpers ───────────────────────────────────────────────────────
+/** Wilson score 95% confidence interval for a win rate. */
+function wilson95(wins: number, n: number): [number, number] {
+  if (n === 0) return [0, 0];
+  const z = 1.96, p = wins / n;
+  const denom  = 1 + (z * z) / n;
+  const center = (p + (z * z) / (2 * n)) / denom;
+  const half   = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / denom;
+  return [Math.max(0, center - half), Math.min(1, center + half)];
+}
+
+/** Max drawdown (points) over the chronological cumulative P&L curve. */
+function maxDrawdown(pnls: number[]): number {
+  let peak = 0, cum = 0, dd = 0;
+  for (const p of pnls) {
+    cum += p;
+    if (cum > peak) peak = cum;
+    dd = Math.max(dd, peak - cum);
+  }
+  return dd;
+}
+
+/** Bootstrap Monte Carlo: 90% interval for expectancy (mean pts/trade). */
+function bootstrapEV(pnls: number[], iters = BOOT_ITERS): [number, number] {
+  if (!pnls.length) return [0, 0];
+  const means: number[] = [];
+  for (let b = 0; b < iters; b++) {
+    let sum = 0;
+    for (let k = 0; k < pnls.length; k++) sum += pnls[Math.floor(Math.random() * pnls.length)];
+    means.push(sum / pnls.length);
+  }
+  means.sort((a, b) => a - b);
+  return [means[Math.floor(iters * 0.05)], means[Math.floor(iters * 0.95)]];
+}
+
 // ── Sheet writers ─────────────────────────────────────────────────────────────
 const HEADER = ["Date (ET)", "Time (ET)", "Interval", "Session", "Direction", "Tier", "Entry", "TP1", "TP2", "SL", "Outcome", "P&L (pts)", "P&L ($, 1 MES)", "Zone Confirmed"];
 
@@ -127,12 +162,12 @@ function writeTradeSheet(wb: ExcelJS.Workbook, name: string, description: string
   });
 
   rows.sort((a, b) => a.signal.time - b.signal.time);
-  let wins = 0, losses = 0, open = 0, tp1 = 0, tp2 = 0, totalPts = 0;
+  let wins = 0, losses = 0, open = 0, totalPts = 0;
   for (const { signal: s, interval } of rows) {
     const pts = pnlPts(s);
     if (s.outcome === "loss") losses++;
     else if (s.outcome === "open") open++;
-    else { wins++; if (s.outcome === "win_tp2") tp2++; else tp1++; }
+    else wins++;
     if (pts != null) totalPts += pts;
     const r = ws.addRow([
       fmtDate(s.time), fmtTime(s.time), interval, s.session.toUpperCase(),
@@ -161,7 +196,6 @@ function writeTradeSheet(wb: ExcelJS.Workbook, name: string, description: string
 
   ws.columns.forEach((col, i) => { col.width = i === 0 ? 14 : i === 10 ? 12 : 11; });
   ws.views = [{ state: "frozen", ySplit: 3 }];
-  return { wins, losses, open, tp1, tp2, totalPts, count: rows.length };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -176,13 +210,28 @@ async function main() {
   const cutoff = lastBar - MONTH_DAYS * 86400; // report exactly the trailing month; earlier bars are warm-up
   console.log(`  ${bars5m.length} 5m bars, ${bars15m.length} 15m bars · ${fmtDate(bars5m[0].time)} → ${fmtDate(lastBar)} · report window starts ${fmtDate(cutoff)}`);
 
-  const zones5m  = detectMilkZones(bars5m);
-  const zones15m = detectMilkZones(bars15m);
-  console.log(`  zones: ${zones5m.length} (5m) · ${zones15m.length} (15m)`);
+  // Zone families per interval
+  const yb5m   = computeYellowBoxZones(bars5m);
+  const yb15m  = computeYellowBoxZones(bars15m);
+  const ict5m  = detectIctZones(bars5m);
+  const ict15m = detectIctZones(bars15m);
+  console.log(`  Yellow Box zones: ${yb5m.length} (5m) · ${yb15m.length} (15m) — ICT zones: ${ict5m.length} (5m) · ${ict15m.length} (15m)`);
 
-  const runCombo = (gates: EngineGates): TradeRow[] => {
+  const runCombo = (codes: Set<string>, programMode = false): TradeRow[] => {
     const rows: TradeRow[] = [];
-    for (const [interval, bars, zones] of [["5m", bars5m, zones5m], ["15m", bars15m, zones15m]] as const) {
+    for (const [interval, bars, yb, ict] of [["5m", bars5m, yb5m, ict5m], ["15m", bars15m, yb15m, ict15m]] as const) {
+      // Zone sets: each enabled zone family must confirm independently ("required").
+      // Program mode: Yellow Box zones with "tier" semantics — the app's exact rules.
+      const zoneSets: EngineZone[][] = [];
+      if (programMode || codes.has("Y")) zoneSets.push(yb);
+      if (codes.has("I")) zoneSets.push(ict);
+      const gates: EngineGates = programMode ? {} : {
+        vector:    codes.has("V"),
+        zone:      zoneSets.length ? "required" : "off",
+        body:      codes.has("B"),
+        footprint: codes.has("F"),
+      };
+      const zones = zoneSets.length ? zoneSets : [[]];
       for (const session of ["rth", "eth"] as EngineSession[]) {
         for (const s of computeEngineSignals(bars, zones, EXIT_PROFILE, session, gates, nowSec)) {
           if (s.time < cutoff) continue; // warm-up period — not reported
@@ -197,7 +246,7 @@ async function main() {
   wb.creator = "Milk Yellow Box Strategy Viewer";
   wb.created = new Date();
 
-  // README first
+  // ── README ──────────────────────────────────────────────────────────────────
   const readme = wb.addWorksheet("README");
   const readmeLines = [
     ["1-Month Strategy Combination Backtest — MES (Micro E-mini S&P 500)"],
@@ -209,13 +258,28 @@ async function main() {
     [""],
     ["Strategy components:"],
     ["  V — Vector: close above (Long) / below (Short) the HL20 vector with agreeing slope."],
-    ["  Z — Milk Zones: candle tested a zone and held (±2 pts) — REQUIRED for entry when enabled."],
+    ["  Y — Yellow Box: the program's zone strategy. A fresh box is drawn EACH trading day, centered on the"],
+    ["      day's OPENING price, width = average daily range (H−L) over the last 14 trading days. Support and"],
+    ["      resistance zones start a percentage distance from the box edges: pct = max(|open − prevOpen| / open,"],
+    ["      0.1%) × open; zone thickness = 30% of that distance. Entry requires a zone test-and-hold (±2 pts)."],
+    ["  I — ICT Zones: Inner Circle Trader concepts — Fair Value Gaps (imbalances), Order Blocks (last opposing"],
+    ["      candle before displacement) and structural swing highs/lows. Entry requires a zone test-and-hold."],
     ["  B — Candle Body: bullish close required for Longs, bearish close for Shorts."],
     ["  F — Footprint: proxy footprint delta must agree; divergence veto; POC/TP exit adjustments."],
     [""],
-    ["Sheets: one per strategy combination (4 solo + 11 combos = every possible combination),"],
-    ["plus 'Program (Backtest)' — the app's exact Backtest page rules, where the zone is a tier"],
-    ["upgrade for Longs (Safe vs Risky) and a hard gate for Shorts, with V+B+F all enabled."],
+    ["Sheets: one per strategy combination (5 solo + 26 combos = every possible combination), plus"],
+    ["'Program (Backtest)' — the app's exact Backtest page rules: Yellow Box zones upgrade Longs to Safe tier"],
+    ["and hard-gate Shorts, with Vector + Body + Footprint enabled. When BOTH zone families are enabled in a"],
+    ["combo (Y+I), each must confirm independently on the same candle."],
+    [""],
+    ["Probability sheet (statistical backing per combination, closed trades only):"],
+    ["  · Win rate with Wilson 95% confidence interval — the plausible range of the true win rate given the"],
+    ["    sample size; overlapping intervals between combos mean the difference may be noise."],
+    ["  · Expectancy — average points won/lost per trade (the number that must be positive to trade it)."],
+    ["  · Profit factor — gross win points ÷ gross loss points (>1.0 = net profitable)."],
+    ["  · Max drawdown — worst peak-to-trough run of the cumulative P&L curve, in points."],
+    [`  · Bootstrap Monte Carlo (${BOOT_ITERS} resamples) — 90% interval for expectancy; if the low end is above`],
+    ["    zero the edge is statistically robust for this sample, not luck."],
     [""],
     ["Always-on risk filters on every sheet (identical to the app's backtest):"],
     ["  · 10-bar signal cooldown per direction"],
@@ -235,38 +299,44 @@ async function main() {
   readme.getRow(1).font = { bold: true, size: 14 };
   readme.getColumn(1).width = 130;
 
-  // Summary placeholder (filled after all sheets are computed)
-  const summary = wb.addWorksheet("Summary");
+  // Summary + Probability placeholders (filled after all sheets are computed)
+  const summary     = wb.addWorksheet("Summary");
+  const probability = wb.addWorksheet("Probability");
 
-  interface SummaryRow { sheet: string; strategies: string; interval: string; count: number; wins: number; losses: number; open: number; tp1: number; tp2: number; pts: number }
-  const summaryRows: SummaryRow[] = [];
+  interface ComboStats {
+    sheet: string; strategies: string; interval: string;
+    count: number; wins: number; losses: number; open: number; tp1: number; tp2: number;
+    pnls: number[]; // chronological closed-trade P&Ls (pts)
+  }
+  const statRows: ComboStats[] = [];
 
-  const addComboSheet = (sheetName: string, label: string, description: string, gates: EngineGates) => {
-    const rows = runCombo(gates);
+  const addComboSheet = (sheetName: string, label: string, description: string, codes: Set<string>, programMode = false) => {
+    const rows = runCombo(codes, programMode);
     writeTradeSheet(wb, sheetName, description, rows);
     for (const interval of ["5m", "15m"] as const) {
-      const sub = rows.filter(r => r.interval === interval);
-      let wins = 0, losses = 0, open = 0, tp1 = 0, tp2 = 0, pts = 0;
+      const sub = rows.filter(r => r.interval === interval).sort((a, b) => a.signal.time - b.signal.time);
+      const st: ComboStats = { sheet: sheetName, strategies: label, interval, count: sub.length, wins: 0, losses: 0, open: 0, tp1: 0, tp2: 0, pnls: [] };
       for (const { signal: s } of sub) {
         const p = pnlPts(s);
-        if (s.outcome === "loss") losses++;
-        else if (s.outcome === "open") open++;
-        else { wins++; if (s.outcome === "win_tp2") tp2++; else tp1++; }
-        if (p != null) pts += p;
+        if (s.outcome === "loss") st.losses++;
+        else if (s.outcome === "open") st.open++;
+        else { st.wins++; if (s.outcome === "win_tp2") st.tp2++; else st.tp1++; }
+        if (p != null) st.pnls.push(p);
       }
-      summaryRows.push({ sheet: sheetName, strategies: label, interval, count: sub.length, wins, losses, open, tp1, tp2, pts });
+      statRows.push(st);
     }
   };
 
-  // Program sheet — exact Backtest page semantics (default gates)
+  // Program sheet — exact Backtest page semantics (Yellow Box zones, tier mode)
   addComboSheet(
     "Program (Backtest)",
-    "Program strategy (V+B+F, zones as tier)",
-    "PROGRAM STRATEGY — exact Backtest page rules: vector + body + footprint gates; Milk zone upgrades Longs to Safe and hard-gates Shorts.",
-    {},
+    "Program strategy (V+B+F, Yellow Box as tier)",
+    "PROGRAM STRATEGY — exact Backtest page rules: vector + body + footprint gates; Yellow Box zone upgrades Longs to Safe and hard-gates Shorts.",
+    new Set(),
+    true,
   );
 
-  // Every combination of the 4 components
+  // Every combination of the 5 components
   const nameByCode: Record<string, string> = Object.fromEntries(COMPONENTS.map(c => [c.code, c.name]));
   for (const combo of allCombos()) {
     const names = combo.codes.map(c => nameByCode[c]).join(" + ");
@@ -276,15 +346,15 @@ async function main() {
       sheetName,
       names,
       `${solo ? "SOLO STRATEGY" : "STRATEGY COMBO"}: ${names} — enabled components are required entry gates; all baseline risk filters apply (see README).`,
-      gatesFor(new Set(combo.codes)),
+      new Set(combo.codes),
     );
     console.log(`  sheet done: ${sheetName}`);
   }
 
-  // Fill Summary
+  // ── Summary ─────────────────────────────────────────────────────────────────
   summary.addRow([`Summary — ${SYMBOL} · ${fmtDate(cutoff)} → ${fmtDate(lastBar)} · 5m & 15m · exit profile "Tight" · $5/pt (1 MES)`]);
   summary.getRow(1).font = { bold: true, size: 12 };
-  summary.mergeCells(1, 1, 1, 11);
+  summary.mergeCells(1, 1, 1, 12);
   summary.addRow([]);
   const sh = summary.addRow(["Sheet", "Strategies", "Interval", "Trades", "Wins", "Losses", "Open", "TP1 Hits", "TP2 Hits", "Win Rate", "P&L (pts)", "P&L ($)"]);
   sh.font = { bold: true };
@@ -292,24 +362,75 @@ async function main() {
     cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
     cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
   });
-  for (const r of summaryRows) {
+  for (const r of statRows) {
     const closed = r.wins + r.losses;
+    const pts = r.pnls.reduce((a, b) => a + b, 0);
     const row = summary.addRow([
       r.sheet, r.strategies, r.interval, r.count, r.wins, r.losses, r.open, r.tp1, r.tp2,
       closed ? `${((r.wins / closed) * 100).toFixed(1)}%` : "—",
-      +r.pts.toFixed(2), +(r.pts * DOLLARS_PER_PT).toFixed(2),
+      +pts.toFixed(2), +(pts * DOLLARS_PER_PT).toFixed(2),
     ]);
-    row.getCell(12).font = { bold: true, color: { argb: r.pts >= 0 ? "FF16A34A" : "FFDC2626" } };
+    row.getCell(12).font = { bold: true, color: { argb: pts >= 0 ? "FF16A34A" : "FFDC2626" } };
   }
-  summary.columns.forEach((col, i) => { col.width = i === 0 ? 22 : i === 1 ? 36 : 10; });
+  summary.columns.forEach((col, i) => { col.width = i === 0 ? 22 : i === 1 ? 40 : 10; });
   summary.views = [{ state: "frozen", ySplit: 3 }];
+
+  // ── Probability ─────────────────────────────────────────────────────────────
+  probability.addRow([`Probability & statistical backing — closed trades only · Wilson 95% CI on win rate · bootstrap Monte Carlo (${BOOT_ITERS} resamples) 90% interval on expectancy`]);
+  probability.getRow(1).font = { bold: true, size: 12 };
+  probability.mergeCells(1, 1, 1, 14);
+  probability.addRow(["A combo's edge is statistically robust for this sample when the bootstrap EV low end is above 0. Overlapping win-rate CIs between combos = difference may be noise. Small samples (<30 closed trades) are marked."]);
+  probability.mergeCells(2, 1, 2, 14);
+  probability.getRow(2).font = { italic: true, size: 10 };
+  probability.addRow([]);
+  const ph = probability.addRow([
+    "Sheet", "Strategies", "Interval", "Closed", "Win Rate", "WR 95% CI Low", "WR 95% CI High",
+    "Expectancy (pts/trade)", "Avg Win (pts)", "Avg Loss (pts)", "Profit Factor",
+    "Max Drawdown (pts)", "Bootstrap EV 5% (pts)", "Bootstrap EV 95% (pts)", "Sample Note",
+  ]);
+  ph.font = { bold: true };
+  ph.eachCell(cell => {
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  });
+  for (const r of statRows) {
+    const closed = r.pnls.length;
+    if (!closed) {
+      probability.addRow([r.sheet, r.strategies, r.interval, 0, "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "no closed trades"]);
+      continue;
+    }
+    const winPnls  = r.pnls.filter(p => p > 0);
+    const lossPnls = r.pnls.filter(p => p <= 0);
+    const [ciLo, ciHi] = wilson95(r.wins, r.wins + r.losses);
+    const expectancy = r.pnls.reduce((a, b) => a + b, 0) / closed;
+    const avgWin  = winPnls.length  ? winPnls.reduce((a, b) => a + b, 0) / winPnls.length : 0;
+    const avgLoss = lossPnls.length ? lossPnls.reduce((a, b) => a + b, 0) / lossPnls.length : 0;
+    const grossWin  = winPnls.reduce((a, b) => a + b, 0);
+    const grossLoss = Math.abs(lossPnls.reduce((a, b) => a + b, 0));
+    const pf = grossLoss > 0 ? grossWin / grossLoss : Infinity;
+    const dd = maxDrawdown(r.pnls);
+    const [evLo, evHi] = bootstrapEV(r.pnls);
+    const row = probability.addRow([
+      r.sheet, r.strategies, r.interval, closed,
+      `${((r.wins / (r.wins + r.losses)) * 100).toFixed(1)}%`,
+      `${(ciLo * 100).toFixed(1)}%`, `${(ciHi * 100).toFixed(1)}%`,
+      +expectancy.toFixed(3), +avgWin.toFixed(2), +avgLoss.toFixed(2),
+      isFinite(pf) ? +pf.toFixed(2) : "∞",
+      +dd.toFixed(2), +evLo.toFixed(3), +evHi.toFixed(3),
+      closed < 30 ? "SMALL SAMPLE" : evLo > 0 ? "robust edge" : "not significant",
+    ]);
+    row.getCell(8).font  = { bold: true, color: { argb: expectancy >= 0 ? "FF16A34A" : "FFDC2626" } };
+    row.getCell(15).font = { color: { argb: evLo > 0 ? "FF16A34A" : closed < 30 ? "FFB45309" : "FF6B7280" } };
+  }
+  probability.columns.forEach((col, i) => { col.width = i === 0 ? 22 : i === 1 ? 40 : 13; });
+  probability.views = [{ state: "frozen", ySplit: 4 }];
 
   const fs = await import("fs");
   const path = await import("path");
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   await wb.xlsx.writeFile(outPath);
   console.log(`\nWrote ${outPath}`);
-  console.log(`Sheets: README, Summary, Program (Backtest), ${allCombos().length} combination sheets`);
+  console.log(`Sheets: README, Summary, Probability, Program (Backtest), ${allCombos().length} combination sheets`);
 }
 
 main().catch(err => { console.error(err); process.exit(1); });

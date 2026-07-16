@@ -9,7 +9,7 @@ import {
   EXIT_STRATEGY_PROFILES,
   MILK_TOLERANCE,
   aggregateToInterval,
-  detectMilkZones as detectEngineZones,
+  computeYellowBoxZones,
   computeEngineSignals,
   isBullZone,
   type EngineSignal,
@@ -56,9 +56,11 @@ interface BacktestResult {
   signals: BacktestSignal[];
 }
 
-// ── Zone detection: shared engine version (identical logic, ZoneBand-compatible) ──
+// ── Zone detection: Yellow Box strategy (shared engine, ZoneBand-compatible) ──
+// Per-day box centered on the day's opening price; support/resistance zones a
+// percentage distance from the box edges. Replaces the old milk-zone detector.
 function detectMilkZones(candles: CandleBar[]): ZoneBand[] {
-  return detectEngineZones(candles) as ZoneBand[];
+  return computeYellowBoxZones(candles) as ZoneBand[];
 }
 
 // ── Backtest engine ───────────────────────────────────────────────────────────
