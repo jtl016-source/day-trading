@@ -5,7 +5,15 @@ import {
   type CandleBar,
   type ZoneBand,
 } from "@/components/CandlestickChart";
-import { buildProxyFootprintCandle, analyzeFootprint } from "@/lib/footprint-analysis";
+import {
+  EXIT_STRATEGY_PROFILES,
+  MILK_TOLERANCE,
+  aggregateToInterval,
+  detectMilkZones as detectEngineZones,
+  computeEngineSignals,
+  isBullZone,
+  type EngineSignal,
+} from "@/lib/signal-engine";
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 const MW = {
@@ -19,29 +27,9 @@ const MW = {
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const VEC_LENGTH       = 20;
-const MILK_TOLERANCE   = 2.0;
-
-const EXIT_STRATEGY_PROFILES = {
-  safe: {
-    // FP-confirmed SAFE: ~73–78% WR → aggressive TP, tighter SL (POC stop enhances further)
-    rth: { tp1Safe: 12.5, tp1: 10.0, tp2: 25.0, sl: 4.0 },
-    eth: { tp1Safe:  7.5, tp1:  6.0, tp2: 15.0, sl: 3.0 },
-    label: "Tight",    desc: "FP confirmed — 4pt SL · 25pt TP2",
-  },
-  risky: {
-    // Standard exits for zone+secondary (no fp) signals: ~45–55% WR
-    rth: { tp1Safe: 10.0, tp1:  8.0, tp2: 20.0, sl: 5.0 },
-    eth: { tp1Safe:  6.0, tp1:  5.0, tp2: 12.0, sl: 3.5 },
-    label: "Standard", desc: "Zone+secondary — 5pt SL · 20pt TP2",
-  },
-  riskiest: {
-    // Wide swing exits — size very small; marginal fp-standalone signals
-    rth: { tp1Safe: 20.0, tp1: 16.0, tp2: 40.0, sl: 10.0 },
-    eth: { tp1Safe: 12.0, tp1: 10.0, tp2: 22.0, sl:  7.0 },
-    label: "Wide",     desc: "Swing style — 10pt SL · 40pt TP2",
-  },
-} as const;
+// EXIT_STRATEGY_PROFILES, MILK_TOLERANCE and all signal logic now live in
+// @/lib/signal-engine — the single source of truth shared with the Market
+// chart and the Signals tab.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type ExitKey    = "safe" | "risky" | "riskiest";
@@ -68,136 +56,14 @@ interface BacktestResult {
   signals: BacktestSignal[];
 }
 
-// ── Interval aggregator ───────────────────────────────────────────────────────
-function aggregateToInterval(candles: CandleBar[], intervalSec: number): CandleBar[] {
-  if (!candles.length) return [];
-  const sorted = [...candles].sort((a, b) => a.time - b.time);
-  const buckets = new Map<number, CandleBar>();
-  for (const c of sorted) {
-    const t = Math.floor(c.time / intervalSec) * intervalSec;
-    if (!buckets.has(t)) {
-      buckets.set(t, { time: t, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume ?? 0, rth: isRTH(t) });
-    } else {
-      const b = buckets.get(t)!;
-      b.high   = Math.max(b.high, c.high);
-      b.low    = Math.min(b.low,  c.low);
-      b.close  = c.close;
-      b.volume = (b.volume ?? 0) + (c.volume ?? 0);
-    }
-  }
-  return [...buckets.values()].sort((a, b) => a.time - b.time);
-}
-
-// ── RTH helpers ───────────────────────────────────────────────────────────────
-function isRTH(ts: number): boolean {
-  const d = new Date(ts * 1000);
-  const day = d.getUTCDay();
-  if (day === 0 || day === 6) return false;
-  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return mins >= 13 * 60 + 30 && mins < 20 * 60; // 9:30 AM – 4:00 PM ET
-}
-
-function rthSettleOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 20 * 3600 + 30 * 60;
-}
-
-// ── Vector line ───────────────────────────────────────────────────────────────
-function computeVectorLine(candles: CandleBar[]): Map<number, number> {
-  const s = [...candles].sort((a, b) => a.time - b.time);
-  const n = s.length;
-  const lb = new Array<number>(n);
-  for (let i = 0; i < n; i++) {
-    let lo = s[i].low;
-    for (let j = Math.max(0, i - VEC_LENGTH + 1); j < i; j++) if (s[j].low < lo) lo = s[j].low;
-    lb[i] = lo;
-  }
-  const map = new Map<number, number>();
-  for (let i = 0; i < n; i++) {
-    let hi = lb[i];
-    for (let j = Math.max(0, i - VEC_LENGTH + 1); j < i; j++) if (lb[j] > hi) hi = lb[j];
-    map.set(s[i].time, hi);
-  }
-  return map;
-}
-
-// ── Zone detection (mirrors market.tsx detectMilkZones) ──────────────────────
+// ── Zone detection: shared engine version (identical logic, ZoneBand-compatible) ──
 function detectMilkZones(candles: CandleBar[]): ZoneBand[] {
-  const rth = [...candles].sort((a, b) => a.time - b.time).filter(c => c.rth !== false);
-  const zones: ZoneBand[] = [];
-
-  const lastRthBarBefore430 = new Map<number, number>();
-  for (const c of rth) {
-    if (c.time % 86400 >= 20 * 3600 + 30 * 60) continue;
-    lastRthBarBefore430.set(Math.floor(c.time / 86400), c.time);
-  }
-  const sessionEndOf = (ts: number) =>
-    lastRthBarBefore430.get(Math.floor(ts / 86400)) ?? rthSettleOfDay(ts);
-
-  const atrAt = (i: number) => {
-    let s = 0, n = 0;
-    for (let j = Math.max(0, i - 13); j <= i; j++) {
-      const b = rth[j], p = j > 0 ? rth[j - 1] : b;
-      s += Math.max(b.high - b.low, Math.abs(b.high - p.close), Math.abs(b.low - p.close));
-      n++;
-    }
-    return n > 0 ? s / n : 2;
-  };
-
-  for (let i = 1; i < rth.length - 1; i++) {
-    const prev = rth[i - 1], curr = rth[i], next = rth[i + 1];
-    const atr  = atrAt(i);
-
-    if (prev.high < next.low && next.low - prev.high >= 0.5)
-      zones.push({ topPrice: next.low, bottomPrice: prev.high, color: "#22c55e", label: "IMBALANCE", fromTime: curr.time, toTime: sessionEndOf(curr.time) });
-    if (prev.low > next.high && prev.low - next.high >= 0.5)
-      zones.push({ topPrice: prev.low, bottomPrice: next.high, color: "#ef4444", label: "RESIST IMBALANCE", fromTime: curr.time, toTime: sessionEndOf(curr.time) });
-
-    if (curr.close < curr.open) {
-      let maxUp = 0;
-      for (let j = i + 1; j <= Math.min(rth.length - 1, i + 4); j++) maxUp = Math.max(maxUp, rth[j].high - curr.high);
-      if (maxUp >= atr * 1.5)
-        zones.push({ topPrice: Math.max(curr.open, curr.close), bottomPrice: curr.low, color: "#3b82f6", label: "ABSORPTION", fromTime: curr.time, toTime: sessionEndOf(curr.time) });
-    }
-    if (curr.close > curr.open) {
-      let maxDown = 0;
-      for (let j = i + 1; j <= Math.min(rth.length - 1, i + 4); j++) maxDown = Math.max(maxDown, curr.low - rth[j].low);
-      if (maxDown >= atr * 1.5)
-        zones.push({ topPrice: curr.high, bottomPrice: Math.min(curr.open, curr.close), color: "#f97316", label: "RESISTIVE", fromTime: curr.time, toTime: sessionEndOf(curr.time) });
-    }
-
-    const LB = 3, sz = Math.max(atr * 0.25, 1.5);
-    let isHigh = true, isLow = true;
-    for (let j = Math.max(0, i - LB); j < i; j++) { if (rth[j].high >= curr.high) isHigh = false; if (rth[j].low <= curr.low) isLow = false; }
-    for (let j = i + 1; j <= Math.min(rth.length - 1, i + LB); j++) { if (rth[j].high >= curr.high) isHigh = false; if (rth[j].low <= curr.low) isLow = false; }
-    if (isHigh) zones.push({ topPrice: curr.high + sz * 0.15, bottomPrice: curr.high - sz, color: "#f43f5e", label: "STRUCTURAL RESIST", fromTime: curr.time, toTime: sessionEndOf(curr.time) });
-    if (isLow)  zones.push({ topPrice: curr.low + sz, bottomPrice: curr.low - sz * 0.15, color: "#14b8a6", label: "STRUCTURAL SUPPORT", fromTime: curr.time, toTime: sessionEndOf(curr.time) });
-  }
-  return zones;
-}
-
-// ── Walk-forward outcome ──────────────────────────────────────────────────────
-function btWalkForward(sorted: CandleBar[], startIdx: number, tp1: number, tp2: number, sl: number, isLong: boolean): Outcome {
-  const c = sorted[startIdx];
-  let settleTs = rthSettleOfDay(c.time);
-  for (let d = 0; c.time >= settleTs && d < 4; d++) settleTs = rthSettleOfDay(c.time + (d + 1) * 86400);
-  const pastEnd = Math.floor(Date.now() / 1000) > settleTs;
-  for (let j = startIdx + 1; j < sorted.length; j++) {
-    const f = sorted[j];
-    if (f.time > settleTs) break;
-    if (isLong) {
-      if (f.high >= tp2) return "win_tp2";
-      if (f.high >= tp1) return "win_tp1";
-      if (f.low  <= sl)  return "loss";
-    } else {
-      if (f.low  <= tp2) return "win_tp2";
-      if (f.low  <= tp1) return "win_tp1";
-      if (f.high >= sl)  return "loss";
-    }
-  }
-  return pastEnd ? "loss" : "open";
+  return detectEngineZones(candles) as ZoneBand[];
 }
 
 // ── Backtest engine ───────────────────────────────────────────────────────────
+// Signal detection is delegated to computeEngineSignals (@/lib/signal-engine) —
+// the exact same code path the Market chart and Signals tab use.
 function runBacktest(
   candles: CandleBar[],
   milkZones: ZoneBand[],
@@ -205,39 +71,7 @@ function runBacktest(
   symbol: string, interval: string, exitStrategy: ExitKey, session: SessionKey,
 ): BacktestResult {
   const sorted = [...candles].sort((a, b) => a.time - b.time);
-  const vecMap = computeVectorLine(sorted);
-  const isBullZ = (z: ZoneBand) => z.color === "#22c55e" || z.color === "#3b82f6" || z.color === "#14b8a6";
-
-  // 60m vector for hard veto on Long signals (declining 60m = skip all longs per strategy)
-  const candles60m  = aggregateToInterval(sorted, 3600);
-  const vec60mMap   = computeVectorLine(candles60m);
-  // Build a declining-phase map for 60m: true when vector < its prior value
-  const vec60mDeclineMap = new Map<number, boolean>();
-  const sorted60m = [...candles60m].sort((a, b) => a.time - b.time);
-  let prev60mVec: number | null = null;
-  for (const c of sorted60m) {
-    const v = vec60mMap.get(c.time);
-    if (v != null) {
-      vec60mDeclineMap.set(c.time, prev60mVec !== null && v < prev60mVec);
-      prev60mVec = v;
-    }
-  }
-  // Forward-fill 60m decline flag to primary interval bars
-  function get60mDecline(ts: number): boolean {
-    const bucket = Math.floor(ts / 3600) * 3600;
-    return vec60mDeclineMap.get(bucket) ?? false;
-  }
-
-  // Pre-compute per-day HOD before each bar for HOD suppression
-  const hodBeforeBar = new Map<number, number>(); // barTime → HOD before that bar
-  const hodRunning   = new Map<number, number>(); // dayKey → running high
-  for (const c of sorted) {
-    if (!isRTH(c.time)) continue;
-    const dayKey = Math.floor(c.time / 86400);
-    const prevHod = hodRunning.get(dayKey) ?? -Infinity;
-    hodBeforeBar.set(c.time, prevHod);
-    hodRunning.set(dayKey, Math.max(prevHod, c.high));
-  }
+  const isBullZ = isBullZone;
 
   const dayHLMap = new Map<string, { high: number; low: number }>();
   for (const c of sorted) {
@@ -252,7 +86,6 @@ function runBacktest(
     risky: { count: 0, winTp1: 0, winTp2: 0, loss: 0, open: 0 },
   };
   const signals: BacktestSignal[] = [];
-  let lastLongBar = -10, lastShortBar = -10;
 
   const mkNote = (
     isLong: boolean, price: number, tier: TierKey,
@@ -299,91 +132,18 @@ function runBacktest(
     return { note: "Open — session not yet resolved", noteType: "caution" };
   };
 
-  const exitProfile = profile[session]; // rth or eth targets
+  // ── Run the shared engine — the ONE signal code path for all pages ──────────
+  const engineSignals: EngineSignal[] = computeEngineSignals(sorted, milkZones, profile, session);
 
-  for (let i = 1; i < sorted.length; i++) {
-    const c = sorted[i];
-    const rth = isRTH(c.time);
-    if (session === "rth" && !rth) continue;
-    if (session === "eth" &&  rth) continue;
-    // Skip CME settlement break (20:30–22:00 UTC) even in ETH mode
-    if (new Date(c.time * 1000).getUTCHours() >= 20 && new Date(c.time * 1000).getUTCHours() < 22) continue;
-    const lb     = vecMap.get(c.time);
-    if (lb == null) continue;
-    const prevLb = vecMap.get(sorted[i - 1].time);
-
-    const milkBullOk = milkZones.some(z =>
-      isBullZ(z) && c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
-      c.low <= z.topPrice + MILK_TOLERANCE && c.close >= z.bottomPrice - MILK_TOLERANCE);
-    const milkBearOk = milkZones.some(z =>
-      !isBullZ(z) && c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
-      c.high >= z.bottomPrice - MILK_TOLERANCE && c.close <= z.topPrice + MILK_TOLERANCE);
-
-    // HOD suppression: skip long entries within 5 pts of pre-bar HOD
-    const prevHod = hodBeforeBar.get(c.time) ?? -Infinity;
-    const nearHodLong = rth && prevHod > -Infinity && c.close < prevHod && c.close >= prevHod - 5;
-
-    // 60m hard veto for longs
-    const vec60mVetoed = get60mDecline(c.time);
-
-    if (c.close > lb && (prevLb == null || lb >= prevLb) && i - lastLongBar >= 10 && !nearHodLong && !vec60mVetoed && c.close >= c.open) {
-      // Require bullish close: bearish candles touching a zone are rejections, not bounces
-      const fpCandle = buildProxyFootprintCandle(c);
-      const priorFp  = sorted.slice(Math.max(0, i - 4), i).map((b: CandleBar) => buildProxyFootprintCandle(b));
-      const fp = analyzeFootprint(fpCandle, "Long", priorFp, c.close);
-      if (fp.vetoed) continue; // divergence veto — signal suppressed
-      if (!fp.deltaAgrees) continue; // delta must agree for Long — proxy ensures bullish bar has positive delta
-
-      lastLongBar = i;
-      // Tier mirrors market.tsx: zone = safe; fp-standalone (no zone) = risky
-      const tier: TierKey = milkBullOk ? "safe" : "risky";
-      const tp1F = tier === "safe" ? exitProfile.tp1Safe : exitProfile.tp1;
-      let tp1  = c.close + tp1F;
-      let tp2  = c.close + exitProfile.tp2;
-      let sl   = c.close - exitProfile.sl;
-      // Apply footprint exit adjustments
-      if (fp.exitAdjustments.usePocStop && fp.exitAdjustments.pocStopPrice != null && fp.exitAdjustments.pocStopPrice < c.close)
-        sl = fp.exitAdjustments.pocStopPrice;
-      if (fp.exitAdjustments.tp1Override != null) tp1 = fp.exitAdjustments.tp1Override;
-      if (fp.exitAdjustments.tp2Extension != null) tp2 = c.close + (tp2 - c.close) * (1 + fp.exitAdjustments.tp2Extension);
-      const out  = btWalkForward(sorted, i, tp1, tp2, sl, true);
-      tiers[tier].count++;
-      if (out === "win_tp1") tiers[tier].winTp1++;
-      else if (out === "win_tp2") tiers[tier].winTp2++;
-      else if (out === "loss") tiers[tier].loss++;
-      else tiers[tier].open++;
-      const { note, noteType } = mkNote(true, c.close, tier, out, c.time, tp1, tp2);
-      signals.push({ time: c.time, direction: "Long", price: c.close, tier, outcome: out, note, noteType });
-    }
-    // Short — zone-confirmed only, bearish close required (matching conf ≥ 80 rule)
-    if (milkBearOk && c.close < lb && (prevLb == null || lb <= prevLb) && i - lastShortBar >= 10 && c.close <= c.open) {
-      // Require bearish close: bullish candles in resistance zones may still be bouncing up
-      const fpCandle = buildProxyFootprintCandle(c);
-      const priorFp  = sorted.slice(Math.max(0, i - 4), i).map((b: CandleBar) => buildProxyFootprintCandle(b));
-      const fp = analyzeFootprint(fpCandle, "Short", priorFp, c.close);
-      if (fp.vetoed) continue;
-      if (!fp.deltaAgrees) continue; // delta must agree — proxy ensures bearish bar has negative delta
-
-      lastShortBar = i;
-      // Shorts: zone = safe; fp-standalone = risky
-      const tier: TierKey = milkBearOk ? "safe" : "risky";
-      const tp1F = tier === "safe" ? exitProfile.tp1Safe : exitProfile.tp1;
-      let tp1  = c.close - tp1F;
-      let tp2  = c.close - exitProfile.tp2;
-      let sl   = c.close + exitProfile.sl;
-      if (fp.exitAdjustments.usePocStop && fp.exitAdjustments.pocStopPrice != null && fp.exitAdjustments.pocStopPrice > c.close)
-        sl = fp.exitAdjustments.pocStopPrice;
-      if (fp.exitAdjustments.tp1Override != null) tp1 = fp.exitAdjustments.tp1Override;
-      if (fp.exitAdjustments.tp2Extension != null) tp2 = c.close - (c.close - tp2) * (1 + fp.exitAdjustments.tp2Extension);
-      const out  = btWalkForward(sorted, i, tp1, tp2, sl, false);
-      tiers[tier].count++;
-      if (out === "win_tp1") tiers[tier].winTp1++;
-      else if (out === "win_tp2") tiers[tier].winTp2++;
-      else if (out === "loss") tiers[tier].loss++;
-      else tiers[tier].open++;
-      const { note, noteType } = mkNote(false, c.close, tier, out, c.time, tp1, tp2);
-      signals.push({ time: c.time, direction: "Short", price: c.close, tier, outcome: out, note, noteType });
-    }
+  for (const s of engineSignals) {
+    const out = s.outcome as Outcome;
+    tiers[s.tier].count++;
+    if (out === "win_tp1") tiers[s.tier].winTp1++;
+    else if (out === "win_tp2") tiers[s.tier].winTp2++;
+    else if (out === "loss") tiers[s.tier].loss++;
+    else tiers[s.tier].open++;
+    const { note, noteType } = mkNote(s.direction === "Long", s.price, s.tier, out, s.time, s.tp1, s.tp2);
+    signals.push({ time: s.time, direction: s.direction, price: s.price, tier: s.tier, outcome: out, note, noteType });
   }
 
   const fromDate = sorted.length ? new Date(sorted[0].time * 1000).toLocaleDateString() : "—";

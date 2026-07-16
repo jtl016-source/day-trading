@@ -145,6 +145,17 @@ Milk draws zones at market open each day. These are fixed predictions — they d
 
 ## Session Log
 
+**2026-07-16 — Shared signal engine + strategy-combination Excel backtest**
+- **Signal logic unified into `client/src/lib/signal-engine.ts`** — the Backtest page's `runBacktest` signal loop (vector gate, zone test-and-hold, body confirmation, proxy-footprint veto/delta gates, HOD long suppression, 60m declining veto, 10-bar cooldown, walk-forward outcomes, exit profiles) was extracted verbatim into a pure module. `backtest.tsx`, `market.tsx` (`allConfluenceSignals` + `computeBgSignals`) and `SignalsPanel.tsx` (standalone `computeSignals`) now all call `computeEngineSignals`, so the chart, the Signals tab and the backtest show the SAME EXACT signals. Do NOT re-fork per-page signal logic — change the engine instead.
+  - market.tsx's old 600-line `allConfluenceSignals` memo (footprint-tier confidence scoring, tabletop patterns, trailer walk-forward, locked signal levels, DB lock override) was REPLACED by the engine. RTH and ETH sessions are computed separately (mirroring the backtest's session modes) and merged. Signal zones come from the engine's `detectMilkZones` on the chart's own candles — NOT from Discord/MWML display zones.
+  - Engine zone lookups are indexed by UTC day (`zonesByDay` + `globalZones` fallback for multi-day zones) — identical results to a linear scan but fast enough to re-run on live bar updates.
+  - SignalsPanel standalone mode fetches 2 extra lead-in days (`dataFromTs = fromTs - 2*86400`) so vector/zones/cooldown are warm at the selected start date; display still filters to `fromTs`.
+  - Confidence: high
+- **Strategy-combination Excel backtest** — `scripts/generate-backtest-xlsx.ts` (run: `npx tsx scripts/generate-backtest-xlsx.ts`) fetches 1 month of MES=F 5m data from Yahoo Finance (15m aggregated client-side like the app), runs the shared engine for every combination of the 4 composable components (Vector / Milk Zones / Candle Body / Footprint → 4 solo + 11 combo sheets) plus a "Program (Backtest)" sheet with the app's exact rules, and writes `backtests/MES-1month-5m-15m-strategy-combos.xlsx` with per-trade rows and a Summary sheet. Engine gates: `{ vector, zone: "tier"|"required"|"off", body, footprint }` — defaults reproduce the Backtest page bit-for-bit; "required" makes the zone a hard entry gate for combo isolation.
+  - Learning: combos including Footprint make the Body gate redundant (proxy footprint delta-agreement already implies body direction), so V+F = V+B+F.
+  - 1-month result snapshot (Tight exits, RTH+ETH): Program strategy 5m 48.8% WR / 15m 54.7% WR; best P&L combos were Z+B+F and B+F; Vector-solo and Zone-solo were net losers on 5m.
+  - Confidence: high
+
 **2026-04-19 — Taught by User**
 - **Resistance Within TP1 Range**: A long signal failed because a resistance zone at 7165.50 sat only 2.5 pts above entry, effectively blocking price before reaching TP1 at 7166.00 and creating an unfavorable reward structure.
   - Action: Skip any long signal where a resistance level exists within 1.0 pt of TP1 (or between entry and TP1), unless price has already broken and closed above that level on the signal interval before entry.

@@ -2,6 +2,11 @@ import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GraduationCap, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
+import {
+  EXIT_STRATEGY_PROFILES as ENGINE_EXIT_PROFILES,
+  detectMilkZones as detectEngineZones,
+  computeEngineSignalsBothSessions,
+} from "@/lib/signal-engine"; // SHARED-ENGINE: single signal source of truth (matches Backtest page)
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const MW = {
@@ -190,7 +195,7 @@ const SL_ATR_MULT   = 0.5;
 const ATR_PERIOD    = 14;
 
 interface RawSignal {
-  time: number; open: number; high: number; low: number; direction: "Long";
+  time: number; open: number; high: number; low: number; direction: "Long" | "Short";
   riskLevel: RiskLevel; price: number;
   tp1: number; tp2: number; sl: number;
   milkOk: boolean; secondaryVecOk: boolean;
@@ -204,77 +209,29 @@ interface RawSignal {
 
 type MLZone = { from_ts: number; to_ts: number; top: number; bottom: number; is_bull: boolean; score: number };
 
-function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = [], mlZones: MLZone[] = []): RawSignal[] {
+// SHARED-ENGINE: standalone signal computation delegates to the shared engine —
+// the EXACT code path the Backtest page runs — so the Signals tab always shows
+// the SAME EXACT signals as the backtest. Zones are detected from the candles
+// by the engine's detectMilkZones (same zone source as the backtest). Exit
+// levels use the "safe" (Tight) profile — the Backtest page default.
+function computeSignals(candles: CandleBar[]): RawSignal[] {
   if (!candles.length) return [];
-  const sorted     = [...candles].sort((a, b) => a.time - b.time);
-  const chartTimes = sorted.map(c => c.time);
-  const vecArr     = computeVectorLine(sorted);
-  const vecMap     = new Map(vecArr.map(v => [v.time, v.value]));
-
-  const secMaps = secondaryCandles.filter(sc => sc.length > 0).map(sc => {
-    const sv = computeVectorLine([...sc].sort((a, b) => a.time - b.time));
-    return new Map(forwardFillVector(sv, chartTimes).map(v => [v.time, v.value]));
-  });
-
-  const raw: RawSignal[] = [];
-  let lastLongBar = -COOLDOWN_BARS, lastLongEthBar = -ETH_COOLDOWN;
-
-  for (let i = 0; i < sorted.length; i++) {
-    const c = sorted[i], lb = vecMap.get(c.time), prevLb = i >= 3 ? vecMap.get(sorted[i - 3].time) : undefined;
-    if (isMarketBreak(c.time)) continue;
-    if (!(lb != null && c.close > lb)) continue;
-    if (lb != null && prevLb != null && lb < prevLb) continue;
-
-    const secondaryVecOk = secMaps.some(m => { const v = m.get(c.time); return v != null && c.close > v; });
-    const utcH = (c.time / 3600 | 0) % 24, utcMin = (c.time / 60 | 0) % 60;
-    const minsUtc = utcH * 60 + utcMin;
-    const rthFlag = c.rth ?? isRTH(c.time);
-    const isRthForMilk = rthFlag && minsUtc >= 13 * 60 + 30 && minsUtc < 20 * 60 + 30;
-
-    // milkOk: price-based check — candle wicked into a bullish zone AND closed above its bottom
-    let milkOk = false;
-    if (isRthForMilk) {
-      for (const z of mlZones) {
-        if (!z.is_bull) continue;
-        if (c.time < z.from_ts || c.time > z.to_ts) continue;
-        if (c.low <= z.top + MILK_TOL && c.close >= z.bottom - MILK_TOL) { milkOk = true; break; }
-      }
-    }
-
-    // SAFE: MilkZone AND secondary Vector both confirm
-    // RISKY: exactly one of MilkZone / secondary Vector confirms
-    // RISKIEST: neither confirms (pattern-only fallback)
-    let level: RiskLevel =
-      (milkOk && secondaryVecOk) ? "safe" :
-      (milkOk || secondaryVecOk) ? "risky" :
-      "riskiest";
-
-    if (rthFlag && utcH >= 20 && level !== "safe") continue;
-
-    const cooldown  = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-    const lastUsed  = rthFlag ? lastLongBar   : lastLongEthBar;
-    if (i - lastUsed < cooldown) continue;
-    if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
-
-    // Fixed-point exits (Monte Carlo calibrated)
-    const tp1 = c.close + TP_FIXED_1;
-    const tp2 = c.close + TP_FIXED_2;
-    const sl  = c.close - SL_FIXED;
-
-    let reclassifyReason: string | undefined;
-    for (const z of mlZones) {
-      if (z.is_bull) continue;
-      if (c.time < z.from_ts || c.time > z.to_ts) continue;
-      const dist = z.bottom - c.close;
-      if (dist >= 0 && dist <= RESIST_PROX) {
-        reclassifyReason = `Resistance at ${z.bottom.toFixed(2)} (${dist.toFixed(1)} pts above)`;
-        break;
-      }
-    }
-
-    raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Long", riskLevel: level, price: c.close, tp1, tp2, sl, milkOk, secondaryVecOk, reclassifyReason });
-  }
-  return raw;
+  const sorted  = [...candles].sort((a, b) => a.time - b.time);
+  const openMap = new Map(sorted.map(c => [c.time, c.open]));
+  const zones   = detectEngineZones(sorted);
+  return computeEngineSignalsBothSessions(sorted, zones, ENGINE_EXIT_PROFILES.safe).map(s => ({
+    time: s.time,
+    open: openMap.get(s.time) ?? s.price,
+    high: s.high,
+    low:  s.low,
+    direction: s.direction,
+    riskLevel: s.tier as RiskLevel,
+    price: s.price,
+    tp1: s.tp1, tp2: s.tp2, sl: s.sl,
+    milkOk: s.milkOk,
+    secondaryVecOk: false,
+    preOutcome: s.outcome,
+  }));
 }
 
 function computeOutcome(
@@ -362,11 +319,16 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   }, [startDate]);
 
   // ── data fetching ───────────────────────────────────────────────────────────
+  // SHARED-ENGINE: fetch 2 extra lead-in days so the engine's 20-bar vector,
+  // zone detection and 10-bar cooldown have warm-up history — signals shown for
+  // the selected range then match the Backtest page (which loads full history).
+  // Display filtering below still uses fromTs, so no extra signals appear.
+  const dataFromTs = fromTs - 2 * 86400;
   const fetchIval = ival === "1m" ? "1m" : "5m";
   const { data: mainData, isLoading } = useQuery<{ candles: CandleBar[] }>({
-    queryKey: ["sp-candles", sym, fetchIval, fromTs, toTs],
+    queryKey: ["sp-candles", sym, fetchIval, dataFromTs, toTs],
     queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${sym}/${fetchIval}?from=${fromTs}&to=${toTs}`);
+      const r = await fetch(`/api/data/cached-continuous/${sym}/${fetchIval}?from=${dataFromTs}&to=${toTs}`);
       if (!r.ok) throw new Error("fetch failed");
       return r.json();
     },
@@ -375,9 +337,9 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
 
   // Secondary 5m (only when interval=1m — needed for secondary vectors)
   const { data: sec5m } = useQuery<{ candles: CandleBar[] }>({
-    queryKey: ["sp-candles", sym, "5m", fromTs, toTs],
+    queryKey: ["sp-candles", sym, "5m", dataFromTs, toTs],
     queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${sym}/5m?from=${fromTs}&to=${toTs}`);
+      const r = await fetch(`/api/data/cached-continuous/${sym}/5m?from=${dataFromTs}&to=${toTs}`);
       if (!r.ok) throw new Error("fetch failed");
       return r.json();
     },
@@ -429,18 +391,6 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   const embedded = externalSignals != null;
   const useExternal = embedded;
 
-  // ML zones — used by computeSignals fallback path (when not using external signals)
-  const { data: spMlZonesData } = useQuery<{ zones: MLZone[] }>({
-    queryKey: ["/api/ml/zones/strong", fromTs, toTs],
-    queryFn: async () => {
-      const r = await fetch(`/api/ml/zones/strong?from_ts=${fromTs}&to_ts=${toTs}`);
-      if (!r.ok) throw new Error("Failed");
-      return r.json();
-    },
-    enabled: !useExternal && fromTs > 0 && toTs > 0,
-    staleTime: 30 * 60_000,
-  });
-
   // ── signal computation ──────────────────────────────────────────────────────
   const openMap = useMemo(() => new Map(sortedPrimary.map(c => [c.time, c.open])), [sortedPrimary]);
   const rawSignals = useMemo((): RawSignal[] => {
@@ -465,8 +415,8 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         confidence: s.confidence,
       }));
     }
-    return computeSignals(primaryCandles, secondaryCandles, spMlZonesData?.zones ?? []);
-  }, [useExternal, externalSignals, openMap, primaryCandles, secondaryCandles, spMlZonesData]);
+    return computeSignals(primaryCandles);
+  }, [useExternal, externalSignals, openMap, primaryCandles]);
 
   const signals = useMemo((): SignalEntry[] => {
     return rawSignals
