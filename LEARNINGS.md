@@ -145,6 +145,11 @@ Milk draws zones at market open each day. These are fixed predictions — they d
 
 ## Session Log
 
+**2026-07-16 (later still) — Signal-firing optimizer (`scripts/optimize-signals.ts`)**
+- Grid search over all 31 strategy-gate combos (+Program mode) × interval (5m/15m/both) × session (RTH/ETH/both) × exits (TP1 {6,8,10,12.5,15} × TP2 {1.6×,2×} × SL {3,4,5,6}); 480 stage-2 configs. Train = first 21 days, test = last 9 days (selection on train only, ≥30 closed train trades required). Output: `backtests/MES-optimized-signal-backtest.xlsx`.
+- **Findings**: every top-12 shape was 15m + RTH — no 5m or ETH shape survived. Best WR: V+I+F 15m RTH TP1 6/TP2 12/SL 3 (train 71.1% → test 57.1%, +172.6 pts full). Best points & recommended: **I+B (ICT zones + candle body) 15m RTH TP1 8/TP2 16/SL 4** — 412 pts ($2,060) full month @ 52.5% WR, test window stayed profitable (+92 pts). Parameter neighborhood stable (SL 3–6 all 380–418 pts) → not an isolated overfit spike. The current Program config (V+B+F, YB tier, Tight exits) lost 46 pts over the same month and went 48.3% WR / −120 pts in the test window.
+- Learning: I+F looked as good as I+B on train (5.1 exp) but FAILED validation (test −6.2 pts) — the train/test split earns its keep; never ship a config on train numbers alone.
+
 **2026-07-16 (later) — Yellow Box zone strategy replaces milk zones + ICT/probability in workbook**
 - **Zone source replaced**: the engine's signal-confirmation zones are now the Yellow Box strategy (`computeYellowBoxZones` in signal-engine.ts), implementing the spec in `attached_assets/Pasted-Build-an-algorithm-…`: per trading day, box center = day's OPENING price, box width = mean daily H−L over last 14 trading days; `raw_diff = max(|open − prevOpen|/open, 0.001)`; support/resistance zones start `raw_diff × open` pts beyond the box edges with thickness 30% of that distance. Support zone → bullish confirmation, resistance zone → bearish. Emits 2 zones/day (very selective vs ~40/day from the old detector).
 - **Old FVG/OB/structural detector kept as `detectIctZones`** — it IS the ICT concept set (Fair Value Gaps, Order Blocks, structural swings) and lives on as the "I" strategy component in the combo backtester. It no longer feeds app signals.
