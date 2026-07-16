@@ -6,10 +6,11 @@ import {
   type ZoneBand,
 } from "@/components/CandlestickChart";
 import {
-  EXIT_STRATEGY_PROFILES,
   MILK_TOLERANCE,
+  OPTIMIZED_GATES,
+  OPTIMIZED_EXITS,
   aggregateToInterval,
-  computeYellowBoxZones,
+  detectIctZones,
   computeEngineSignals,
   isBullZone,
   type EngineSignal,
@@ -32,7 +33,6 @@ const MW = {
 // chart and the Signals tab.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-type ExitKey    = "safe" | "risky" | "riskiest";
 type TierKey    = "safe" | "risky";
 type SessionKey = "rth" | "eth";
 type Outcome = "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
@@ -50,17 +50,17 @@ interface BacktestSignal {
 interface TierStat { count: number; winTp1: number; winTp2: number; loss: number; open: number }
 
 interface BacktestResult {
-  symbol: string; interval: string; exitStrategy: ExitKey;
+  symbol: string; interval: string; exitStrategy: string;
   fromDate: string; toDate: string; totalBars: number;
   tiers: { safe: TierStat; risky: TierStat };
   signals: BacktestSignal[];
 }
 
-// ── Zone detection: Yellow Box strategy (shared engine, ZoneBand-compatible) ──
-// Per-day box centered on the day's opening price; support/resistance zones a
-// percentage distance from the box edges. Replaces the old milk-zone detector.
+// ── Zone detection: ICT zones (shared engine, ZoneBand-compatible) ────────────
+// FVG / Order Block / structural swing levels — the zones THE program strategy
+// confirms against (ICT Zones + Candle Body, optimized 2026-07-16).
 function detectMilkZones(candles: CandleBar[]): ZoneBand[] {
-  return computeYellowBoxZones(candles) as ZoneBand[];
+  return detectIctZones(candles) as ZoneBand[];
 }
 
 // ── Backtest engine ───────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ function runBacktest(
   candles: CandleBar[],
   milkZones: ZoneBand[],
   profile: { rth: { tp1Safe: number; tp1: number; tp2: number; sl: number }; eth: { tp1Safe: number; tp1: number; tp2: number; sl: number } },
-  symbol: string, interval: string, exitStrategy: ExitKey, session: SessionKey,
+  symbol: string, interval: string, exitStrategy: string, session: SessionKey,
 ): BacktestResult {
   const sorted = [...candles].sort((a, b) => a.time - b.time);
   const isBullZ = isBullZone;
@@ -135,7 +135,8 @@ function runBacktest(
   };
 
   // ── Run the shared engine — the ONE signal code path for all pages ──────────
-  const engineSignals: EngineSignal[] = computeEngineSignals(sorted, milkZones, profile, session);
+  // OPTIMIZED_GATES = ICT zone required + candle body; no vector/footprint gate.
+  const engineSignals: EngineSignal[] = computeEngineSignals(sorted, milkZones, profile, session, OPTIMIZED_GATES);
 
   for (const s of engineSignals) {
     const out = s.outcome as Outcome;
@@ -496,8 +497,8 @@ function runMonteCarlo(signals: BacktestSignal[]): MCResult {
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function BacktestPage() {
   const [symbol, setSymbol]               = useState("MES");
-  const [interval, setInterval]           = useState<"1m"|"5m"|"15m"|"60m">("5m");
-  const [exitStrategy, setExitStrategy]   = useState<ExitKey>("safe");
+  // THE program strategy fires on 15m — default the backtest to it
+  const [interval, setInterval]           = useState<"1m"|"5m"|"15m"|"60m">("15m");
   const [enabledTiers, setEnabledTiers]   = useState<Set<TierKey>>(new Set(["safe", "risky"]));
   const [sessionMode, setSessionMode]     = useState<SessionKey>("rth");
   const [candles, setCandles]             = useState<CandleBar[]>([]);
@@ -560,15 +561,15 @@ export default function BacktestPage() {
       setCandles(bars);
       const zones   = detectMilkZones(bars);
       setMilkZones(zones);
-      const profile = EXIT_STRATEGY_PROFILES[exitStrategy];
-      const bt      = runBacktest(bars, zones, profile, symbol, interval, exitStrategy, sessionMode);
+      // Fixed exits — part of the optimized strategy (TP1 +8 / TP2 +16 / SL −4)
+      const bt      = runBacktest(bars, zones, OPTIMIZED_EXITS, symbol, interval, "optimized", sessionMode);
       setResult(bt);
     } catch (e: any) {
       setLoadError(e.message ?? "Failed to load");
     } finally {
       setIsLoading(false);
     }
-  }, [symbol, interval, exitStrategy, sessionMode, intervalSec]);
+  }, [symbol, interval, sessionMode, intervalSec]);
 
   const saveMl = async () => {
     if (!result || !hasNew) return;
@@ -600,8 +601,7 @@ export default function BacktestPage() {
   };
 
   // ── Derived stats ───────────────────────────────────────────────────────────
-  const profile    = EXIT_STRATEGY_PROFILES[exitStrategy];
-  const exitProfile = profile[sessionMode];
+  const exitProfile = OPTIMIZED_EXITS[sessionMode];
   const filteredSignals = result
     ? result.signals.filter(s => enabledTiers.has(s.tier))
     : [];
@@ -723,24 +723,10 @@ export default function BacktestPage() {
           <option value="60m">60m</option>
         </select>
 
-        {/* Exit strategy */}
-        <div style={{ display: "flex", gap: 4 }}>
-          {(["safe", "risky", "riskiest"] as ExitKey[]).map(k => {
-            const p = EXIT_STRATEGY_PROFILES[k];
-            const active = exitStrategy === k;
-            const col = k === "safe" ? "#26c87a" : k === "risky" ? "#f59e0b" : "#ef4444";
-            return (
-              <button key={k} onClick={() => setExitStrategy(k)} style={{
-                padding: "2px 10px", borderRadius: 4, fontSize: 11, cursor: "pointer",
-                background: active ? col + "22" : "transparent",
-                border: `1px solid ${active ? col : MW.border}`,
-                color: active ? col : MW.muted,
-              }}>
-                {p.label}
-              </button>
-            );
-          })}
-        </div>
+        {/* Exit strategy — fixed by the optimized program strategy */}
+        <span style={{ fontSize: 11, color: MW.muted, padding: "2px 8px", border: `1px solid ${MW.border}`, borderRadius: 4 }}>
+          Exits: TP1 +8 · TP2 +16 · SL −4 (optimized)
+        </span>
 
         {/* Session toggle — RTH / ETH */}
         <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: `1px solid ${MW.border}` }}>

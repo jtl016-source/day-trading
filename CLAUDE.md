@@ -60,11 +60,16 @@ MotiveWave (Java study)
 - Forward-fill coarser vectors onto finer chart times using `forwardFillVector(vec, chartTimes)`
 - Pre-allocate exactly 3 extra `LineSeries` at chart init — update data only, never add/remove
 
-### Signal Levels
-- **safe**: zone + vector direction + bullish/bearish body + within 3 most recent zones
-- **risky**: zone + vector direction + body confirmation
-- **riskiest**: zone + vector direction only
-- Cooldown: 10 RTH bars between signals (prevents clustering)
+### Signals — THE program strategy (optimized 2026-07-16)
+- ONE signal source for chart, Signals tab, backtest and notifications:
+  `computeOptimizedSignals` in `client/src/lib/signal-engine.ts`
+- Rule: 15m RTH candle tests-and-holds an ICT zone (FVG/Order Block/structural, ±2 pts)
+  AND closes in the trade direction. No vector gate, no footprint gate.
+- Exits: TP1 +8 / TP2 +16 / SL −4 (`OPTIMIZED_EXITS`); gates in `OPTIMIZED_GATES`
+- Signals fire on 15m bars ONLY, regardless of viewed chart interval
+- Cooldown: 10 bars between signals per direction (prevents clustering)
+- Baseline risk filters always on: HOD long suppression (5 pts), 60m declining-vector
+  long veto, CME settlement-break skip, session-settle exits
 
 ### RTH Definition
 - Mon–Fri, 13:30–21:00 UTC (9:30am–5pm ET)

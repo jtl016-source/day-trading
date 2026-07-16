@@ -145,6 +145,13 @@ Milk draws zones at market open each day. These are fixed predictions — they d
 
 ## Session Log
 
+**2026-07-16 (final) — ALL program signals replaced with the optimized strategy**
+- Per user decision, every signal surface now runs `computeOptimizedSignals` (signal-engine.ts): **ICT Zones + Candle Body on 15m RTH, TP1 +8 / TP2 +16 / SL −4** (`OPTIMIZED_GATES` = { vector:false, zone:"required", body:true, footprint:false }, `OPTIMIZED_EXITS`). Verified to reproduce the optimizer's recommended config exactly (99 signals / 52.5% WR / +412 pts on the same month of MES=F data).
+- market.tsx: `allConfluenceSignals` → optimized signals (on the 60m chart the strategy runs from the background 15m fetch since 60m bars can't be disaggregated); signals tagged `interval:"15m"`. bg scanners for 1m/5m/60m permanently empty; bg15m = optimized. Chart fallback zones now display the ICT zones the strategy confirms against (detected on 15m aggregation).
+- SignalsPanel: embedded interval filter REMOVED (single 15m strategy — signals show on every chart interval); standalone mode computes from the 5m dataset (60m display bars can't be disaggregated to 15m); entries tagged 15m so "View on Chart" navigates to the 15m chart.
+- backtest.tsx: exit-strategy selector removed (exits fixed by the strategy); default interval now 15m; zones = ICT; gates = OPTIMIZED_GATES. Interval/session selectors remain for exploration but 15m+RTH is THE strategy.
+- Gotcha: `npx tsx --eval` with top-level await fails (cjs); test scripts must live inside the repo for node_modules resolution.
+
 **2026-07-16 (later still) — Signal-firing optimizer (`scripts/optimize-signals.ts`)**
 - Grid search over all 31 strategy-gate combos (+Program mode) × interval (5m/15m/both) × session (RTH/ETH/both) × exits (TP1 {6,8,10,12.5,15} × TP2 {1.6×,2×} × SL {3,4,5,6}); 480 stage-2 configs. Train = first 21 days, test = last 9 days (selection on train only, ≥30 closed train trades required). Output: `backtests/MES-optimized-signal-backtest.xlsx`.
 - **Findings**: every top-12 shape was 15m + RTH — no 5m or ETH shape survived. Best WR: V+I+F 15m RTH TP1 6/TP2 12/SL 3 (train 71.1% → test 57.1%, +172.6 pts full). Best points & recommended: **I+B (ICT zones + candle body) 15m RTH TP1 8/TP2 16/SL 4** — 412 pts ($2,060) full month @ 52.5% WR, test window stayed profitable (+92 pts). Parameter neighborhood stable (SL 3–6 all 380–418 pts) → not an isolated overfit spike. The current Program config (V+B+F, YB tier, Tight exits) lost 46 pts over the same month and went 48.3% WR / −120 pts in the test window.

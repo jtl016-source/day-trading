@@ -295,6 +295,35 @@ export function computeYellowBoxDisplayBands(candles: EngineCandle[], opts: Yell
  *  kept as an explicit ICT strategy component for backtesting/combos. */
 export const detectIctZones = detectMilkZones;
 
+// ── THE PROGRAM STRATEGY (optimized 2026-07-16) ───────────────────────────────
+// Winner of the 480-configuration train/test search (scripts/optimize-signals.ts):
+// ICT Zones + Candle Body on 15m during RTH with TP1 +8 / TP2 +16 / SL −4.
+// Full month: +412 pts ($2,060) at 52.5% WR; validation window stayed profitable.
+// Entry rule: a 15m RTH candle tests-and-holds an ICT zone (FVG / Order Block /
+// structural level, ±2 pts) AND closes in the trade direction. No vector gate,
+// no footprint gate. Baseline risk filters (cooldown, HOD suppression, 60m
+// declining veto, settlement skip) remain active inside the engine.
+export const OPTIMIZED_GATES: EngineGates = { vector: false, zone: "required", body: true, footprint: false };
+export const OPTIMIZED_EXITS: ExitProfile = {
+  rth: { tp1Safe: 8,   tp1: 8,   tp2: 16,  sl: 4 },
+  eth: { tp1Safe: 4.8, tp1: 4.8, tp2: 9.6, sl: 2.4 }, // unused (RTH-only strategy); kept for type completeness
+};
+export const OPTIMIZED_INTERVAL_SEC = 900; // signals fire on 15m bars only
+
+/** Compute THE program's signals from any candle set at 15m resolution or finer.
+ *  Candles are aggregated to 15m (idempotent for 15m input), ICT zones are
+ *  detected from them, and the engine runs RTH-only with the optimized gates
+ *  and exits. Every surface (chart, signals tab, backtest) calls this. */
+export function computeOptimizedSignals(
+  candles: EngineCandle[],
+  nowSec: number = Math.floor(Date.now() / 1000),
+): EngineSignal[] {
+  if (!candles.length) return [];
+  const c15 = aggregateToInterval(candles, OPTIMIZED_INTERVAL_SEC);
+  const zones = detectIctZones(c15);
+  return computeEngineSignals(c15, zones, OPTIMIZED_EXITS, "rth", OPTIMIZED_GATES, nowSec);
+}
+
 // ── Walk-forward outcome (identical rules to backtest.tsx btWalkForward) ──────
 export function btWalkForward(
   sorted: EngineCandle[], startIdx: number,

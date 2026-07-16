@@ -50,13 +50,9 @@ import {
 
 import { analyzeFootprint, buildProxyFootprintCandle, setFootprintDataConfirmed, FOOTPRINT_DATA_CONFIRMED, IMBALANCE_THRESHOLD, MW_IMBALANCE_THRESHOLDS, NET_THRESHOLDS, PROXY_TIER2, PROXY_TIER3, getCurrentSessionType, getLastCompletedSession, buildFrozenImbalances, updateMitigation, type FrozenImbalanceZone, type FootprintCandle, type ImbalanceCluster, type FootprintReading, type PriceLevelData } from "@/lib/footprint-analysis"; // FOOTPRINT-STRATEGY:
 import {
-  EXIT_STRATEGY_PROFILES as ENGINE_EXIT_PROFILES,
-  computeYellowBoxZones,
-  computeYellowBoxDisplayBands,
-  computeEngineSignals,
-  computeEngineSignalsBothSessions,
-  type ExitProfile,
-} from "@/lib/signal-engine"; // SHARED-ENGINE: single signal source of truth (matches Backtest page)
+  computeOptimizedSignals,
+  detectIctZones,
+} from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface SymbolInfo { symbol: string; name: string }
@@ -323,16 +319,15 @@ function computeVectorLine(candles: CandleBar[]): Array<{ time: number; value: n
   return result;
 }
 
-// ── Background signal scanner (used for all-interval notifications) ──────────
-// SHARED-ENGINE: delegates to computeEngineSignals so background notifications
-// fire on the SAME EXACT signals the Backtest page (and chart) produce.
+// ── Background signal scanner (used for notifications) ───────────────────────
+// SHARED-ENGINE: delegates to computeOptimizedSignals — THE program strategy
+// (ICT Zones + Candle Body, 15m RTH, 8/16/4 exits) — so notifications fire on
+// the SAME EXACT signals the chart, Signals tab and Backtest page show.
 function computeBgSignals(
   candles: CandleBar[],
-  profile: ExitProfile,
 ): Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; riskLevel: "safe" | "risky" | "riskiest" }> {
   if (candles.length < 22) return [];
-  const zones = computeYellowBoxZones(candles);
-  return computeEngineSignals(candles, zones, profile, "rth").map(s => ({
+  return computeOptimizedSignals(candles).map(s => ({
     time: s.time, direction: s.direction, price: s.price,
     tp1: s.tp1, tp2: s.tp2, sl: s.sl, riskLevel: s.tier as "safe" | "risky" | "riskiest",
   }));
@@ -2077,12 +2072,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     staleTime: 30 * 60_000,
   });
 
-  // Client-side zones: Yellow Box strategy display bands (the per-day box plus
-  // its support/resistance zones — the zones that drive signals).
-  // Fallback only — used when no Discord zones are available.
+  // Client-side zones: the ICT zones (FVG / Order Block / structural) that THE
+  // program strategy confirms against, detected on 15m — exactly what the
+  // signal engine sees. Fallback only — used when no Discord zones are available.
   const clientMilkZones = useMemo((): ZoneBand[] => {
     if (!windowedCandles.length) return [];
-    return computeYellowBoxDisplayBands(windowedCandles) as ZoneBand[];
+    return detectIctZones(aggToInterval(windowedCandles, 900)) as ZoneBand[];
   }, [windowedCandles]);
 
   // Discord zones — exact levels posted by Milk in Discord (highest authority).
@@ -2183,21 +2178,18 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     interval?: string;
   };
 
-  // ── Confluence signals — SHARED ENGINE ─────────────────────────────────────
-  // Signals come from @/lib/signal-engine — the EXACT code path the Backtest
-  // page runs (proxy-footprint veto/delta gates, body confirmation, HOD
-  // suppression, 60m declining veto, 10-bar cooldown, zone tiering, walk-forward
-  // outcomes). RTH and ETH sessions are computed separately (mirroring the
-  // backtest's session modes) and merged chronologically, so the chart and the
-  // Signals tab always show the SAME EXACT signals as the backtest.
-  // Zones come from the engine's Yellow Box strategy (per-day open-centered box
-  // + percentage R/S zones) — the same zone source the backtest uses (NOT the
-  // Discord/MWML display zones).
+  // ── Confluence signals — THE PROGRAM STRATEGY (optimized) ───────────────────
+  // ONE signal source for the whole app: computeOptimizedSignals in
+  // @/lib/signal-engine — ICT Zones + Candle Body on 15m during RTH with
+  // TP1 +8 / TP2 +16 / SL −4 (winner of the 480-config train/test search).
+  // Signals always fire on 15m bars regardless of the viewed chart interval;
+  // on 1m/5m charts the 15m bucket-start timestamps line up with real bars.
+  // On the 60m chart the strategy runs from the background 15m fetch.
   const allConfluenceSignals = useMemo((): CSig[] => {
-    if (!allBarsForVector.length) return [];
-    const sorted = [...allBarsForVector].sort((a, b) => a.time - b.time);
-    const zones  = computeYellowBoxZones(sorted);
-    const engineSigs = computeEngineSignalsBothSessions(sorted, zones, ENGINE_EXIT_PROFILES[exitStrategy]);
+    const source = interval === "60m" ? (bg15mData?.candles ?? []) : allBarsForVector;
+    if (!source.length) return [];
+    const sorted = [...source].sort((a, b) => a.time - b.time);
+    const engineSigs = computeOptimizedSignals(sorted);
     return engineSigs.map((s): CSig => ({
       time: s.time, price: s.price, high: s.high, low: s.low,
       direction: s.direction,
@@ -2205,9 +2197,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       riskLevel: s.tier,
       confirmations: { milkOk: s.milkOk, vecOk: true, secondaryVecOk: false },
       outcome: s.outcome,
-      interval,
+      interval: "15m",
     }));
-  }, [allBarsForVector, exitStrategy, interval]);
+  }, [allBarsForVector, bg15mData, interval]);
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
@@ -2294,31 +2286,18 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return Math.floor((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) + ET_OFFSET_H * 3_600_000) / 1000);
   }, [windowedDays]);
 
-  // ── Background signals for all intervals ─────────────────────────────────
-  // Each interval always sources from its own data — background fetch or current view.
-  const bgSignals1m  = useMemo(() => {
-    const candles = interval === "1m" ? windowedCandles : (bg1mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, ENGINE_EXIT_PROFILES[exitStrategy]);
-  }, [windowedCandles, bg1mData, interval, exitStrategy]);
-
-  const bgSignals5m  = useMemo(() => {
-    const candles = interval === "5m" ? windowedCandles : (bg5mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, ENGINE_EXIT_PROFILES[exitStrategy]);
-  }, [windowedCandles, bg5mData, interval, exitStrategy]);
+  // ── Background signals ─────────────────────────────────────────────────────
+  // THE program strategy fires on 15m only — the other interval scanners are
+  // permanently empty (kept so notification plumbing stays unchanged).
+  const bgSignals1m  = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
+  const bgSignals5m  = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
+  const bgSignals60m = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
 
   const bgSignals15m = useMemo(() => {
     const candles = interval === "15m" ? windowedCandles : (bg15mData?.candles ?? []);
     if (!candles.length) return [];
-    return computeBgSignals(candles, ENGINE_EXIT_PROFILES[exitStrategy]);
-  }, [windowedCandles, bg15mData, interval, exitStrategy]);
-
-  const bgSignals60m = useMemo(() => {
-    const candles = interval === "60m" ? windowedCandles : (bg60mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, ENGINE_EXIT_PROFILES[exitStrategy]);
-  }, [windowedCandles, bg60mData, interval, exitStrategy]);
+    return computeBgSignals(candles);
+  }, [windowedCandles, bg15mData, interval]);
 
   // Keep latestSignalsRef in sync so the 3s auto-trade confirmation callback
   // can verify a signal is still live before sending an order.

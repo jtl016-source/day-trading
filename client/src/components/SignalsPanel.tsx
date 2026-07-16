@@ -2,11 +2,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GraduationCap, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
-import {
-  EXIT_STRATEGY_PROFILES as ENGINE_EXIT_PROFILES,
-  computeYellowBoxZones,
-  computeEngineSignalsBothSessions,
-} from "@/lib/signal-engine"; // SHARED-ENGINE: single signal source of truth (matches Backtest page)
+import { computeOptimizedSignals } from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const MW = {
@@ -209,18 +205,16 @@ interface RawSignal {
 
 type MLZone = { from_ts: number; to_ts: number; top: number; bottom: number; is_bull: boolean; score: number };
 
-// SHARED-ENGINE: standalone signal computation delegates to the shared engine —
-// the EXACT code path the Backtest page runs — so the Signals tab always shows
-// the SAME EXACT signals as the backtest. Zones come from the engine's Yellow
-// Box strategy (per-day open-centered box + percentage R/S zones — same zone
-// source as the backtest). Exit levels use the "safe" (Tight) profile — the
-// Backtest page default.
+// SHARED-ENGINE: standalone signal computation delegates to computeOptimizedSignals —
+// THE program strategy (ICT Zones + Candle Body on 15m RTH, TP1 +8 / TP2 +16 /
+// SL −4) — the EXACT code path the Market chart and Backtest page run, so the
+// Signals tab always shows the SAME EXACT signals. Input candles are aggregated
+// to 15m inside the engine regardless of the panel's display interval.
 function computeSignals(candles: CandleBar[]): RawSignal[] {
   if (!candles.length) return [];
   const sorted  = [...candles].sort((a, b) => a.time - b.time);
   const openMap = new Map(sorted.map(c => [c.time, c.open]));
-  const zones   = computeYellowBoxZones(sorted);
-  return computeEngineSignalsBothSessions(sorted, zones, ENGINE_EXIT_PROFILES.safe).map(s => ({
+  return computeOptimizedSignals(sorted).map(s => ({
     time: s.time,
     open: openMap.get(s.time) ?? s.price,
     high: s.high,
@@ -396,9 +390,9 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   const openMap = useMemo(() => new Map(sortedPrimary.map(c => [c.time, c.open])), [sortedPrimary]);
   const rawSignals = useMemo((): RawSignal[] => {
     if (useExternal) {
-      // FIX: only show signals tagged for the current interval — safety filter for any stale cross-interval signals
-      const intervalFiltered = externalSignals.filter(s => !s.interval || s.interval === defaultInterval);
-      return intervalFiltered.map(s => ({
+      // THE program strategy fires on 15m only — show its signals regardless of
+      // the chart's viewed interval (no cross-interval filtering needed).
+      return externalSignals.map(s => ({
         time: s.time,
         open: openMap.get(s.time) ?? s.price,
         high: s.high,
@@ -416,8 +410,10 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         confidence: s.confidence,
       }));
     }
-    return computeSignals(primaryCandles);
-  }, [useExternal, externalSignals, openMap, primaryCandles]);
+    // Standalone mode: always compute from the 5m dataset — the engine
+    // aggregates to 15m internally (60m display bars cannot be disaggregated).
+    return computeSignals(base5m);
+  }, [useExternal, externalSignals, openMap, base5m]);
 
   const signals = useMemo((): SignalEntry[] => {
     return rawSignals
@@ -448,7 +444,9 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           const res = computeOutcome(s, sortedPrimary);
           outcome = res.outcome; tpHit = res.tpHit; points = res.points;
         }
-        return { key: `${sym}-${s.time}-${ival}`, ...s, interval: ival, rth: isRTH(s.time), outcome, tpHit, points };
+        // All program signals are 15m strategy signals — tag them as such so
+        // "View on Chart" navigates to the 15m interval where they fired.
+        return { key: `${sym}-${s.time}-15m`, ...s, interval: "15m" as IntervalKey, rth: isRTH(s.time), outcome, tpHit, points };
       })
       .filter(s => {
         if (s.time < fromTs || s.time > toTs) return false;
