@@ -198,6 +198,8 @@ interface RawSignal {
   reclassifyReason?: string;
   /** Pre-computed outcome from market.tsx (only set when externalSignals provided) */
   preOutcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
+  /** The strategy interval this signal fired on (5m or 15m) */
+  sigInterval?: "5m" | "15m";
   signalType?: "pure_tabletop" | "side_tabletop";
   footprintReading?: string; // FOOTPRINT-UI: JSON FootprintReading
   confidence?: number; // 0–100 confidence score
@@ -226,6 +228,7 @@ function computeSignals(candles: CandleBar[]): RawSignal[] {
     milkOk: s.milkOk,
     secondaryVecOk: false,
     preOutcome: s.outcome,
+    sigInterval: s.interval,
   }));
 }
 
@@ -408,6 +411,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         signalType: s.signalType,
         footprintReading: s.footprintReading, // FOOTPRINT-UI:
         confidence: s.confidence,
+        sigInterval: s.interval === "5m" ? "5m" : "15m",
       }));
     }
     // Standalone mode: always compute from the 5m dataset — the engine
@@ -444,9 +448,11 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           const res = computeOutcome(s, sortedPrimary);
           outcome = res.outcome; tpHit = res.tpHit; points = res.points;
         }
-        // All program signals are 15m strategy signals — tag them as such so
-        // "View on Chart" navigates to the 15m interval where they fired.
-        return { key: `${sym}-${s.time}-15m`, ...s, interval: "15m" as IntervalKey, rth: isRTH(s.time), outcome, tpHit, points };
+        // Tag each entry with the strategy interval it fired on (5m or 15m) so
+        // "View on Chart" navigates to that interval. A 5m and a 15m signal can
+        // share a timestamp, so the interval is part of the key.
+        const sigIv = (s.sigInterval ?? "15m") as IntervalKey;
+        return { key: `${sym}-${s.time}-${sigIv}`, ...s, interval: sigIv, rth: isRTH(s.time), outcome, tpHit, points };
       })
       .filter(s => {
         if (s.time < fromTs || s.time > toTs) return false;

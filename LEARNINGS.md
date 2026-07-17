@@ -145,6 +145,13 @@ Milk draws zones at market open each day. These are fixed predictions — they d
 
 ## Session Log
 
+**2026-07-17 — Strategy now trades 5m AND 15m (dual-interval, per-interval exits)**
+- `computeOptimizedSignals` runs the ICT+Body RTH rule on BOTH intervals and tags each signal (`OptimizedSignal.interval`). Exits are per-interval: 15m = 8/16/4; **5m = 4/8/4** (grid-calibrated: train 57.1% WR / 220 pts, test 60.7% / +112 pts, full +332 pts @ 58.3%). CRITICAL: the 15m exits on 5m bars scored only +56 pts @ 34.9% — never share exit parameters across intervals.
+- market.tsx: per-interval data sources (5m component needs ≤5m bars — on the 15m chart use rawCandleData (raw 5m), on 60m use bg15mData); the primary notification effect now groups by SIGNAL interval (not viewed chart interval) so `autoTradeIntervalRef.has(ivLabel)` gates correctly; bg scanners all permanently empty (allConfluenceSignals covers both intervals from any chart).
+- Auto-trade "Trade on intervals" UI reduced to 5m/15m checkboxes, default BOTH on (was ["5m"] — persisted values survive, so existing users keep their choice).
+- SignalsPanel: entries tagged with their firing interval (5m/15m in the key too — both can share a timestamp); View on Chart navigates to that interval.
+- Verified vs grid: 5m 264 signals / 58.3% / +332 pts · 15m 99 / 52.5% / +412 pts · combined +744 pts ($3,720) on the benchmark month.
+
 **2026-07-16 (final) — ALL program signals replaced with the optimized strategy**
 - Per user decision, every signal surface now runs `computeOptimizedSignals` (signal-engine.ts): **ICT Zones + Candle Body on 15m RTH, TP1 +8 / TP2 +16 / SL −4** (`OPTIMIZED_GATES` = { vector:false, zone:"required", body:true, footprint:false }, `OPTIMIZED_EXITS`). Verified to reproduce the optimizer's recommended config exactly (99 signals / 52.5% WR / +412 pts on the same month of MES=F data).
 - market.tsx: `allConfluenceSignals` → optimized signals (on the 60m chart the strategy runs from the background 15m fetch since 60m bars can't be disaggregated); signals tagged `interval:"15m"`. bg scanners for 1m/5m/60m permanently empty; bg15m = optimized. Chart fallback zones now display the ICT zones the strategy confirms against (detected on 15m aggregation).

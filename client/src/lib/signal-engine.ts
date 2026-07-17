@@ -295,33 +295,69 @@ export function computeYellowBoxDisplayBands(candles: EngineCandle[], opts: Yell
  *  kept as an explicit ICT strategy component for backtesting/combos. */
 export const detectIctZones = detectMilkZones;
 
-// ── THE PROGRAM STRATEGY (optimized 2026-07-16) ───────────────────────────────
+// ── THE PROGRAM STRATEGY (optimized 2026-07-16, dual-interval 2026-07-17) ─────
 // Winner of the 480-configuration train/test search (scripts/optimize-signals.ts):
-// ICT Zones + Candle Body on 15m during RTH with TP1 +8 / TP2 +16 / SL −4.
-// Full month: +412 pts ($2,060) at 52.5% WR; validation window stayed profitable.
-// Entry rule: a 15m RTH candle tests-and-holds an ICT zone (FVG / Order Block /
-// structural level, ±2 pts) AND closes in the trade direction. No vector gate,
-// no footprint gate. Baseline risk filters (cooldown, HOD suppression, 60m
-// declining veto, settlement skip) remain active inside the engine.
+// ICT Zones + Candle Body during RTH. Entry rule: an RTH candle tests-and-holds
+// an ICT zone (FVG / Order Block / structural level, ±2 pts) AND closes in the
+// trade direction. No vector gate, no footprint gate. Baseline risk filters
+// (cooldown, HOD suppression, 60m declining veto, settlement skip) stay active.
+//
+// The strategy trades TWO intervals, each with its own grid-calibrated exits
+// (both validated on an untouched test window):
+//   15m: TP1 +8 / TP2 +16 / SL −4  → +412 pts @ 52.5% WR on the benchmark month
+//   5m:  TP1 +4 / TP2 +8  / SL −4  → +332 pts @ 58.3% WR (test window 60.7% WR)
+// The 15m exits on 5m bars were re-tested and FAIL (+56 pts @ 34.9%) — never
+// share exit parameters across intervals.
 export const OPTIMIZED_GATES: EngineGates = { vector: false, zone: "required", body: true, footprint: false };
 export const OPTIMIZED_EXITS: ExitProfile = {
   rth: { tp1Safe: 8,   tp1: 8,   tp2: 16,  sl: 4 },
   eth: { tp1Safe: 4.8, tp1: 4.8, tp2: 9.6, sl: 2.4 }, // unused (RTH-only strategy); kept for type completeness
 };
-export const OPTIMIZED_INTERVAL_SEC = 900; // signals fire on 15m bars only
+export const OPTIMIZED_EXITS_5M: ExitProfile = {
+  rth: { tp1Safe: 4,   tp1: 4,   tp2: 8,   sl: 4 },
+  eth: { tp1Safe: 2.4, tp1: 2.4, tp2: 4.8, sl: 2.4 }, // unused (RTH-only strategy)
+};
 
-/** Compute THE program's signals from any candle set at 15m resolution or finer.
- *  Candles are aggregated to 15m (idempotent for 15m input), ICT zones are
- *  detected from them, and the engine runs RTH-only with the optimized gates
- *  and exits. Every surface (chart, signals tab, backtest) calls this. */
+export type OptimizedInterval = "5m" | "15m";
+export const OPTIMIZED_INTERVALS: ReadonlyArray<{ sec: number; label: OptimizedInterval; exits: ExitProfile }> = [
+  { sec: 300, label: "5m",  exits: OPTIMIZED_EXITS_5M },
+  { sec: 900, label: "15m", exits: OPTIMIZED_EXITS },
+];
+
+export type OptimizedSignal = EngineSignal & { interval: OptimizedInterval };
+
+/** Compute THE program's signals from any candle set at 5m resolution or finer.
+ *  For each trading interval (5m and 15m) the candles are aggregated (idempotent
+ *  for matching input), ICT zones are detected, and the engine runs RTH-only
+ *  with the optimized gates and that interval's exits. Results are tagged with
+ *  their interval and merged chronologically. Every surface (chart, signals
+ *  tab, backtest, notifications, auto-trade) calls this. */
 export function computeOptimizedSignals(
   candles: EngineCandle[],
   nowSec: number = Math.floor(Date.now() / 1000),
-): EngineSignal[] {
+): OptimizedSignal[] {
   if (!candles.length) return [];
-  const c15 = aggregateToInterval(candles, OPTIMIZED_INTERVAL_SEC);
-  const zones = detectIctZones(c15);
-  return computeEngineSignals(c15, zones, OPTIMIZED_EXITS, "rth", OPTIMIZED_GATES, nowSec);
+  return OPTIMIZED_INTERVALS
+    .flatMap(iv => computeOptimizedSignalsForInterval(candles, iv.label, nowSec))
+    .sort((a, b) => a.time - b.time);
+}
+
+/** One trading interval of THE program strategy. `candles` must be at that
+ *  interval's resolution or finer (5m bars for the 5m component; 5m or 15m
+ *  bars for the 15m component — aggregation is idempotent for matching input).
+ *  Used by market.tsx, which has different best-available datasets per chart
+ *  interval (e.g. the 15m chart's main dataset cannot be disaggregated to 5m). */
+export function computeOptimizedSignalsForInterval(
+  candles: EngineCandle[],
+  interval: OptimizedInterval,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): OptimizedSignal[] {
+  if (!candles.length) return [];
+  const iv = OPTIMIZED_INTERVALS.find(x => x.label === interval)!;
+  const agg = aggregateToInterval(candles, iv.sec);
+  const zones = detectIctZones(agg);
+  return computeEngineSignals(agg, zones, iv.exits, "rth", OPTIMIZED_GATES, nowSec)
+    .map(s => ({ ...s, interval: iv.label }));
 }
 
 // ── Walk-forward outcome (identical rules to backtest.tsx btWalkForward) ──────

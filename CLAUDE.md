@@ -60,13 +60,18 @@ MotiveWave (Java study)
 - Forward-fill coarser vectors onto finer chart times using `forwardFillVector(vec, chartTimes)`
 - Pre-allocate exactly 3 extra `LineSeries` at chart init — update data only, never add/remove
 
-### Signals — THE program strategy (optimized 2026-07-16)
+### Signals — THE program strategy (optimized 2026-07-16, dual-interval 2026-07-17)
 - ONE signal source for chart, Signals tab, backtest and notifications:
   `computeOptimizedSignals` in `client/src/lib/signal-engine.ts`
-- Rule: 15m RTH candle tests-and-holds an ICT zone (FVG/Order Block/structural, ±2 pts)
+- Rule: an RTH candle tests-and-holds an ICT zone (FVG/Order Block/structural, ±2 pts)
   AND closes in the trade direction. No vector gate, no footprint gate.
-- Exits: TP1 +8 / TP2 +16 / SL −4 (`OPTIMIZED_EXITS`); gates in `OPTIMIZED_GATES`
-- Signals fire on 15m bars ONLY, regardless of viewed chart interval
+- Trades TWO intervals, each with grid-calibrated exits (never share exits across intervals):
+  · 15m: TP1 +8 / TP2 +16 / SL −4 (`OPTIMIZED_EXITS`)
+  · 5m:  TP1 +4 / TP2 +8  / SL −4 (`OPTIMIZED_EXITS_5M`)
+- Signals are tagged with their interval; the auto-trader's "Trade on intervals"
+  setting (5m/15m checkboxes) gates which ones fire orders
+- The 5m strategy component needs ≤5m candles — the 15m chart's dataset is 15m,
+  so market.tsx sources the raw 5m fetch there (60m chart: background 15m fetch)
 - Cooldown: 10 bars between signals per direction (prevents clustering)
 - Baseline risk filters always on: HOD long suppression (5 pts), 60m declining-vector
   long veto, CME settlement-break skip, session-settle exits

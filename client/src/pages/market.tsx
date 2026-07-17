@@ -51,6 +51,7 @@ import {
 import { analyzeFootprint, buildProxyFootprintCandle, setFootprintDataConfirmed, FOOTPRINT_DATA_CONFIRMED, IMBALANCE_THRESHOLD, MW_IMBALANCE_THRESHOLDS, NET_THRESHOLDS, PROXY_TIER2, PROXY_TIER3, getCurrentSessionType, getLastCompletedSession, buildFrozenImbalances, updateMitigation, type FrozenImbalanceZone, type FootprintCandle, type ImbalanceCluster, type FootprintReading, type PriceLevelData } from "@/lib/footprint-analysis"; // FOOTPRINT-STRATEGY:
 import {
   computeOptimizedSignals,
+  computeOptimizedSignalsForInterval,
   detectIctZones,
 } from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
 
@@ -773,7 +774,9 @@ export default function MarketPage() {
   const [autoTradeContracts, setAutoTradeContracts]     = useState(() => getPersistedSetting("autoTradeContracts", 1));
   const [autoTradeContractType, setAutoTradeContractType] = useState<"MES" | "ES">(() => getPersistedSetting<"MES"|"ES">("autoTradeContractType", "MES"));
   const [autoTradeRiskLevels, setAutoTradeRiskLevels]   = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeRiskLevels", ["safe"])));
-  const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m"])));
+  // THE program strategy trades 5m and 15m — both enabled by default; the
+  // "Trade on intervals" setting below gates which ones auto-trade fires.
+  const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m", "15m"])));
   const [autoTradeConnected, setAutoTradeConnected]     = useState(false);
   const [mwSyncStatus, setMwSyncStatus] = useState<"pending" | "syncing" | "done">("pending");
   const [mwSyncBars, setMwSyncBars]     = useState(0);
@@ -2178,18 +2181,25 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     interval?: string;
   };
 
-  // ── Confluence signals — THE PROGRAM STRATEGY (optimized) ───────────────────
-  // ONE signal source for the whole app: computeOptimizedSignals in
-  // @/lib/signal-engine — ICT Zones + Candle Body on 15m during RTH with
-  // TP1 +8 / TP2 +16 / SL −4 (winner of the 480-config train/test search).
-  // Signals always fire on 15m bars regardless of the viewed chart interval;
-  // on 1m/5m charts the 15m bucket-start timestamps line up with real bars.
-  // On the 60m chart the strategy runs from the background 15m fetch.
+  // ── Confluence signals — THE PROGRAM STRATEGY (optimized, dual-interval) ────
+  // ONE signal source for the whole app: the optimized engine strategy —
+  // ICT Zones + Candle Body during RTH, trading BOTH 5m (TP1 +4/TP2 +8/SL −4)
+  // and 15m (TP1 +8/TP2 +16/SL −4), each tagged with its interval so the
+  // auto-trader's "Trade on intervals" setting can gate which ones fire.
+  // Per-interval data sources: the 5m component needs ≤5m bars (the 15m chart's
+  // main dataset is already 15m and cannot be disaggregated, so it uses the raw
+  // 5m fetch; the 60m chart uses the background 15m fetch, which is 5m-resolution).
   const allConfluenceSignals = useMemo((): CSig[] => {
-    const source = interval === "60m" ? (bg15mData?.candles ?? []) : allBarsForVector;
-    if (!source.length) return [];
-    const sorted = [...source].sort((a, b) => a.time - b.time);
-    const engineSigs = computeOptimizedSignals(sorted);
+    const source5m: CandleBar[] =
+      interval === "1m" || interval === "5m" ? allBarsForVector
+      : interval === "15m" ? (rawCandleData?.candles ?? [])
+      : (bg15mData?.candles ?? []);
+    const source15m: CandleBar[] = interval === "15m" ? allBarsForVector : source5m;
+    if (!source5m.length && !source15m.length) return [];
+    const engineSigs = [
+      ...computeOptimizedSignalsForInterval([...source5m].sort((a, b) => a.time - b.time), "5m"),
+      ...computeOptimizedSignalsForInterval([...source15m].sort((a, b) => a.time - b.time), "15m"),
+    ].sort((a, b) => a.time - b.time);
     return engineSigs.map((s): CSig => ({
       time: s.time, price: s.price, high: s.high, low: s.low,
       direction: s.direction,
@@ -2197,9 +2207,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       riskLevel: s.tier,
       confirmations: { milkOk: s.milkOk, vecOk: true, secondaryVecOk: false },
       outcome: s.outcome,
-      interval: "15m",
+      interval: s.interval,
     }));
-  }, [allBarsForVector, bg15mData, interval]);
+  }, [allBarsForVector, rawCandleData, bg15mData, interval]);
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
@@ -2287,17 +2297,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   }, [windowedDays]);
 
   // ── Background signals ─────────────────────────────────────────────────────
-  // THE program strategy fires on 15m only — the other interval scanners are
+  // Redundant now: allConfluenceSignals always computes BOTH strategy intervals
+  // (5m + 15m) regardless of the viewed chart, so the background scanners are
   // permanently empty (kept so notification plumbing stays unchanged).
   const bgSignals1m  = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
   const bgSignals5m  = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
+  const bgSignals15m = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
   const bgSignals60m = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
-
-  const bgSignals15m = useMemo(() => {
-    const candles = interval === "15m" ? windowedCandles : (bg15mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles);
-  }, [windowedCandles, bg15mData, interval]);
 
   // Keep latestSignalsRef in sync so the 3s auto-trade confirmation callback
   // can verify a signal is still live before sending an order.
@@ -2481,46 +2487,47 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   };
 
   // Primary: watch allConfluenceSignals — fires the moment a new signal bar appears.
-  // Also re-fires if zones UPGRADE a signal from risky → safe so auto-trade catches the
-  // confirmed entry. lastNotifiedRef + lastNotifiedRiskRef prevent any other double-firing.
-  // This takes priority because it shares lastNotifiedRef with the bg* effects below;
-  // whichever fires first sets the time and blocks the other from double-firing.
+  // Signals are grouped by THEIR OWN interval (5m/15m — the strategy's trading
+  // intervals), NOT the viewed chart interval, so the auto-trader's
+  // "Trade on intervals" setting gates exactly the trades the user selected.
+  // lastNotifiedRef + lastNotifiedRiskRef prevent any double-firing.
   useEffect(() => {
     if (!allConfluenceSignals.length) return;
-    const ivSec = interval === "1m" ? 60 : interval === "5m" ? 300 : interval === "15m" ? 900 : 3600;
     const nowSec = Math.floor(Date.now() / 1000);
-    const ivKey = interval;
-    // Check Long and Short independently — a recent Long must not block a Short (and vice-versa)
-    for (const dir of ["Long", "Short"] as const) {
-      const notifyKey = `${ivKey}_${dir}`;
-      const dirSigs = allConfluenceSignals.filter(s => s.direction === dir);
-      if (!notifyInitializedRef.current[notifyKey]) {
-        // Always initialize both directions on first pass — even if no signals exist for this
-        // direction yet. If we only initialize when signals exist, the first real signal of an
-        // unseen direction (e.g. first Short on an all-Long day) would be silently swallowed.
-        lastNotifiedRef.current[notifyKey] = dirSigs.length ? dirSigs[dirSigs.length - 1].time : 0;
-        lastNotifiedRiskRef.current[notifyKey] = dirSigs.length ? (dirSigs[dirSigs.length - 1].riskLevel ?? "riskiest") : "riskiest";
-        notifyInitializedRef.current[notifyKey] = true;
-        continue;
-      }
-      if (!dirSigs.length) continue;
-      const latest = dirSigs[dirSigs.length - 1];
-      const lastTime = lastNotifiedRef.current[notifyKey] ?? 0;
-      const lastRisk = lastNotifiedRiskRef.current[notifyKey] ?? "riskiest";
-      const isNewBar  = latest.time > lastTime;
-      // Zone upgrade: same bar but Milk zones now confirm a higher tier (risky→safe etc.)
-      const isUpgrade = latest.time === lastTime &&
-        (RISK_RANK[latest.riskLevel ?? "riskiest"] ?? 0) > (RISK_RANK[lastRisk] ?? 0);
-      if (!isNewBar && !isUpgrade) continue;
-      if (nowSec - latest.time > ivSec * 2) {
-        // Signal is stale — record it but don't fire (prevent firing when app catches up)
+    for (const ivKey of ["5m", "15m"] as const) {
+      const ivSec = ivKey === "5m" ? 300 : 900;
+      // Check Long and Short independently — a recent Long must not block a Short (and vice-versa)
+      for (const dir of ["Long", "Short"] as const) {
+        const notifyKey = `${ivKey}_${dir}`;
+        const dirSigs = allConfluenceSignals.filter(s => s.interval === ivKey && s.direction === dir);
+        if (!notifyInitializedRef.current[notifyKey]) {
+          // Always initialize both directions on first pass — even if no signals exist for this
+          // direction yet. If we only initialize when signals exist, the first real signal of an
+          // unseen direction (e.g. first Short on an all-Long day) would be silently swallowed.
+          lastNotifiedRef.current[notifyKey] = dirSigs.length ? dirSigs[dirSigs.length - 1].time : 0;
+          lastNotifiedRiskRef.current[notifyKey] = dirSigs.length ? (dirSigs[dirSigs.length - 1].riskLevel ?? "riskiest") : "riskiest";
+          notifyInitializedRef.current[notifyKey] = true;
+          continue;
+        }
+        if (!dirSigs.length) continue;
+        const latest = dirSigs[dirSigs.length - 1];
+        const lastTime = lastNotifiedRef.current[notifyKey] ?? 0;
+        const lastRisk = lastNotifiedRiskRef.current[notifyKey] ?? "riskiest";
+        const isNewBar  = latest.time > lastTime;
+        // Zone upgrade: same bar but zones now confirm a higher tier (risky→safe etc.)
+        const isUpgrade = latest.time === lastTime &&
+          (RISK_RANK[latest.riskLevel ?? "riskiest"] ?? 0) > (RISK_RANK[lastRisk] ?? 0);
+        if (!isNewBar && !isUpgrade) continue;
+        if (nowSec - latest.time > ivSec * 2) {
+          // Signal is stale — record it but don't fire (prevent firing when app catches up)
+          lastNotifiedRef.current[notifyKey] = latest.time;
+          lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
+          continue;
+        }
         lastNotifiedRef.current[notifyKey] = latest.time;
         lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
-        continue;
+        fireSignalNotification(latest, ivKey);
       }
-      lastNotifiedRef.current[notifyKey] = latest.time;
-      lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
-      fireSignalNotification(latest, ivKey);
     }
   }, [allConfluenceSignals]);
 
@@ -3730,11 +3737,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 ))}
               </div>
 
-              {/* Interval filter */}
+              {/* Interval filter — the strategy trades 5m and 15m only */}
               <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals</div>
+                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals (strategy fires 5m &amp; 15m)</div>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {(["1m", "5m", "15m", "60m"] as const).map(iv => (
+                  {(["5m", "15m"] as const).map(iv => (
                     <label key={iv} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
                       <input
                         type="checkbox"

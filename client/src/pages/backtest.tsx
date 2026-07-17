@@ -9,6 +9,7 @@ import {
   MILK_TOLERANCE,
   OPTIMIZED_GATES,
   OPTIMIZED_EXITS,
+  OPTIMIZED_EXITS_5M,
   aggregateToInterval,
   detectIctZones,
   computeEngineSignals,
@@ -561,8 +562,10 @@ export default function BacktestPage() {
       setCandles(bars);
       const zones   = detectMilkZones(bars);
       setMilkZones(zones);
-      // Fixed exits — part of the optimized strategy (TP1 +8 / TP2 +16 / SL −4)
-      const bt      = runBacktest(bars, zones, OPTIMIZED_EXITS, symbol, interval, "optimized", sessionMode);
+      // Fixed exits — part of the optimized strategy, calibrated per interval:
+      // 5m = TP1 +4 / TP2 +8 / SL −4 · 15m = TP1 +8 / TP2 +16 / SL −4
+      const exits   = interval === "5m" ? OPTIMIZED_EXITS_5M : OPTIMIZED_EXITS;
+      const bt      = runBacktest(bars, zones, exits, symbol, interval, "optimized", sessionMode);
       setResult(bt);
     } catch (e: any) {
       setLoadError(e.message ?? "Failed to load");
@@ -600,8 +603,8 @@ export default function BacktestPage() {
     }
   };
 
-  // ── Derived stats ───────────────────────────────────────────────────────────
-  const exitProfile = OPTIMIZED_EXITS[sessionMode];
+  // ── Derived stats — exits are interval-calibrated (5m: 4/8/4 · others: 8/16/4) ──
+  const exitProfile = (interval === "5m" ? OPTIMIZED_EXITS_5M : OPTIMIZED_EXITS)[sessionMode];
   const filteredSignals = result
     ? result.signals.filter(s => enabledTiers.has(s.tier))
     : [];
@@ -723,9 +726,9 @@ export default function BacktestPage() {
           <option value="60m">60m</option>
         </select>
 
-        {/* Exit strategy — fixed by the optimized program strategy */}
+        {/* Exit strategy — fixed by the optimized program strategy, per interval */}
         <span style={{ fontSize: 11, color: MW.muted, padding: "2px 8px", border: `1px solid ${MW.border}`, borderRadius: 4 }}>
-          Exits: TP1 +8 · TP2 +16 · SL −4 (optimized)
+          {interval === "5m" ? "Exits: TP1 +4 · TP2 +8 · SL −4 (optimized 5m)" : "Exits: TP1 +8 · TP2 +16 · SL −4 (optimized 15m)"}
         </span>
 
         {/* Session toggle — RTH / ETH */}
