@@ -622,7 +622,9 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   const rawSignals = useMemo((): RawSignal[] => {
     if (useExternal) {
       // FIX: only show signals tagged for the current interval — safety filter for any stale cross-interval signals
-      const intervalFiltered = externalSignals.filter(s => !s.interval || s.interval === defaultInterval);
+      // THE program strategy fires on 5m and 15m only — show its signals regardless
+      // of the chart's viewed interval (each entry is tagged with its own interval).
+      const intervalFiltered = externalSignals;
       return intervalFiltered.map(s => ({
         time: s.time,
         open: openMap.get(s.time) ?? s.price,

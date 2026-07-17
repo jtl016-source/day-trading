@@ -2904,6 +2904,17 @@ export async function registerRoutes(
     }
   });
 
+  // DELETE /api/signals/history — wipe ALL persisted signals (one-time reset when
+  // switching to the optimized program strategy; new signals repopulate from the engine).
+  app.delete("/api/signals/history", async (_req, res) => {
+    try {
+      await db.delete(signalHistory);
+      res.json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/signals/history — bulk upsert signal records
   app.post("/api/signals/history", async (req, res) => {
     const { signals } = req.body as {

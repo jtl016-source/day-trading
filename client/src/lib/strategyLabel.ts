@@ -20,6 +20,7 @@ export function strategyLabel(
 ): string {
   const st = (signalType ?? "").toLowerCase();
   // Named strategies that aren't a multi-factor confluence bundle.
+  if (st === "optimized")         return "ICT Zone + Body"; // THE program strategy (optimized 2026-07)
   if (st === "vector-side-entry") return "Vector Side-Entry";
   if (st === "zone-pattern")      return "Zone-to-Zone Pattern";
   if (st === "mean-reversion")    return "Mean-Reversion";

@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { normalizeSymbol } from "@shared/symbol";
+import { computeOptimizedSignalsForInterval } from "@shared/firing/optimized"; // THE program strategy (ICT zone + body, 5m/15m RTH)
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CandlestickChart,
@@ -929,7 +930,9 @@ export default function MarketPage() {
   const [autoTradeContracts, setAutoTradeContracts]     = useState(() => getPersistedSetting("autoTradeContracts", 1));
   const [autoTradeContractType, setAutoTradeContractType] = useState<"MES" | "ES">(() => getPersistedSetting<"MES"|"ES">("autoTradeContractType", "MES"));
   const [autoTradeRiskLevels, setAutoTradeRiskLevels]   = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeRiskLevels", ["safe"])));
-  const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m"])));
+  // THE program strategy trades 5m and 15m — both enabled by default; the
+  // "Trade on intervals" setting gates which ones auto-trade fires.
+  const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m", "15m"])));
   const [autoTradeConnected, setAutoTradeConnected]     = useState(false);
   const [mwSyncStatus, setMwSyncStatus] = useState<"pending" | "syncing" | "done">("pending");
   const [mwSyncBars, setMwSyncBars]     = useState(0);
@@ -2536,556 +2539,46 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     zonesLoaded?: boolean;
     /** FOOTPRINT-TIER: JSON-serialized FootprintReading, null when footprint data unavailable */
     footprintReading?: string; // FOOTPRINT-TIER:
-    /** 0–100 confidence score — only main Long/Short signals ≥ 75 are emitted; tabletop uses zone votes */
+    /** 0–100 confidence score */
     confidence?: number;
-    /** FIX: interval at signal creation — used to filter SignalsPanel by current interval */
+    /** Interval at signal creation — 5m or 15m (the strategy's trading intervals) */
     interval?: string;
-    /** Signal source — "vector-side-entry" marks the take-every-side-entry-as-Long feature (auto-trade eligible). */
+    /** Signal source — "optimized" = THE program strategy (ICT zone + body close) */
     signalType?: string;
   };
 
+  // ── Confluence signals — THE PROGRAM STRATEGY (optimized, dual-interval) ────
+  // ONE signal source for the whole app: shared/firing/optimized.ts —
+  // ICT Zones + Candle Body during RTH, trading BOTH 5m (TP1 +4/TP2 +8/SL −4)
+  // and 15m (TP1 +8/TP2 +16/SL −4), each signal tagged with its interval so the
+  // auto-trader's "Trade on intervals" setting gates which ones fire.
+  // Winner of the 480-config train/test search (see LEARNINGS.md 2026-07-16/17);
+  // replaces the legacy multi-strategy confluence engine per user decision.
+  // Per-interval data sources: the 5m component needs ≤5m bars (on the 15m/60m
+  // charts it uses the background 5m fetch); the 15m component can reuse the
+  // 15m chart's own candles.
   const allConfluenceSignals = useMemo((): CSig[] => {
-    if (!windowedCandles.length) return [];
-    // PERF: windowedCandles is already sorted (baseCandles sorted from DB; live bars binary-inserted)
-    const sorted = windowedCandles;
-    const barSec = interval === "1m" ? 60 : interval === "5m" ? 300 : interval === "15m" ? 900 : 3600;
-    const vecMap = new Map(vectorLine.map(v => [v.time, v.value]));
-    // Bull zones: label text is primary (most reliable — directly from Milk's terminology);
-    // color is the fallback for zones with no label or ambiguous text.
-    const isBullZone = (z: ZoneBand): boolean => {
-      if (z.label) {
-        const l = z.label.toLowerCase();
-        // Bear keywords take priority over bull (e.g. "sellers absorb buyers" is bear)
-        if (/sell|resist|bear|supply|absorb\s*buy|cap\s*session|ceiling|non.fair|iv.wall|iv.overflow|pivot(?!.*floor)|gex.wall.short|wall.short|short.median/i.test(l)) return false;
-        if (/buy|demand|support|bull|absorb\s*sell|floor|gex.wall.long|wall.long|long.median|spy.floor|ovn.spy.floor/i.test(l)) return true;
-      }
-      // Color fallback: green/blue/teal hex OR green/blue-dominant rgba
-      const c = z.color.toLowerCase().trim();
-      if (c === "#22c55e" || c === "#3b82f6" || c === "#14b8a6") return true;
-      const m = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-      if (m) { const r = +m[1], g = +m[2], b = +m[3]; return g > r || (b > r && b > g); }
-      return false;
-    };
-    // PERF: pre-compute zone bull/bear classification once — avoids regex on every candle×zone
-    const zoneBullish = activeZones.map(z => isBullZone(z));
-
-    // ── Exit strategy: tier-aware TP/SL lookup ────────────────────────────────
-    // Changing exitStrategy clears lockedSignalLevelsRef so all signals recompute cleanly.
-    // When Trailer is on, TP1 from the selected tier becomes the activation level (not a fixed exit).
-    const _ep = EXIT_STRATEGY_PROFILES[exitStrategy];
-    const tierExits = (lv: string, rth: boolean) => {
-      const side = rth ? _ep.rth : _ep.eth;
-      return (side as Record<string, { tp1: number; tp2: number; sl: number }>)[lv] ?? side.riskiest;
-    };
-
-    // FOOTPRINT-TIER: build a time-indexed lookup for footprint candles received this session
-    const fpCandlesSnap = footprintCandlesRef.current; // PERF: read from ref — not a React dep
-    const fpByTime = new Map<number, FootprintCandle>(); // FOOTPRINT-TIER:
-    for (const fc of fpCandlesSnap) fpByTime.set(fc.time, fc); // FOOTPRINT-TIER:
-
-    // FP candles arrive in chronological order and are appended in order — no sort needed
-    const sortedFpCandles = fpCandlesSnap; // PERF: already ordered by arrival time
-    let fpPtr = 0; // advances through sortedFpCandles as we scan sorted candles in order // PERF:
-
-    const raw: CSig[] = [];
-    // Vector side-entry longs collected during the scan (outcome computed via the closure
-    // `walkForward`, so they MUST be built inside the loop); merged into `raw` after the loop.
-    const sideEntryRaw: CSig[] = [];
-    const COOLDOWN_BARS   = 10;
-    const ETH_COOLDOWN    = 20;
-    const PROX_PTS        = 5.0;
-    // Separate cooldowns per direction (LEARNINGS: shared cooldown blocks opposite-direction signals)
-    let lastLongBar     = -COOLDOWN_BARS;
-    let lastLongEthBar  = -ETH_COOLDOWN;
-    let lastShortBar    = -COOLDOWN_BARS;
-    let lastShortEthBar = -ETH_COOLDOWN;
-
-    // Zones with fromTime > 0 are dated session zones (MWML/Discord milk zones).
-    // Zones with fromTime === 0 are persistent structural levels — they don't count
-    // for milk zone confirmation since they have no specific session context.
-    const hasDatedZones = activeZones.some(z => (z.fromTime ?? 0) > 0);
-
-    // ── HOD/LOD caution logic ─────────────────────────────────────────────
-    // If TP1 is close to or above HOD (for longs) / below LOD (for shorts),
-    // tighten TP1 so it can actually hit. TP2 is never clamped.
-    const HOD_PROX_PTS  = 3.0;  // within this many pts of HOD/LOD = "close to" (TP1 tightening)
-    const HOD_BUF_PTS   = 2.0;  // set TP1 to HOD − buf (or LOD + buf)
-    const MIN_TP1_PTS   = 3.0;  // never squeeze TP1 below this profit
-    const LOD_ENTRY_PROX = 3.0; // suppress shorts within this many pts above LOD (no downside room)
-    const HOD_ENTRY_PROX = 3.0; // suppress longs within this many pts below HOD (no upside room)
-    let hodDay  = -1;
-    let hodHigh = -Infinity;    // RTH high of day at current candle (including current bar)
-    let hodLow  =  Infinity;    // RTH low of day at current candle
-
-    // 60m hard veto: pre-locate the 60m secondary vector line so we can check per-candle
-    const vec60mLine = extraVecSignalLines.find(ev => ev.label === "60m") ?? null;
-
-    // Precompute rolling 14-bar ATR (O(n) sliding window) — used for vector proximity tests
-    const atrArr = new Float64Array(sorted.length);
-    {
-      let runSum = 0;
-      const buf = new Float64Array(14);
-      let bufLen = 0, bufIdx = 0;
-      for (let i = 0; i < sorted.length; i++) {
-        const b = sorted[i], p = i > 0 ? sorted[i - 1] : b;
-        const tr = Math.max(b.high - b.low, Math.abs(b.high - p.close), Math.abs(b.low - p.close));
-        if (bufLen < 14) { buf[bufIdx % 14] = tr; bufLen++; }
-        else { runSum -= buf[bufIdx % 14]; buf[bufIdx % 14] = tr; }
-        runSum += tr; bufIdx++;
-        atrArr[i] = runSum / bufLen;
-      }
-    }
-    // How many bars back to look for a vector test (price heading towards the vector)
-    const VEC_TEST_BARS = 5;
-
-    for (let i = 0; i < sorted.length; i++) {
-      const c      = sorted[i];
-
-      // Never fire a signal on the current forming bar (complete === false).
-      // Forming bars have a live close that oscillates each second — signals
-      // computed here would appear, disappear, and re-appear within the same candle.
-      // Signals on completed bars (complete === true or undefined for historical) are permanent.
-      if ((c as any).complete === false) continue;
-
-      // ── Update HOD/LOD before any early-exit so all RTH bars are counted ──
-      const utcH    = (c.time / 3600 | 0) % 24;
-      const minsUtc = utcH * 60 + ((c.time / 60 | 0) % 60);
-      const rthC    = c.rth ?? isRTH(c.time);
-      const cDay    = Math.floor(c.time / 86400);
-      if (cDay !== hodDay) { hodDay = cDay; hodHigh = -Infinity; hodLow = Infinity; }
-      // Capture HOD/LOD BEFORE the current bar (prevents suppressing valid breakout/breakdown bars).
-      const prevDayHodHigh = hodHigh;
-      const prevDayHodLow  = hodLow;
-      if (rthC) { if (c.high > hodHigh) hodHigh = c.high; if (c.low < hodLow) hodLow = c.low; }
-      // Suppress short entries approaching LOD from above (selling into a floor, no downside room).
-      const nearLodShort = rthC && prevDayHodLow < Infinity
-        && c.close > prevDayHodLow && c.close <= prevDayHodLow + LOD_ENTRY_PROX;
-      // Suppress long entries approaching HOD from below (buying into a ceiling, no upside room).
-      const nearHodLong = rthC && prevDayHodHigh > -Infinity
-        && c.close >= prevDayHodHigh - HOD_ENTRY_PROX && c.close < prevDayHodHigh;
-
-      const lb     = vecMap.get(c.time);
-      const prevLb = i >= 3 ? vecMap.get(sorted[i - 3].time) : undefined;
-
-      if (isMarketBreak(c.time)) continue;
-      if (lb == null) continue;
-      // USER RULE: no signals (confluence OR side-entry) in the RTH-close window 3:15–5:00 PM ET —
-      // too risky into the close. ETH side-entries (outside RTH) are unaffected.
-      if (rthC && isAfter315ET(c.time)) continue;
-
-      // Compute milk-zone bonuses for both directions in a single pass.
-      // Scoring:
-      //   close currently INSIDE the zone → 4 pts (best — price is in the zone right now)
-      //   close within 0.5 pts of zone bottom/top → 3 pts
-      //   close between 0.5 and 1.5 pts outside zone → 1 pt (partial touch)
-      //   close more than 1.5 pts outside zone → 0 pts
-      const isRthForMilk = rthC && minsUtc >= 13 * 60 + 30 && minsUtc < 20 * 60 + 30;
-      let milkPtsL = 0, milkPtsS = 0;
-      let milkBullOk = false, milkBearOk = false;
-      if (isRthForMilk) {
-        for (let zi = 0; zi < activeZones.length; zi++) {
-          const z = activeZones[zi];
-          // Only dated zones (fromTime > 0) count for milk confirmation — static structural
-          // zones (fromTime=0) have no session context and would bleed into all history.
-          if (!(z.fromTime ?? 0) || c.time < z.fromTime! || (z.toTime != null && c.time > z.toTime)) continue;
-          const bull = zoneBullish[zi];
-          if (bull) {
-            if (c.low <= z.topPrice + 0.5) {
-              const inZone = c.close >= z.bottomPrice && c.close <= z.topPrice;
-              const below = z.bottomPrice - c.close; // positive = close is below zone bottom
-              const pts = inZone ? 4 : below <= 0.5 ? 3 : below <= 1.5 ? 1 : 0;
-              if (pts > milkPtsL) { milkPtsL = pts; if (pts > 0) milkBullOk = true; }
-            }
-          } else {
-            if (c.high >= z.bottomPrice - 0.5) {
-              const above = c.close - z.topPrice; // positive = close is above zone top
-              const inZone = c.close >= z.bottomPrice && c.close <= z.topPrice;
-              const pts = inZone ? 4 : above <= 0.5 ? 3 : above <= 1.5 ? 1 : 0;
-              if (pts > milkPtsS) { milkPtsS = pts; if (pts > 0) milkBearOk = true; }
-            }
-          }
-          if (milkBullOk && milkPtsL === 4 && milkBearOk && milkPtsS === 4) break; // PERF
-        }
-      }
-
-      // Secondary vector confluence: only counts when that interval's vector is flat
-      // (flat = ≤1pt change over 2 steps → consolidation/side-entry on that interval per strategy)
-      // PERF: single pass replaces 4 separate some()/filter() calls
-      let secLongOk = false, secShortOk = false, secLongCount = 0, secShortCount = 0;
-      for (const ev of extraVecSignalLines) {
-        const v = ev.map.get(c.time);
-        if (v == null || ev.flatMap.get(c.time) !== true) continue;
-        if (c.close > v) { secLongCount++;  secLongOk  = true; }
-        else if (c.close < v) { secShortCount++; secShortOk = true; }
-      }
-
-      // ── Helper: walk-forward outcome for a given set of exit prices ──────
-      const walkForward = (tp1: number, tp2: number, sl: number, isLong: boolean): { outcome: CSig["outcome"]; toTime: number } => {
-        // For ETH signals after today's RTH close (e.g. 22:00 UTC), rthSettleOfDay returns a
-        // time already in the past — advance to the next session's close to keep exits forward.
-        let settleTs = rthSettleOfDay(c.time);
-        if (c.time >= settleTs) {
-          for (let d = 1; d <= 4; d++) {
-            settleTs = rthSettleOfDay(c.time + d * 86400);
-            if (settleTs > c.time) break;
-          }
-        }
-        const pastSessionEnd = Math.floor(Date.now() / 1000) > settleTs;
-
-        // ── Trailer mode: TP1 is the activation level, not a fixed exit ──────
-        // Phase 1: wait for price to reach TP1 (activation). SL is a hard stop.
-        // Phase 2 (armed): trail the peak; exit when price retreats trailerOffset pts.
-        // TP1 level comes from whichever risk tier (safe/risky/riskiest) is selected.
-        if (useTrailer) {
-          let activationIdx = -1;
-          for (let j = i + 1; j < sorted.length; j++) {
-            const f = sorted[j];
-            if (f.time > settleTs) break;
-            if (isLong) {
-              if (f.low <= sl)   return { outcome: "loss",    toTime: f.time };
-              if (f.high >= tp1) { activationIdx = j; break; }
-            } else {
-              if (f.high >= sl)  return { outcome: "loss",    toTime: f.time };
-              if (f.low  <= tp1) { activationIdx = j; break; }
-            }
-          }
-          if (activationIdx === -1) {
-            // TP1 never reached — position ends at session close
-            return { outcome: pastSessionEnd ? "loss" : "open", toTime: settleTs };
-          }
-          // Phase 2: trail from peak after TP1 activation
-          let trailPeak = isLong ? sorted[activationIdx].high : sorted[activationIdx].low;
-          for (let j = activationIdx + 1; j < sorted.length; j++) {
-            const f = sorted[j];
-            if (f.time > settleTs) break;
-            if (isLong) {
-              if (f.high > trailPeak) trailPeak = f.high;
-              if (f.low <= trailPeak - trailerOffset) return { outcome: "win_trailer", toTime: f.time };
-            } else {
-              if (f.low < trailPeak) trailPeak = f.low;
-              if (f.high >= trailPeak + trailerOffset) return { outcome: "win_trailer", toTime: f.time };
-            }
-          }
-          // Session ended while still trailing — count as a win (trade was in profit)
-          return { outcome: pastSessionEnd ? "win_trailer" : "open", toTime: settleTs };
-        }
-
-        // ── Standard TP1/TP2 fixed-exit mode ─────────────────────────────────
-        let toTime = settleTs;
-        let outcome: CSig["outcome"] = "open";
-        for (let j = i + 1; j < sorted.length; j++) {
-          const f = sorted[j];
-          if (f.time > settleTs) break; // never exit past session close
-          if (isLong) {
-            if (f.high >= tp2) { outcome = "win_tp2"; toTime = f.time; break; }
-            if (f.high >= tp1) { outcome = "win_tp1"; toTime = f.time; break; }
-            if (f.low  <= sl)  { outcome = "loss";    toTime = f.time; break; }
-          } else {
-            if (f.low  <= tp2) { outcome = "win_tp2"; toTime = f.time; break; }
-            if (f.low  <= tp1) { outcome = "win_tp1"; toTime = f.time; break; }
-            if (f.high >= sl)  { outcome = "loss";    toTime = f.time; break; }
-          }
-        }
-        // Day trading: all positions close at session end.
-        // If the session is over and no TP/SL was hit (incomplete bar data), mark as loss.
-        if (outcome === "open" && pastSessionEnd) {
-          outcome = "loss";
-        }
-        return { outcome, toTime };
-      };
-
-      // Advance footprint pointer past current candle time (amortised O(1) across the loop)
-      while (fpPtr < sortedFpCandles.length && sortedFpCandles[fpPtr].time < c.time) fpPtr++;
-
-      // ── Vector side-entry longs (feature: take EVERY side entry as a Long) ───
-      // Side entry = price closed below the vector last bar and back above it this bar, on a
-      // flat/declining vector (same definition as computeVectorSignals). The bracket IS the
-      // vector's exit strategy: stop = vector − VEC_STOP_BELOW (capped at VEC_MAX_STOP risk),
-      // targets entry + VEC_TP1 / VEC_TP2. Outcome via the shared walk-forward (honours the
-      // trailer toggle exactly like confluence signals). Levels are locked on first fire so the
-      // live forming bar can't drift them. Persisted + auto-trade eligible via signalType.
-      if (takeSideEntries) {
-        const sePrev   = i > 0 ? sorted[i - 1] : undefined;
-        const sePrevLb = sePrev ? vecMap.get(sePrev.time) : undefined;
-        if (sePrev && sePrevLb != null && sePrev.close < sePrevLb && c.close > lb && (lb - sePrevLb) < 0) {
-          const seKey = `${c.time}_Long_SE`;
-          let seLock = lockedSignalLevelsRef.current.get(seKey);
-          if (!seLock) {
-            const seEntry = c.close;
-            const seSl    = Math.max(lb - VEC_STOP_BELOW, seEntry - VEC_MAX_STOP);
-            seLock = { price: seEntry, tp1: seEntry + VEC_TP1, tp2: seEntry + VEC_TP2, sl: seSl };
-            lockedSignalLevelsRef.current.set(seKey, seLock);
-          }
-          const { outcome: seOutcome, toTime: seToTime } = walkForward(seLock.tp1, seLock.tp2, seLock.sl, true);
-          sideEntryRaw.push({
-            time: c.time, price: seLock.price, high: c.high, low: c.low, direction: "Long",
-            tp1: seLock.tp1, tp2: seLock.tp2, sl: seLock.sl, toTime: seToTime,
-            riskLevel: "risky",
-            confirmations: { milkOk: false, milkPts: 0, vecOk: true, secondaryVecOk: false, secondaryVecCount: 0 },
-            outcome: seOutcome, interval, signalType: "vector-side-entry", confidence: 50,
-          });
-        }
-      }
-
-      // USER RULE: confluence signals (milk/vector/footprint) are RTH-only. During ETH only the
-      // vector side-entry above may fire — skip the rest of this bar's evaluation when not RTH.
-      if (!rthC) continue;
-
-      // ── LONG signal evaluation ──────────────────────────────────────────────
-      if (c.close > lb) {
-        const fpCandleL: FootprintCandle = fpByTime.get(c.time) ?? buildProxyFootprintCandle(c);
-        const priorFpL = sortedFpCandles.length > 0
-          ? sortedFpCandles.slice(Math.max(0, fpPtr - 3), fpPtr)
-          : sorted.slice(Math.max(0, i - 4), i).map((b: CandleBar) => buildProxyFootprintCandle(b));
-        const fpReadingL: FootprintReading | null = analyzeFootprint(fpCandleL, "Long", priorFpL, c.close);
-
-        if (!fpReadingL?.vetoed) {
-          const fpFullL    = fpReadingL?.confirmed ?? false;
-          const fpPartialL = fpReadingL?.partial   ?? false;
-
-          // Vector side-entry + tabletop momentum detection:
-          // Side entry: previous bar closed at/below vector, current bar closed above (crossed from below).
-          // Tabletop test: vector flat over last 2 bars — price tested the level and closed above (bullish momentum).
-          const prevBarLb  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
-          const prevBarLb2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
-          const sideEntryL = prevBarLb != null && sorted[i - 1].close <= prevBarLb && c.close > lb;
-          const tabletopTestL = prevBarLb != null && prevBarLb2 != null
-            && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
-            && c.close > lb && c.close >= c.open;
-          const vecTestedL = sideEntryL || tabletopTestL;
-
-          // Weighted scoring: FP strong=4, FP weak=2 | MilkZone=3 | Vector=2 | Pattern=1
-          // SAFE+=8+ or strong-FP-on-zone | SAFE=4–7 or partial-FP-on-zone | RISKY=3 | RISKIEST=1–2
-          const fpFiresL = fpFullL || fpPartialL;
-          let fpStrongL = false, fpOnMilkZoneL = false, fpPartialOnZoneL = false;
-          if (fpFiresL) {
-            // Condition 1: 2+ consecutive imbalance levels in buy direction
-            if (fpCandleL.imbalances.some(cl => cl.direction === "buy" && cl.levelCount >= 2)) fpStrongL = true;
-            // Condition 2: candle delta >= 2x average of prior candles
-            if (!fpStrongL && priorFpL.length > 0) {
-              const avgAbsDelta = priorFpL.reduce((s, pc) => s + Math.abs(pc.candleDelta), 0) / priorFpL.length;
-              if (avgAbsDelta > 0 && Math.abs(fpCandleL.candleDelta) >= 2 * avgAbsDelta) fpStrongL = true;
-            }
-            // Condition 3: imbalance cluster overlaps active Milk zone
-            // Strong FP on zone → SAFE+ override; partial FP on zone → SAFE floor (not SAFE+)
-            outer: for (const cl of fpCandleL.imbalances) {
-              for (const z of activeZones) {
-                if (!(z.fromTime ?? 0) || c.time < z.fromTime! || (z.toTime != null && c.time > z.toTime)) continue;
-                if (cl.startPrice <= z.topPrice && cl.endPrice >= z.bottomPrice) {
-                  if (fpStrongL) { fpOnMilkZoneL = true; } else { fpPartialOnZoneL = true; }
-                  break outer;
-                }
-              }
-            }
-          }
-          // FIX 4: proxy data cannot be "strong" — cannot claim safeplus via FP-on-zone
-          if (fpReadingL?.isProxyData) { fpStrongL = false; fpOnMilkZoneL = false; }
-          const fpPtsL   = fpFiresL ? 4 : 0;
-          const vecPtsL  = vecTestedL ? 2 : 0;
-          const totalPtsL = fpPtsL + milkPtsL + vecPtsL;
-
-          // SINGLE-TIER: a signal only fires when the setup clears the SAFE quality bar — the
-          // same conditions that used to produce "safe"/"safeplus": ≥4 confluence pts, or a
-          // footprint on/at a milk zone. Weaker setups (the old "risky"/"riskiest", 1–3 pts) are
-          // no longer signals at all. Every signal that fires is labeled "safe" — no categories.
-          const lockKey = `${c.time}_Long`;
-          const existingTierL = lockedSignalTierRef.current.get(lockKey);
-          const safeQualityL = totalPtsL >= 4 || fpOnMilkZoneL || fpPartialOnZoneL;
-          const cdL = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
-          // FIRE-LOCK: a NEW signal fires only if it clears the safe bar + HOD/cooldown gates.
-          // An ALREADY-FIRED signal (existingTierL is set) re-emits UNCONDITIONALLY on every
-          // recompute, so once a dot is on the chart it can NEVER disappear — even if late-arriving
-          // footprint/milk/vector data would no longer qualify it. Fired = locked, permanently.
-          const newFireL = safeQualityL && !nearHodLong && (i - (rthC ? lastLongBar : lastLongEthBar) >= cdL);
-          if (existingTierL || newFireL) {
-            const level = "safe" as const;
-            const _wrL = signalWinRates[`safe:Long`];
-            const confL = (_wrL && _wrL.sampleCount >= 5) ? Math.round(_wrL.winRate * 100) : 75;
-            // Advance the cooldown anchor on every emit (locked re-emit too) so new signals stay spaced.
-            if (rthC) lastLongBar = i; else lastLongEthBar = i;
-
-            // First fire → lock the risk factor + the exact footprint/milk/vector reading.
-            let tierL = existingTierL;
-            if (!tierL) {
-              tierL = {
-                riskLevel: level,
-                confirmations: { milkOk: milkBullOk, milkPts: milkPtsL, vecOk: vecTestedL, secondaryVecOk: secLongOk, secondaryVecCount: secLongCount },
-                footprintReading: fpReadingL ? JSON.stringify(fpReadingL) : undefined,
-                confidence: confL,
-              };
-              lockedSignalTierRef.current.set(lockKey, tierL);
-            }
-            // Tier is always "safe" now → exits use the safe profile; the lock only freezes
-            // the confirmation breakdown so the chips don't flicker as data loads.
-            const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
-                const dbLock = dbSignalHistory.get(lockKey);
-                if (dbLock) { lockedSignalLevelsRef.current.set(lockKey, dbLock); }
-                else if (!lockedSignalLevelsRef.current.has(lockKey)) {
-                  if (useZoneTargets) {
-                    const zonesNow = activeZones.filter(z => c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity));
-                    const above = zonesNow.filter(z => z.bottomPrice > c.close + 0.5).sort((a, b) => a.bottomPrice - b.bottomPrice);
-                    const below = zonesNow.filter(z => z.topPrice   < c.close - 0.5).sort((a, b) => b.topPrice - a.topPrice);
-                    if (above.length >= 1 && above[0].bottomPrice - c.close >= MIN_TP1_PTS) {
-                      const ztTp1 = above[0].bottomPrice;
-                      const ztTp2 = above[1] ? above[1].bottomPrice : above[0].topPrice;
-                      const ztSl  = below.length > 0 ? below[0].bottomPrice - 0.5 : c.close - slF;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: ztTp1, tp2: ztTp2, sl: ztSl });
-                    } else {
-                      const rawTp1L = c.close + tp1F;
-                      const adjTp1L = (rthC && isFinite(hodHigh) && rawTp1L >= hodHigh - HOD_PROX_PTS)
-                        ? Math.max(c.close + MIN_TP1_PTS, hodHigh - HOD_BUF_PTS) : rawTp1L;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1L, tp2: c.close + tp2F, sl: c.close - slF });
-                    }
-                  } else {
-                    const rawTp1L = c.close + tp1F;
-                    const adjTp1L = (rthC && isFinite(hodHigh) && rawTp1L >= hodHigh - HOD_PROX_PTS)
-                      ? Math.max(c.close + MIN_TP1_PTS, hodHigh - HOD_BUF_PTS) : rawTp1L;
-                    lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1L, tp2: c.close + tp2F, sl: c.close - slF });
-                  }
-                }
-                const locked = lockedSignalLevelsRef.current.get(lockKey)!;
-                const entryClose = locked.price;
-                const tp1 = locked.tp1, tp2 = locked.tp2, sl = entryClose - slF;
-
-                const { outcome, toTime } = walkForward(tp1, tp2, sl, true);
-                // Always "safe" — confirmations/footprint frozen on first fire (lock) so the chips
-                // don't flicker; confidence falls back to the freshly computed safe win-rate.
-                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Long", tp1, tp2, sl, toTime, riskLevel: level, confirmations: tierL.confirmations, zonesLoaded: hasDatedZones, outcome, footprintReading: tierL.footprintReading, interval, confidence: tierL.confidence ?? confL });
-          }
-        }
-      }
-
-      // ── SHORT signal evaluation ─────────────────────────────────────────────
-      if (c.close < lb) {
-        const fpCandleS: FootprintCandle = fpByTime.get(c.time) ?? buildProxyFootprintCandle(c);
-        const priorFpS = sortedFpCandles.length > 0
-          ? sortedFpCandles.slice(Math.max(0, fpPtr - 3), fpPtr)
-          : sorted.slice(Math.max(0, i - 4), i).map((b: CandleBar) => buildProxyFootprintCandle(b));
-        const fpReadingS: FootprintReading | null = analyzeFootprint(fpCandleS, "Short", priorFpS, c.close);
-
-        if (!fpReadingS?.vetoed) {
-          const fpFullS    = fpReadingS?.confirmed ?? false;
-          const fpPartialS = fpReadingS?.partial   ?? false;
-
-          // Vector side-entry + tabletop momentum detection (Short):
-          // Side entry: previous bar closed at/above vector, current bar closed below (crossed from above).
-          // Tabletop test: vector flat over last 2 bars — price tested the level and closed below (bearish momentum).
-          const prevBarLbS  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
-          const prevBarLbS2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
-          const sideEntryS = prevBarLbS != null && sorted[i - 1].close >= prevBarLbS && c.close < lb;
-          const tabletopTestS = prevBarLbS != null && prevBarLbS2 != null
-            && Math.abs(lb - prevBarLbS) < 0.5 && Math.abs(prevBarLbS - prevBarLbS2) < 0.5
-            && c.close < lb && c.close <= c.open;
-          const vecTestedS = sideEntryS || tabletopTestS;
-
-          // Weighted scoring: FP strong=4, FP weak=2 | MilkZone=3 | Vector=2 | Pattern=1
-          // SAFE+=8+ or FP-on-zone | SAFE=4–7 | RISKY=3 | RISKIEST=1–2
-          const fpFiresS = fpFullS || fpPartialS;
-          let fpStrongS = false, fpOnMilkZoneS = false, fpPartialOnZoneS = false;
-          if (fpFiresS) {
-            // Condition 1: 2+ consecutive imbalance levels in sell direction
-            if (fpCandleS.imbalances.some(cl => cl.direction === "sell" && cl.levelCount >= 2)) fpStrongS = true;
-            // Condition 2: candle delta >= 2x average of prior candles (negative delta for shorts)
-            if (!fpStrongS && priorFpS.length > 0) {
-              const avgAbsDelta = priorFpS.reduce((s, pc) => s + Math.abs(pc.candleDelta), 0) / priorFpS.length;
-              if (avgAbsDelta > 0 && Math.abs(fpCandleS.candleDelta) >= 2 * avgAbsDelta) fpStrongS = true;
-            }
-            // Condition 3: FIX 3 — strong FP on zone → SAFE+; partial FP on zone → SAFE floor only
-            outer: for (const cl of fpCandleS.imbalances) {
-              for (const z of activeZones) {
-                if (!(z.fromTime ?? 0) || c.time < z.fromTime! || (z.toTime != null && c.time > z.toTime)) continue;
-                if (cl.startPrice <= z.topPrice && cl.endPrice >= z.bottomPrice) {
-                  if (fpStrongS) { fpOnMilkZoneS = true; } else { fpPartialOnZoneS = true; }
-                  break outer;
-                }
-              }
-            }
-          }
-          // FIX 4: proxy data cannot be "strong" — cannot claim safeplus via FP-on-zone
-          if (fpReadingS?.isProxyData) { fpStrongS = false; fpOnMilkZoneS = false; }
-          const fpPtsS   = fpFiresS ? 4 : 0;
-          const vecPtsS  = vecTestedS ? 2 : 0;
-          const totalPtsS = fpPtsS + milkPtsS + vecPtsS;
-
-          // SINGLE-TIER (Short): fire only when the setup clears the SAFE quality bar (≥4 pts or
-          // footprint on/at a milk zone). Weaker setups are no longer signals. Every signal = "safe".
-          const lockKey = `${c.time}_Short`;
-          const existingTierS = lockedSignalTierRef.current.get(lockKey);
-          const safeQualityS = totalPtsS >= 4 || fpOnMilkZoneS || fpPartialOnZoneS;
-          const cdS = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
-          // FIRE-LOCK: a NEW short fires only if it clears the safe bar + LOD/cooldown gates. An
-          // ALREADY-FIRED short (existingTierS) re-emits unconditionally so it never disappears.
-          const newFireS = safeQualityS && !nearLodShort && (i - (rthC ? lastShortBar : lastShortEthBar) >= cdS);
-          if (existingTierS || newFireS) {
-            const level = "safe" as const;
-            const _wrS = signalWinRates[`safe:Short`];
-            const confS = (_wrS && _wrS.sampleCount >= 5) ? Math.round(_wrS.winRate * 100) : 75;
-            if (rthC) lastShortBar = i; else lastShortEthBar = i; // spacing anchor on every emit
-
-            // First fire → lock the risk factor + the exact footprint/milk/vector reading.
-            let tierS = existingTierS;
-            if (!tierS) {
-              tierS = {
-                riskLevel: level,
-                confirmations: { milkOk: milkBearOk, milkPts: milkPtsS, vecOk: vecTestedS, secondaryVecOk: secShortOk, secondaryVecCount: secShortCount },
-                footprintReading: fpReadingS ? JSON.stringify(fpReadingS) : undefined,
-                confidence: confS,
-              };
-              lockedSignalTierRef.current.set(lockKey, tierS);
-            }
-            // Tier is always "safe" → exits use the safe profile; lock only freezes the chips.
-            const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
-                const dbLock = dbSignalHistory.get(lockKey);
-                if (dbLock) { lockedSignalLevelsRef.current.set(lockKey, dbLock); }
-                else if (!lockedSignalLevelsRef.current.has(lockKey)) {
-                  if (useZoneTargets) {
-                    const zonesNow = activeZones.filter(z => c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity));
-                    const above = zonesNow.filter(z => z.bottomPrice > c.close + 0.5).sort((a, b) => a.bottomPrice - b.bottomPrice);
-                    const below = zonesNow.filter(z => z.topPrice   < c.close - 0.5).sort((a, b) => b.topPrice - a.topPrice);
-                    if (below.length >= 1 && c.close - below[0].topPrice >= MIN_TP1_PTS) {
-                      const ztTp1 = below[0].topPrice;
-                      const ztTp2 = below[1] ? below[1].topPrice : below[0].bottomPrice;
-                      const ztSl  = above.length > 0 ? above[0].topPrice + 0.5 : c.close + slF;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: ztTp1, tp2: ztTp2, sl: ztSl });
-                    } else {
-                      const rawTp1S = c.close - tp1F;
-                      const adjTp1S = (rthC && isFinite(hodLow) && hodLow < Infinity && rawTp1S <= hodLow + HOD_PROX_PTS)
-                        ? Math.min(c.close - MIN_TP1_PTS, hodLow + HOD_BUF_PTS) : rawTp1S;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1S, tp2: c.close - tp2F, sl: c.close + slF });
-                    }
-                  } else {
-                    const rawTp1S = c.close - tp1F;
-                    const adjTp1S = (rthC && isFinite(hodLow) && hodLow < Infinity && rawTp1S <= hodLow + HOD_PROX_PTS)
-                      ? Math.min(c.close - MIN_TP1_PTS, hodLow + HOD_BUF_PTS) : rawTp1S;
-                    lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1S, tp2: c.close - tp2F, sl: c.close + slF });
-                  }
-                }
-                const locked = lockedSignalLevelsRef.current.get(lockKey)!;
-                const entryClose = locked.price;
-                const tp1 = locked.tp1, tp2 = locked.tp2, sl = entryClose + slF;
-
-                const { outcome, toTime } = walkForward(tp1, tp2, sl, false);
-                // Always "safe" — confirmations/footprint frozen on first fire; confidence falls
-                // back to the freshly computed safe win-rate.
-                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Short", tp1, tp2, sl, toTime, riskLevel: level, confirmations: tierS.confirmations, zonesLoaded: hasDatedZones, outcome, footprintReading: tierS.footprintReading, interval, confidence: tierS.confidence ?? confS });
-          }
-        }
-      }
-
-    }
-
-    // Merge vector side-entry longs, skipping bars where a confluence Long already fired
-    // (a confluence Long takes priority and avoids the (symbol,interval,time,direction) DB
-    // unique-key collision since both persist as direction "Long").
-    if (sideEntryRaw.length) {
-      const longTimes = new Set(raw.filter(s => s.direction === "Long").map(s => s.time));
-      for (const se of sideEntryRaw) if (!longTimes.has(se.time)) raw.push(se);
-    }
-
-    // Sort by time so the panel shows signals in chronological order
-    return raw.sort((a, b) => a.time - b.time);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowedCandles, vectorLine, interval, extraVecSignalLines, activeZones, dbSignalHistory, exitStrategy, useTrailer, trailerOffset, beVersion, fpCompletedVersion, useZoneTargets, signalWinRates, takeSideEntries]); // PERF: fpCompletedVersion replaces latestFootprintCandle+footprintCandles — increments only on new complete bar
+    const source5m: CandleBar[] =
+      interval === "1m" || interval === "5m" ? windowedCandles : (bg5mData?.candles ?? []);
+    const source15m: CandleBar[] =
+      interval === "15m" ? windowedCandles : (bg15mData?.candles ?? source5m);
+    if (!source5m.length && !source15m.length) return [];
+    const engineSigs = [
+      ...computeOptimizedSignalsForInterval(source5m, "5m"),
+      ...computeOptimizedSignalsForInterval(source15m, "15m"),
+    ].sort((a, b) => a.time - b.time);
+    return engineSigs.map((s): CSig => ({
+      time: s.time, price: s.price, high: s.high, low: s.low,
+      direction: s.direction,
+      tp1: s.tp1, tp2: s.tp2, sl: s.sl, toTime: s.toTime,
+      riskLevel: s.tier,
+      confirmations: { milkOk: s.milkOk, vecOk: false, secondaryVecOk: false },
+      outcome: s.outcome,
+      zonesLoaded: true,
+      interval: s.interval,
+      signalType: "optimized",
+    }));
+  }, [windowedCandles, bg5mData, bg15mData, interval]);
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
@@ -3148,7 +2641,8 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     if (!allConfluenceSignals.length) return;
     const toSave = allConfluenceSignals.filter(s => {
       // Key includes outcome so a signal is persisted both when first open AND when it closes.
-      const key = `${selectedSymbol}_${interval}_${s.time}_${s.direction}_${s.outcome ?? "open"}`;
+      // Signals persist under THEIR OWN strategy interval (5m/15m), not the viewed chart's.
+      const key = `${selectedSymbol}_${s.interval ?? interval}_${s.time}_${s.direction}_${s.outcome ?? "open"}`;
       if (persistedSignalKeysRef.current.has(key)) return false;
       persistedSignalKeysRef.current.add(key);
       return true;
@@ -3160,7 +2654,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       body: JSON.stringify({
         signals: toSave.map(s => ({
           symbol: selectedSymbol,
-          interval,
+          interval: s.interval ?? interval,
           timestamp: s.time,
           direction: s.direction,
           riskLevel: s.riskLevel,
@@ -3190,31 +2684,14 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return Math.floor((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) + ET_OFFSET_H * 3_600_000) / 1000);
   }, [windowedDays]);
 
-  // ── Background signals for all intervals ─────────────────────────────────
-  // Each interval always sources from its own data — background fetch or current view.
-  const bgSignals1m  = useMemo(() => {
-    const candles = interval === "1m" ? windowedCandles : (bg1mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg1mData, interval, activeZones]);
-
-  const bgSignals5m  = useMemo(() => {
-    const candles = interval === "5m" ? windowedCandles : (bg5mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg5mData, interval, activeZones]);
-
-  const bgSignals15m = useMemo(() => {
-    const candles = interval === "15m" ? windowedCandles : (bg15mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg15mData, interval, activeZones]);
-
-  const bgSignals60m = useMemo(() => {
-    const candles = interval === "60m" ? windowedCandles : (bg60mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg60mData, interval, activeZones]);
+  // ── Background signals ─────────────────────────────────────────────────────
+  // Redundant now: allConfluenceSignals always computes BOTH strategy intervals
+  // (5m + 15m) regardless of the viewed chart, so the background scanners are
+  // permanently empty (kept so notification plumbing stays unchanged).
+  const bgSignals1m  = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
+  const bgSignals5m  = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
+  const bgSignals15m = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
+  const bgSignals60m = useMemo(() => [] as ReturnType<typeof computeBgSignals>, []);
 
   // Keep latestSignalsRef in sync so the 3s auto-trade confirmation callback
   // can verify a signal is still live before sending an order.
@@ -3482,40 +2959,44 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // whichever fires first sets the time and blocks the other from double-firing.
   useEffect(() => {
     if (!allConfluenceSignals.length) return;
-    const ivSec = interval === "1m" ? 60 : interval === "5m" ? 300 : interval === "15m" ? 900 : 3600;
     const nowSec = Math.floor(Date.now() / 1000);
-    const ivKey = interval;
-    // Check Long and Short independently — a recent Long must not block a Short (and vice-versa)
-    for (const dir of ["Long", "Short"] as const) {
-      const notifyKey = `${ivKey}_${dir}`;
-      const dirSigs = allConfluenceSignals.filter(s => s.direction === dir);
-      if (!notifyInitializedRef.current[notifyKey]) {
-        // Always initialize both directions on first pass — even if no signals exist for this
-        // direction yet. If we only initialize when signals exist, the first real signal of an
-        // unseen direction (e.g. first Short on an all-Long day) would be silently swallowed.
-        lastNotifiedRef.current[notifyKey] = dirSigs.length ? dirSigs[dirSigs.length - 1].time : 0;
-        lastNotifiedRiskRef.current[notifyKey] = dirSigs.length ? (dirSigs[dirSigs.length - 1].riskLevel ?? "riskiest") : "riskiest";
-        notifyInitializedRef.current[notifyKey] = true;
-        continue;
-      }
-      if (!dirSigs.length) continue;
-      const latest = dirSigs[dirSigs.length - 1];
-      const lastTime = lastNotifiedRef.current[notifyKey] ?? 0;
-      const lastRisk = lastNotifiedRiskRef.current[notifyKey] ?? "riskiest";
-      const isNewBar  = latest.time > lastTime;
-      // Zone upgrade: same bar but Milk zones now confirm a higher tier (risky→safe etc.)
-      const isUpgrade = latest.time === lastTime &&
-        (RISK_RANK[latest.riskLevel ?? "riskiest"] ?? 0) > (RISK_RANK[lastRisk] ?? 0);
-      if (!isNewBar && !isUpgrade) continue;
-      if (nowSec - latest.time > ivSec * 2) {
-        // Signal is stale — record it but don't fire (prevent firing when app catches up)
+    // Signals are grouped by THEIR OWN interval (5m/15m — the strategy's trading
+    // intervals), NOT the viewed chart interval, so the auto-trader's
+    // "Trade on intervals" setting gates exactly the trades the user selected.
+    for (const ivKey of ["5m", "15m"] as const) {
+      const ivSec = ivKey === "5m" ? 300 : 900;
+      // Check Long and Short independently — a recent Long must not block a Short (and vice-versa)
+      for (const dir of ["Long", "Short"] as const) {
+        const notifyKey = `${ivKey}_${dir}`;
+        const dirSigs = allConfluenceSignals.filter(s => s.interval === ivKey && s.direction === dir);
+        if (!notifyInitializedRef.current[notifyKey]) {
+          // Always initialize both directions on first pass — even if no signals exist for this
+          // direction yet. If we only initialize when signals exist, the first real signal of an
+          // unseen direction (e.g. first Short on an all-Long day) would be silently swallowed.
+          lastNotifiedRef.current[notifyKey] = dirSigs.length ? dirSigs[dirSigs.length - 1].time : 0;
+          lastNotifiedRiskRef.current[notifyKey] = dirSigs.length ? (dirSigs[dirSigs.length - 1].riskLevel ?? "riskiest") : "riskiest";
+          notifyInitializedRef.current[notifyKey] = true;
+          continue;
+        }
+        if (!dirSigs.length) continue;
+        const latest = dirSigs[dirSigs.length - 1];
+        const lastTime = lastNotifiedRef.current[notifyKey] ?? 0;
+        const lastRisk = lastNotifiedRiskRef.current[notifyKey] ?? "riskiest";
+        const isNewBar  = latest.time > lastTime;
+        // Tier upgrade on the same bar (kept for safety; optimized signals are always "safe")
+        const isUpgrade = latest.time === lastTime &&
+          (RISK_RANK[latest.riskLevel ?? "riskiest"] ?? 0) > (RISK_RANK[lastRisk] ?? 0);
+        if (!isNewBar && !isUpgrade) continue;
+        if (nowSec - latest.time > ivSec * 2) {
+          // Signal is stale — record it but don't fire (prevent firing when app catches up)
+          lastNotifiedRef.current[notifyKey] = latest.time;
+          lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
+          continue;
+        }
         lastNotifiedRef.current[notifyKey] = latest.time;
         lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
-        continue;
+        fireSignalNotification(latest, ivKey);
       }
-      lastNotifiedRef.current[notifyKey] = latest.time;
-      lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
-      fireSignalNotification(latest, ivKey);
     }
   }, [allConfluenceSignals]);
 
@@ -4805,11 +4286,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 ))}
               </div>
 
-              {/* Interval filter */}
+              {/* Interval filter — the strategy trades 5m and 15m only */}
               <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals</div>
+                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals (strategy fires 5m &amp; 15m)</div>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {(["1m", "5m", "15m", "60m"] as const).map(iv => (
+                  {(["5m", "15m"] as const).map(iv => (
                     <label key={iv} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
                       <input
                         type="checkbox"
