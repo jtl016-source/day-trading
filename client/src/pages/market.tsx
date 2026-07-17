@@ -1876,8 +1876,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/5m?from=${fromTs}&to=${toTs}`);
       if (!r.ok) throw new Error("Failed"); return r.json();
     },
+    // LIVE-CRITICAL: this feeds the optimized strategy's 5m component when the
+    // viewed chart is 15m/60m — it must refresh continuously or 5m signals
+    // would freeze at page load (the 5m staleness gate is 10 min).
     enabled: interval !== "5m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
+    staleTime: 25_000,
+    refetchInterval: 30_000,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
@@ -2558,10 +2562,15 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // charts it uses the background 5m fetch); the 15m component can reuse the
   // 15m chart's own candles.
   const allConfluenceSignals = useMemo((): CSig[] => {
+    // LIVE-CRITICAL: prefer live-merged windowedCandles wherever possible so
+    // signals fire in real time. On 1m/5m charts BOTH components run from the
+    // live feed (the 15m component aggregates the live 5m/1m bars). Only the
+    // 60m chart (and the 5m component on the 15m chart) fall back to the
+    // background 5m fetch, which refetches every 30s.
     const source5m: CandleBar[] =
       interval === "1m" || interval === "5m" ? windowedCandles : (bg5mData?.candles ?? []);
     const source15m: CandleBar[] =
-      interval === "15m" ? windowedCandles : (bg15mData?.candles ?? source5m);
+      interval === "15m" ? windowedCandles : source5m;
     if (!source5m.length && !source15m.length) return [];
     const engineSigs = [
       ...computeOptimizedSignalsForInterval(source5m, "5m"),
@@ -2578,7 +2587,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       interval: s.interval,
       signalType: "optimized",
     }));
-  }, [windowedCandles, bg5mData, bg15mData, interval]);
+  }, [windowedCandles, bg5mData, interval]);
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
