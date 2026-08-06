@@ -1790,6 +1790,23 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       // ── Confluence signal circles + MC TP/SL levels ───────────────────────
       // Shared label tracker prevents multiple signals' text boxes from overlapping
       const usedLabels: Array<{ rx: number; y: number }> = [];
+      // Signals can be tagged with a finer interval than the displayed bars
+      // (e.g. a 5m signal on the 15m/60m chart) — their exact bar time then has
+      // no coordinate on this time scale. Snap those to the displayed bar that
+      // CONTAINS the signal time, else they silently vanish from coarser charts.
+      const dispTimes = [...candlesRef.current].map(c => c.time).sort((a, b) => a - b);
+      let dispIntervalSec = Infinity;
+      for (let i = 1; i < Math.min(dispTimes.length, 50); i++) {
+        const d = dispTimes[i] - dispTimes[i - 1];
+        if (d > 0 && d < dispIntervalSec) dispIntervalSec = d;
+      }
+      const snapToDisplayedBar = (t: number): number | null => {
+        let lo = 0, hi = dispTimes.length - 1, best = -1;
+        while (lo <= hi) { const m = (lo + hi) >> 1; if (dispTimes[m] <= t) { best = m; lo = m + 1; } else hi = m - 1; }
+        if (best < 0) return null;
+        const bt = dispTimes[best];
+        return isFinite(dispIntervalSec) && t - bt < dispIntervalSec ? bt : null;
+      };
       for (const sig of confluenceSignalsRef.current) {
         const rl = (sig as any).riskLevel as string | undefined;
         const st = sig.signalType as string | undefined;
@@ -1798,7 +1815,11 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         // Circle radius: backtest=9 always; else safe=9, risky=7, riskiest=5
         const circleR  = backtestModeRef.current ? 9 : (rl === "risky" ? 7 : rl === "riskiest" ? 5 : 9);
 
-        const sx = ts.timeToCoordinate(sig.time as any);
+        let sx = ts.timeToCoordinate(sig.time as any);
+        if (sx == null) {
+          const snapped = snapToDisplayedBar(sig.time as number);
+          if (snapped != null) sx = ts.timeToCoordinate(snapped as any);
+        }
         const sy = series.priceToCoordinate(sig.price);
         if (sx == null || sy == null) continue;
         const isLong = sig.direction === "Long";

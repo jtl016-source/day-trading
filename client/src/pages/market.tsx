@@ -776,7 +776,14 @@ export default function MarketPage() {
   const [autoTradeRiskLevels, setAutoTradeRiskLevels]   = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeRiskLevels", ["safe"])));
   // THE program strategy trades 5m and 15m — both enabled by default; the
   // "Trade on intervals" setting below gates which ones auto-trade fires.
-  const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m", "15m"])));
+  const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => {
+    // One-time migration: builds before 2026-07-17 persisted ["5m"] as the
+    // then-default, which silently blocks all 15m trades under the dual-interval
+    // strategy. Re-seed to both intervals unless the settings carry the v2 flag
+    // (written on every persist below), so choices made after this ship stick.
+    if (!getPersistedSetting<boolean>("autoTradeIntervalsV2", false)) return new Set(["5m", "15m"]);
+    return new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m", "15m"]));
+  });
   const [autoTradeConnected, setAutoTradeConnected]     = useState(false);
   const [mwSyncStatus, setMwSyncStatus] = useState<"pending" | "syncing" | "done">("pending");
   const [mwSyncBars, setMwSyncBars]     = useState(0);
@@ -950,6 +957,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         autoTradeContracts, autoTradeContractType,
         autoTradeRiskLevels: [...autoTradeRiskLevels],
         autoTradeIntervals:  [...autoTradeIntervals],
+        autoTradeIntervalsV2: true,
         autoTradeTp1Only,
         autoTradeDirection,
         useTrailer,
@@ -1511,14 +1519,16 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     staleTime: 30_000,
     refetchInterval: 30_000,
   });
-  const { data: bg15mData } = useQuery<{ candles: CandleBar[] }>({
+  const { data: bg15mData } = useQuery<{ candles: CandleBar[]; raw5m?: CandleBar[] }>({
     queryKey: ["/api/data/cached-continuous", selectedSymbol, "15m", fromTs, toTs, "bg"],
     queryFn: async () => {
-      // 15m is aggregated from 5m
+      // 15m is aggregated from 5m; the raw 5m bars are kept alongside because
+      // the strategy's 5m component needs ≤5m candles (aggregated 15m bars
+      // fed to it produce wrong, mislabeled signals on the 60m chart)
       const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/5m?from=${fromTs}&to=${toTs}`);
       if (!r.ok) throw new Error("Failed");
       const d = await r.json();
-      return { ...d, candles: agg5mTo15m(d.candles ?? []) };
+      return { ...d, candles: agg5mTo15m(d.candles ?? []), raw5m: d.candles ?? [] };
     },
     enabled: interval !== "15m" && fromTs > 0 && toTs > 0,
     staleTime: 30_000,
@@ -2188,12 +2198,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // auto-trader's "Trade on intervals" setting can gate which ones fire.
   // Per-interval data sources: the 5m component needs ≤5m bars (the 15m chart's
   // main dataset is already 15m and cannot be disaggregated, so it uses the raw
-  // 5m fetch; the 60m chart uses the background 15m fetch, which is 5m-resolution).
+  // 5m fetch; the 60m chart uses the bg15m query's raw 5m payload — the query's
+  // `candles` field is ALREADY aggregated to 15m and must not feed the 5m component).
   const allConfluenceSignals = useMemo((): CSig[] => {
     const source5m: CandleBar[] =
       interval === "1m" || interval === "5m" ? allBarsForVector
       : interval === "15m" ? (rawCandleData?.candles ?? [])
-      : (bg15mData?.candles ?? []);
+      : (bg15mData?.raw5m ?? bg15mData?.candles ?? []);
     const source15m: CandleBar[] = interval === "15m" ? allBarsForVector : source5m;
     if (!source5m.length && !source15m.length) return [];
     const engineSigs = [
