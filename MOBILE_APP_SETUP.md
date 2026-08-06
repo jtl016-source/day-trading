@@ -1,5 +1,27 @@
 # Mobile App — Working From Anywhere + Standalone Install
 
+## ✅ Implemented: the web app is now an installable app (PWA)
+
+No computer or Expo Go needed. Once this branch is deployed:
+
+1. Open the deployed site on your phone (Railway/Replit URL).
+2. **iPhone (Safari)**: Share button → "Add to Home Screen".
+   **Android (Chrome)**: menu (⋮) → "Add to Home screen" / "Install app".
+3. A **Milk Yellow Box** icon appears on your home screen. It launches
+   full-screen (no browser bars), works from any network, and never touches
+   Expo Go or your computer.
+
+What was added: `client/public/manifest.webmanifest`, app icons
+(`icon-192/512`, maskable, `apple-touch-icon`), a minimal `sw.js` service
+worker (never caches `/api` or `/ws` — live data always fresh), PWA meta
+tags in `client/index.html`, and service-worker registration in `main.tsx`
+(production only).
+
+The sections below remain for the separate Expo project on your computer,
+if you still want a native binary later.
+
+---
+
 The Expo mobile app is NOT in this repository — it lives on your computer.
 This guide covers (1) why it only loads on your home WiFi and how to fix it,
 and (2) how to turn it into a real installed app so you never open Expo Go.
