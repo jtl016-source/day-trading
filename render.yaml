@@ -1,0 +1,14 @@
+# Render.com deploy blueprint — free tier.
+# In Render: New → Blueprint → select this repo → Apply. That's the whole setup.
+services:
+  - type: web
+    name: day-trading
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"

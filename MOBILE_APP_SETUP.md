@@ -22,6 +22,54 @@ if you still want a native binary later.
 
 ---
 
+## Free hosting options (Railway replacement)
+
+The server needs: long-running Node process, WebSockets, and (ideally) a
+persistent disk for the SQLite candle cache (`data/app.db`).
+
+### Option A — Render.com free tier (recommended, phone-friendly)
+
+`render.yaml` in the repo root makes this one-click:
+
+1. Sign up at render.com with your GitHub account (works from a phone).
+2. New → **Blueprint** → pick the `day-trading` repo → Apply.
+3. Render builds and deploys from `main` automatically (and re-deploys on
+   every merge). Your URL: `https://day-trading-XXXX.onrender.com`.
+
+Free-tier caveats:
+- **Spins down after ~15 min idle** — first open after a quiet period takes
+  ~30–60s to wake. (While MotiveWave's TickRelay is connected it stays awake.)
+- **No persistent disk** — the SQLite candle cache resets on each deploy or
+  restart. Re-download from Polygon via the `/data` page, or use
+  `POST /api/data/import-full` with a JSON export to restore.
+
+### Option B — Host on the home PC (best fit, $0, no cloud at all)
+
+MotiveWave already requires the home PC to be on for live ticks — so run the
+server there too, and expose it with a free tunnel:
+
+1. On the PC: `npm run build && npm start` (serves on port 5000).
+2. Install **Tailscale** (free personal plan) on the PC and your phone →
+   the phone can reach the PC from anywhere, privately, at a stable address.
+   `tailscale serve --bg 5000` gives it HTTPS.
+   Or `tailscale funnel 5000` for a public HTTPS URL (no phone app needed).
+3. Add to Home Screen from that URL.
+
+Pros: candle cache persists, no cold starts, ticks never leave the LAN.
+Con: needs one-time setup at the computer.
+
+### Option C — Oracle Cloud "Always Free" VM
+
+A genuinely free forever Linux VM (generous ARM shape). Most robust: real
+disk, always on, no sleep. But it's a full server you SSH into and maintain —
+only worth it if A and B both disappoint.
+
+Avoid: Fly.io (requires a card now), Glitch (hosting shut down), Replit
+deployments (paid), free serverless platforms like Cloud Run/Vercel/Netlify
+(no persistent WebSocket server + SQLite wiped constantly).
+
+---
+
 The Expo mobile app is NOT in this repository — it lives on your computer.
 This guide covers (1) why it only loads on your home WiFi and how to fix it,
 and (2) how to turn it into a real installed app so you never open Expo Go.

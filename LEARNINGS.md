@@ -145,6 +145,11 @@ Milk draws zones at market open each day. These are fixed predictions — they d
 
 ## Session Log
 
+**2026-08-06 — Railway dropped (paid); free-hosting options documented + Render blueprint added**
+- User abandoned Railway over cost. Added `render.yaml` (Render.com free tier, Node 22, `npm ci && npm run build` / `npm start`) so deploying is New → Blueprint → pick repo. Render free caveats that matter HERE: service sleeps after ~15 min idle (MotiveWave's persistent `/ws/mw-feed` WS connection keeps it awake during market hours) and NO persistent disk — `data/app.db` (SQLite candle cache) is wiped on every deploy/restart; restore via Polygon re-download or `POST /api/data/import-full`.
+- Best-fit alternative documented in MOBILE_APP_SETUP.md: host on the home PC (which must run anyway for MotiveWave) + Tailscale serve/funnel for a stable HTTPS URL — persistent DB, no cold starts, $0.
+- Server hosting requirements (verified in code): long-running Node + WS, SQLite on local disk at `server/../data/app.db`, binds `process.env.PORT` (falls back 5000), no DATABASE_URL needed at runtime (drizzle.config's DATABASE_URL check is drizzle-kit-only). Serverless platforms (Cloud Run/Vercel/Netlify) are a bad fit.
+
 **2026-08-06 — Mobile app "only loads at my house" diagnosed; setup guide added**
 - **The Expo mobile app is NOT in this repo** — searched every remote branch: no `app.json`/`eas.json`/React Native code anywhere. It exists only on the user's computer. Any future mobile-app code task needs the user to push that project (or paste its files) first.
 - **Root cause of the location dependence**: `expo start` defaults to LAN mode — Expo Go fetches the JS bundle from the dev machine's `192.168.x.x` address, unreachable off the home WiFi. Second, independent dependency: if the app's API/WS base URLs point at a LAN IP instead of a deployed server, data fails away from home even when the bundle loads. Both documented with fixes in `MOBILE_APP_SETUP.md` (tunnel mode / deployed Railway URL / EAS Build for a standalone installable app + EAS Update for OTA JS updates).
