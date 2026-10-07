@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GraduationCap, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
-import { computeOptimizedSignals } from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
+import { computeOptimizedSignals, type OptimizedInterval } from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const MW = {
@@ -198,8 +198,8 @@ interface RawSignal {
   reclassifyReason?: string;
   /** Pre-computed outcome from market.tsx (only set when externalSignals provided) */
   preOutcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
-  /** The strategy interval this signal fired on (5m or 15m) */
-  sigInterval?: "5m" | "15m";
+  /** The strategy interval this signal fired on (1m scalp, 5m or 15m) */
+  sigInterval?: OptimizedInterval;
   signalType?: "pure_tabletop" | "side_tabletop";
   footprintReading?: string; // FOOTPRINT-UI: JSON FootprintReading
   confidence?: number; // 0–100 confidence score
@@ -208,10 +208,12 @@ interface RawSignal {
 type MLZone = { from_ts: number; to_ts: number; top: number; bottom: number; is_bull: boolean; score: number };
 
 // SHARED-ENGINE: standalone signal computation delegates to computeOptimizedSignals —
-// THE program strategy (ICT Zones + Candle Body on 15m RTH, TP1 +8 / TP2 +16 /
-// SL −4) — the EXACT code path the Market chart and Backtest page run, so the
-// Signals tab always shows the SAME EXACT signals. Input candles are aggregated
-// to 15m inside the engine regardless of the panel's display interval.
+// THE program strategy (ICT Zones + Candle Body during RTH on the 1m scalp, 5m
+// and 15m components, each with its own exits) — the EXACT code path the Market
+// chart and Backtest page run, so the Signals tab always shows the SAME EXACT
+// signals. The engine aggregates the input to each component's interval and
+// skips components finer than the input (standalone mode feeds 5m bars, so the
+// 1m scalp only appears here when market.tsx supplies externalSignals).
 function computeSignals(candles: CandleBar[]): RawSignal[] {
   if (!candles.length) return [];
   const sorted  = [...candles].sort((a, b) => a.time - b.time);
@@ -411,7 +413,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         signalType: s.signalType,
         footprintReading: s.footprintReading, // FOOTPRINT-UI:
         confidence: s.confidence,
-        sigInterval: s.interval === "5m" ? "5m" : "15m",
+        sigInterval: s.interval === "1m" ? "1m" : s.interval === "5m" ? "5m" : "15m",
       }));
     }
     // Standalone mode: always compute from the 5m dataset — the engine
@@ -448,9 +450,9 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           const res = computeOutcome(s, sortedPrimary);
           outcome = res.outcome; tpHit = res.tpHit; points = res.points;
         }
-        // Tag each entry with the strategy interval it fired on (5m or 15m) so
-        // "View on Chart" navigates to that interval. A 5m and a 15m signal can
-        // share a timestamp, so the interval is part of the key.
+        // Tag each entry with the strategy interval it fired on (1m/5m/15m) so
+        // "View on Chart" navigates to that interval. Two components can share
+        // a timestamp, so the interval is part of the key.
         const sigIv = (s.sigInterval ?? "15m") as IntervalKey;
         return { key: `${sym}-${s.time}-${sigIv}`, ...s, interval: sigIv, rth: isRTH(s.time), outcome, tpHit, points };
       })

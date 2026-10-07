@@ -9,7 +9,8 @@ import {
   MILK_TOLERANCE,
   OPTIMIZED_GATES,
   OPTIMIZED_EXITS,
-  OPTIMIZED_EXITS_5M,
+  optimizedConfigFor,
+  type EngineGates,
   aggregateToInterval,
   detectIctZones,
   computeEngineSignals,
@@ -67,11 +68,21 @@ function detectMilkZones(candles: CandleBar[]): ZoneBand[] {
 // ── Backtest engine ───────────────────────────────────────────────────────────
 // Signal detection is delegated to computeEngineSignals (@/lib/signal-engine) —
 // the exact same code path the Market chart and Signals tab use.
+/** Program exits + gates for a chart interval; 60m (not a strategy interval) explores with the 15m config. */
+function programConfig(interval: string): { exits: typeof OPTIMIZED_EXITS; gates: EngineGates } {
+  if (interval === "1m" || interval === "5m" || interval === "15m") {
+    const c = optimizedConfigFor(interval);
+    return { exits: c.exits, gates: c.gates };
+  }
+  return { exits: OPTIMIZED_EXITS, gates: OPTIMIZED_GATES };
+}
+
 function runBacktest(
   candles: CandleBar[],
   milkZones: ZoneBand[],
   profile: { rth: { tp1Safe: number; tp1: number; tp2: number; sl: number }; eth: { tp1Safe: number; tp1: number; tp2: number; sl: number } },
   symbol: string, interval: string, exitStrategy: string, session: SessionKey,
+  gates: EngineGates = OPTIMIZED_GATES,
 ): BacktestResult {
   const sorted = [...candles].sort((a, b) => a.time - b.time);
   const isBullZ = isBullZone;
@@ -136,8 +147,9 @@ function runBacktest(
   };
 
   // ── Run the shared engine — the ONE signal code path for all pages ──────────
-  // OPTIMIZED_GATES = ICT zone required + candle body; no vector/footprint gate.
-  const engineSignals: EngineSignal[] = computeEngineSignals(sorted, milkZones, profile, session, OPTIMIZED_GATES);
+  // Gates = ICT zone required + candle body (no vector/footprint gate); the 1m
+  // scalp adds its kill-zone window, VWAP-side and narrow-bar filters.
+  const engineSignals: EngineSignal[] = computeEngineSignals(sorted, milkZones, profile, session, gates);
 
   for (const s of engineSignals) {
     const out = s.outcome as Outcome;
@@ -562,10 +574,12 @@ export default function BacktestPage() {
       setCandles(bars);
       const zones   = detectMilkZones(bars);
       setMilkZones(zones);
-      // Fixed exits — part of the optimized strategy, calibrated per interval:
-      // 5m = TP1 +4 / TP2 +8 / SL −4 · 15m = TP1 +8 / TP2 +16 / SL −4
-      const exits   = interval === "5m" ? OPTIMIZED_EXITS_5M : OPTIMIZED_EXITS;
-      const bt      = runBacktest(bars, zones, exits, symbol, interval, "optimized", sessionMode);
+      // Fixed exits + gates — part of the optimized strategy, calibrated per
+      // interval: 1m scalp = TP1 +4 / TP2 +6 / SL −4 (+ scalp filters) · 5m =
+      // TP1 +4 / TP2 +8 / SL −4 · 15m = TP1 +8 / TP2 +16 / SL −4 (60m explores
+      // with the 15m config).
+      const cfg     = programConfig(interval);
+      const bt      = runBacktest(bars, zones, cfg.exits, symbol, interval, "optimized", sessionMode, cfg.gates);
       setResult(bt);
     } catch (e: any) {
       setLoadError(e.message ?? "Failed to load");
@@ -603,8 +617,8 @@ export default function BacktestPage() {
     }
   };
 
-  // ── Derived stats — exits are interval-calibrated (5m: 4/8/4 · others: 8/16/4) ──
-  const exitProfile = (interval === "5m" ? OPTIMIZED_EXITS_5M : OPTIMIZED_EXITS)[sessionMode];
+  // ── Derived stats — exits are interval-calibrated (1m: 4/6/4 · 5m: 4/8/4 · others: 8/16/4) ──
+  const exitProfile = programConfig(interval).exits[sessionMode];
   const filteredSignals = result
     ? result.signals.filter(s => enabledTiers.has(s.tier))
     : [];
