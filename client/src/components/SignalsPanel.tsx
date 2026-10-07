@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GraduationCap, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
-import { computeOptimizedSignals, type OptimizedInterval } from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
+import { computeOptimizedSignals, OPTIMIZED_INTERVALS, SCALP_WINDOWS_UTC, SCALP_MAX_RANGE_PTS, COOLDOWN_BARS as ENGINE_COOLDOWN_BARS, type OptimizedInterval } from "@/lib/signal-engine"; // SHARED-ENGINE: THE program strategy — same signals on chart, tab and backtest
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const MW = {
@@ -277,7 +277,7 @@ function defaultStartDate(): string {
 export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = "5m", onClose, onViewOnChart, externalSignals, milkZones, allCandles, footprintAlerts }: SignalsPanelProps) { // FOOTPRINT-UI:
   const [sym,       setSym]       = useState(defaultSymbol);
   const [ival,      setIval]      = useState<IntervalKey>(defaultInterval);
-  const [activeTab,   setActiveTab]   = useState<"signals" | "learned">("signals");
+  const [activeTab,   setActiveTab]   = useState<"signals" | "learned" | "info">("signals");
   const [direction,   setDirection]   = useState<"all"|"long"|"short">("all");
   const [riskFilter,  setRiskFilter]  = useState<"all"|RiskLevel>("all");
   const [rthOnly,     setRthOnly]     = useState(true);
@@ -669,20 +669,24 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", borderBottom: `1px solid ${MW.border}`, background: MW.panel, flexShrink: 0 }}>
         {/* Tab buttons */}
-        {(["signals", "learned"] as const).map(tab => (
-          <button key={tab} onClick={() => { setActiveTab(tab); if (tab === "learned") refetchLearnings(); }}
-            style={{
-              padding: "3px 12px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
-              background: activeTab === tab ? (tab === "learned" ? "rgba(167,139,250,0.18)" : "rgba(66,165,245,0.15)") : "transparent",
-              border: `1px solid ${activeTab === tab ? (tab === "learned" ? "#a78bfa88" : MW.accent + "88") : MW.border}`,
-              color: activeTab === tab ? (tab === "learned" ? "#a78bfa" : MW.accent) : MW.muted,
-              fontFamily: "'Trebuchet MS', monospace", textTransform: "uppercase", letterSpacing: "0.05em",
-            }}
-          >{tab}</button>
-        ))}
+        {(["signals", "learned", "info"] as const).map(tab => {
+          const tone = tab === "learned" ? "#a78bfa" : tab === "info" ? "#fbbf24" : MW.accent;
+          const on = activeTab === tab;
+          return (
+            <button key={tab} onClick={() => { setActiveTab(tab); if (tab === "learned") refetchLearnings(); }}
+              style={{
+                padding: "3px 12px", borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: "pointer",
+                background: on ? tone + "2e" : "transparent",
+                border: `1px solid ${on ? tone + "88" : MW.border}`,
+                color: on ? tone : MW.muted,
+                fontFamily: "'Trebuchet MS', monospace", textTransform: "uppercase", letterSpacing: "0.05em",
+              }}
+            >{tab}</button>
+          );
+        })}
 
         <span style={{ color: MW.muted, fontSize: 11 }}>
-          {activeTab === "signals" ? `${stats.total} signals` : `${lessons.length} lessons`}
+          {activeTab === "signals" ? `${stats.total} signals` : activeTab === "learned" ? `${lessons.length} lessons` : `${OPTIMIZED_INTERVALS.length} strategies`}
         </span>
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
@@ -925,6 +929,76 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           </div>
         </div>
       )}
+
+      {/* ── Info tab — THE program strategy, read straight from the engine constants ── */}
+      {activeTab === "info" && (() => {
+        const fmtUtc = (m: number) => {
+          // Fixed-UTC windows (no DST shift, like isRTH): render as ET for the trader
+          const et = m - 4 * 60; const h = Math.floor(et / 60), mm = et % 60;
+          return `${((h + 11) % 12) + 1}:${String(mm).padStart(2, "0")} ${h < 12 ? "AM" : "PM"} ET`;
+        };
+        const scalpWin = SCALP_WINDOWS_UTC.map(([a, b]) => `${fmtUtc(a)} – ${fmtUtc(b)}`).join(", ");
+        const card: React.CSSProperties = { padding: "12px 14px", borderRadius: 6, background: "#070b11", border: `1px solid ${MW.border}` };
+        const h = (t: string, color = MW.muted) => <div style={{ fontSize: 9, color, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 6 }}>{t}</div>;
+        const p: React.CSSProperties = { fontSize: 11, color: MW.text, lineHeight: 1.7 };
+        const li: React.CSSProperties = { ...p, display: "flex", gap: 8 };
+        const dot = (c: string) => <span style={{ color: c, flexShrink: 0 }}>•</span>;
+        const roleOf: Record<OptimizedInterval, { role: string; color: string; note: string }> = {
+          "1m":  { role: "Scalp — opening drive",  color: "#fbbf24", note: `Kill-zone only (${scalpWin}) · longs above / shorts below session VWAP · signal bar ≤ ${SCALP_MAX_RANGE_PTS} pts` },
+          "5m":  { role: "Intraday",               color: MW.accent, note: "No extra gates" },
+          "15m": { role: "Swing of the day",       color: "#a78bfa",  note: "No extra gates" },
+        };
+        return (
+          <div style={{ flex: 1, overflowY: "auto", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 14 }}>
+
+            <div style={card}>
+              {h("The program strategy — one rule, three intervals", "#fbbf24")}
+              <div style={p}>
+                An RTH candle <strong>tests and holds an ICT zone</strong> (Fair Value Gap, Order Block or structural level, ±2 pts) <strong>and closes in the trade direction</strong>.
+                No vector gate, no footprint gate. The same rule runs on three intervals; each has its own calibrated exits and never shares them.
+                Always-on filters: {ENGINE_COOLDOWN_BARS}-bar per-direction cooldown, long suppression within 5 pts of the day's high, 60m declining-vector long veto, CME settlement-break skip, exits at session settle.
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
+              {OPTIMIZED_INTERVALS.map(iv => {
+                const r = roleOf[iv.label]; const e = iv.exits.rth;
+                return (
+                  <div key={iv.label} style={{ ...card, borderColor: r.color + "55" }}>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 6 }}>
+                      <span style={{ fontSize: 16, fontWeight: 800, color: r.color }}>{iv.label}</span>
+                      <span style={{ fontSize: 10, color: MW.muted, textTransform: "uppercase", letterSpacing: "0.06em" }}>{r.role}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 12, marginBottom: 6, fontSize: 12, fontWeight: 700 }}>
+                      <span style={{ color: MW.up }}>TP1 +{e.tp1}</span>
+                      <span style={{ color: MW.up }}>TP2 +{e.tp2}</span>
+                      <span style={{ color: MW.down }}>SL −{e.sl}</span>
+                    </div>
+                    <div style={{ fontSize: 10, color: MW.muted, lineHeight: 1.6 }}>{r.note}</div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ ...card, borderColor: "#fbbf2455" }}>
+              {h("1m scalp — how it works", "#fbbf24")}
+              <div style={li}>{dot("#fbbf24")}<span><strong>Window:</strong> trades only {scalpWin}. The opening drive resolves 1m structure fast enough for a 4-pt target; the 2–3 PM window and midday both tested net-negative and are excluded.</span></div>
+              <div style={li}>{dot("#fbbf24")}<span><strong>VWAP side:</strong> longs only when the signal bar closes above the running session VWAP, shorts only below it. Scalps go with the session's value, never against it.</span></div>
+              <div style={li}>{dot("#fbbf24")}<span><strong>Narrow bar:</strong> the signal bar must be ≤ {SCALP_MAX_RANGE_PTS} pts high-to-low. A 4-pt stop off a 6-pt bar sits inside normal noise; a tight test-and-hold bar means the zone actually held.</span></div>
+              <div style={li}>{dot("#fbbf24")}<span><strong>Exits:</strong> TP1 +{OPTIMIZED_INTERVALS[0].exits.rth.tp1} / TP2 +{OPTIMIZED_INTERVALS[0].exits.rth.tp2} / SL −{OPTIMIZED_INTERVALS[0].exits.rth.sl}. Sub-3-pt targets never survive MES commissions and slippage — on MES, "scalp" means the filters are tight, not the targets.</span></div>
+              <div style={li}>{dot("#fbbf24")}<span><strong>Calibration:</strong> 28 days of 1m MES bars, 3,840 configurations, train 19 d / test 9 d, ranked on the pessimistic walk-forward (a bar spanning both TP and SL counts as a loss) net of 0.75 pt/trade costs. Result: 124 trades, 63.7% win rate, +172 pts pessimistic, +79 net; test window +24 net. Neighbouring stops and targets validate too.</span></div>
+              <div style={li}>{dot("#fbbf24")}<span><strong>Needs 1m bars.</strong> On the 5m/15m/60m charts the scalp runs from the background 1m feed; its markers snap to the bar that contains them.</span></div>
+              <div style={{ ...p, color: MW.muted, marginTop: 6 }}>Watch the live scalp win rate against the 63.7% calibration figure. Sustained performance below ~55% means re-calibrate (scripts/calibrate-scalp.ts), not widen the stop.</div>
+            </div>
+
+            <div style={card}>
+              {h("Where signals go")}
+              <div style={li}>{dot(MW.accent)}<span>Chart markers, this Signals tab, the Backtest page, browser notifications and Discord alerts — all from the same engine call, so every surface shows identical signals.</span></div>
+              <div style={li}>{dot(MW.accent)}<span>Auto-trade: the <strong>Trade on intervals</strong> setting (1m scalp / 5m / 15m) gates which intervals send orders to MotiveWave. All three are on by default.</span></div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Learned Trades Modal ──────────────────────────────────────────────── */}
       {showLearnedTrades && (() => {
