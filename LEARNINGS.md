@@ -770,3 +770,6 @@ Error: Could not resolve authentication method. Expected either apiKey or authTo
 - Afternoon entry — momentum often faded (×31)
 - Late session — expired near close (×11)
 - Resistance at 7235.00 capped the run (×1)
+
+**2026-10-07 — Research only: scalping strategy survey (no code changed)**
+- User asked for a survey of scalping strategies and how they work. Delivered in chat; nothing shipped. Reference points worth keeping for future engine work: ES scalps typically target 2–8 ticks with 3–4 tick stops (order-flow style); 5-min ORB backtests cluster at ~54% WR unfiltered, ~55–64% with HTF-trend/VWAP filters and VIX 16–24; ICT Silver Bullet = liquidity sweep → MSS on 1m/3m → FVG retest entry in the 10:00–11:00 ET window, stop beyond the sweep, ≥2:1. The engine's current 5m rule (zone test-and-hold + body close, 4/8/4) is already closest to the ICT intraday-scalping model; the obvious untested additions are a VWAP-side filter and an OAIR/OAOR regime gate (open inside prior RTH range → balance day, outside → trend day), which also target the 2026-08-05 chop-day losses.
