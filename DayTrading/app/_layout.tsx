@@ -14,6 +14,11 @@ import { IBMPlexMono_400Regular, IBMPlexMono_500Medium, IBMPlexMono_600SemiBold 
 import { AppProvider, useApp } from '@/context/app-context';
 import { MeridianBackground } from '@/components/meridian-background';
 import { Trading } from '@/constants/theme';
+import { installApiKeyFetch } from '@/lib/api-key';
+
+// Cloudflare-Tunnel gate: every /api/ fetch carries X-Api-Key from here on (module scope —
+// runs before any screen fires a request; the server ignores the header on LAN).
+installApiKeyFetch();
 
 // Keep the splash up until fonts are ready (Chakra Petch + IBM Plex Mono).
 SplashScreen.preventAutoHideAsync().catch(() => {});

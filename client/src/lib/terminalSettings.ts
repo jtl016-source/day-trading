@@ -6,8 +6,9 @@
 // `mwb_settings` on mount, so terminal changes take effect on the next reload.
 //
 // SINGLE-TIER: every signal is "safe". The Exit Strategy block mirrors the engine's real
-// exit controls (Tight/Standard/Wide profile, direction, TP targets, trailer, zone targets,
-// side-entry longs) — same keys the old market page used.
+// exit controls (Tight/Standard/Wide profile, direction, TP targets) — same keys the market
+// page uses. (Trailer + zone-target + side-entry-long toggles DELETED 2026-07-13: trailer is
+// gone per spec rule 12; the other two controlled nothing in the fact-engine model.)
 
 export type ExitProfile = "safe" | "risky" | "riskiest"; // Tight / Standard / Wide
 export type TradeDirection = "both" | "long" | "short";
@@ -21,10 +22,6 @@ export interface TerminalSettings {
   exitStrategy: ExitProfile; // Tight / Standard / Wide
   direction: TradeDirection; // → autoTradeDirection
   tp1Only: boolean;          // → autoTradeTp1Only (TP1 only vs TP1 + TP2)
-  useTrailer: boolean;       // → useTrailer
-  trailerOffset: number;     // → trailerOffset
-  useZoneTargets: boolean;   // → useZoneTargets
-  takeSideEntries: boolean;  // → takeSideEntries
   // Signal Engine (terminal-only display)
   closed: boolean;
   confirms: Confirms;
@@ -37,7 +34,14 @@ export interface StrategyToggles {
   MilkZone: boolean;     // → mwb_settings.showMilkZones (engine display)
   Vector: boolean;       // → mwb_settings.showVector (engine display)
   Footprint: boolean;    // → mwb_settings.showFpPanel (engine display)
+  YellowBox: boolean;    // → mwb_settings.yellowBoxEnabled (per-day gold boxes + engine fact input)
+  CloseEst: boolean;     // → mwb_settings.closeEstEnabled (EOD close-estimate zone overlay — display-only)
   Probability: boolean;  // master toggle: fractal probability layer (panel + on-chart overlays)
+  // CONFIRMATION-FACT toggles (2026-07-15) — corroborator-only facts in the signal engine,
+  // NOT standalone strategies. DEFAULT ON; missing-key-means-ON semantics like YellowBox.
+  ICT: boolean;          // → mwb_settings.ictConfirmEnabled (engine fact input)
+  Fractal: boolean;      // → mwb_settings.fractalConfirmEnabled (engine fact input)
+  FractalGeo: boolean;   // → mwb_settings.fractalGeoConfirmEnabled (engine fact input)
   // Per-concept on-chart overlays (only active when Probability is on) — each shown individually.
   probValueArea: boolean; // long-run POC / VAH / VAL horizontal lines
   probRegime: boolean;    // DFA-Hurst regime ribbon along the bottom
@@ -54,10 +58,6 @@ export const DEFAULT_SETTINGS: TerminalSettings = {
   exitStrategy: "risky", // matches the engine default getPersistedSetting("exitStrategy","risky")
   direction: "both",
   tp1Only: false,
-  useTrailer: false,
-  trailerOffset: 2.0,
-  useZoneTargets: false,
-  takeSideEntries: false,
   closed: true,
   confirms: "2",
   ml: true,
@@ -68,7 +68,12 @@ export const DEFAULT_STRATEGIES: StrategyToggles = {
   MilkZone: false, // upload-driven only — turns on when the user uploads a zone PNG, never by default
   Vector: true,
   Footprint: true,
+  YellowBox: true, // DEFAULT ON — {...DEFAULT_STRATEGIES, ...saved} makes a MISSING key resolve true for existing profiles
+  CloseEst: true, // DEFAULT ON — EOD close-estimate zone (2026-08-09 study session); missing key resolves true
   Probability: false, // off by default — opt-in fractal regime/value-area read-out
+  ICT: true,     // DEFAULT ON — confirmation facts (missing key resolves true for existing profiles)
+  Fractal: true, // DEFAULT ON — confirmation facts (missing key resolves true for existing profiles)
+  FractalGeo: true, // DEFAULT ON — Fractal-Geometry guide confirmations (missing key resolves true)
   probValueArea: true,
   probRegime: true,
   probForecast: true,
@@ -112,10 +117,6 @@ export function loadSettings(): TerminalSettings {
   if (mwb.exitStrategy === "safe" || mwb.exitStrategy === "risky" || mwb.exitStrategy === "riskiest") merged.exitStrategy = mwb.exitStrategy;
   if (mwb.autoTradeDirection === "both" || mwb.autoTradeDirection === "long" || mwb.autoTradeDirection === "short") merged.direction = mwb.autoTradeDirection;
   if (typeof mwb.autoTradeTp1Only === "boolean") merged.tp1Only = mwb.autoTradeTp1Only as boolean;
-  if (typeof mwb.useTrailer === "boolean") merged.useTrailer = mwb.useTrailer as boolean;
-  if (typeof mwb.trailerOffset === "number") merged.trailerOffset = mwb.trailerOffset as number;
-  if (typeof mwb.useZoneTargets === "boolean") merged.useZoneTargets = mwb.useZoneTargets as boolean;
-  if (typeof mwb.takeSideEntries === "boolean") merged.takeSideEntries = mwb.takeSideEntries as boolean;
   return merged;
 }
 
@@ -131,10 +132,6 @@ export function saveSettings(s: TerminalSettings): void {
     exitStrategy: s.exitStrategy,
     autoTradeDirection: s.direction,
     autoTradeTp1Only: s.tp1Only,
-    useTrailer: s.useTrailer,
-    trailerOffset: s.trailerOffset,
-    useZoneTargets: s.useZoneTargets,
-    takeSideEntries: s.takeSideEntries,
   });
 }
 
@@ -152,7 +149,14 @@ export function loadStrategies(): StrategyToggles {
   if (typeof mwb.showMilkZones === "boolean") merged.MilkZone = mwb.showMilkZones as boolean;
   if (typeof mwb.showVector === "boolean") merged.Vector = mwb.showVector as boolean;
   if (typeof mwb.showFpPanel === "boolean") merged.Footprint = mwb.showFpPanel as boolean;
+  // Missing yellowBoxEnabled key (pre-existing profiles) keeps the default ON — only a real boolean overrides.
+  if (typeof mwb.yellowBoxEnabled === "boolean") merged.YellowBox = mwb.yellowBoxEnabled as boolean;
+  if (typeof mwb.closeEstEnabled === "boolean") merged.CloseEst = mwb.closeEstEnabled as boolean;
   if (typeof mwb.showProbability === "boolean") merged.Probability = mwb.showProbability as boolean;
+  // Confirmation-fact toggles: missing key = default ON — only a real boolean overrides.
+  if (typeof mwb.ictConfirmEnabled === "boolean") merged.ICT = mwb.ictConfirmEnabled as boolean;
+  if (typeof mwb.fractalConfirmEnabled === "boolean") merged.Fractal = mwb.fractalConfirmEnabled as boolean;
+  if (typeof mwb.fractalGeoConfirmEnabled === "boolean") merged.FractalGeo = mwb.fractalGeoConfirmEnabled as boolean;
   return merged;
 }
 
@@ -166,7 +170,12 @@ export function saveStrategies(s: StrategyToggles): void {
     showMilkZones: s.MilkZone,
     showVector: s.Vector,
     showFpPanel: s.Footprint,
+    yellowBoxEnabled: s.YellowBox,
+    closeEstEnabled: s.CloseEst,
     showProbability: s.Probability,
+    ictConfirmEnabled: s.ICT,
+    fractalConfirmEnabled: s.Fractal,
+    fractalGeoConfirmEnabled: s.FractalGeo,
   });
 }
 

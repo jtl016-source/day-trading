@@ -76,7 +76,7 @@ export const signalHistory = sqliteTable("signal_history", {
   signalType: text("signal_type"),
   entry: real("entry").notNull(),
   tp1: real("tp1").notNull(),
-  tp2: real("tp2").notNull(),
+  tp2: real("tp2"), // TP1-ONLY policy (2026-08-13): null = one target only (all new rows)
   sl: real("sl").notNull(),
   outcome: text("outcome"),
   patternBars: integer("pattern_bars"),
@@ -84,6 +84,39 @@ export const signalHistory = sqliteTable("signal_history", {
   // JSON {milkOk, milkPts, vecOk, secondaryVecOk, secondaryVecCount} — lets the iPhone
   // render the exact confirmation breakdown the PC computed (MilkZone/Vector/Footprint chips).
   confirmations: text("confirmations"),
+  // BACKTEST-GRADE EXIT DETAIL (2026-07-29): additive/nullable — filled by --persist (harness
+  // 1m walkExit) and by the live engine's walk-forward when a live-fired signal resolves.
+  // The Signals tab / SignalDetail / chart markers read these instead of re-deriving P&L.
+  exitPrice: real("exit_price"),
+  exitTs: integer("exit_ts"),
+  pointsResult: real("points_result"),
+  mae: real("mae"),
+  mfe: real("mfe"),
+  barsToExit: integer("bars_to_exit"),
+  // FACT-ENGINE: composite fact-list label, e.g. "Vector(5m SE↑ + 15m tabletop) + Zone(support @6512)".
+  // Replaces the tier badge in the Signals UI. Additive/nullable — old rows have NULL.
+  label: text("label"),
+  // RISK DISPLAY (2026-07-30): display-only — the fire-time canonical fact-family combo key
+  // ("FG+Fr+YB") + situational risk flags (JSON string array, e.g. '["no-footprint","late-entry"]').
+  // Additive/nullable — rows without them display gracefully with no risk info.
+  comboKey: text("combo_key"),
+  riskFlags: text("risk_flags"),
+  // POSITION SIZING (2026-08-02 — display/config-only): the engine's fire-time suggested
+  // contract count from the combo's held-out track-record tier (PROVEN = 2, else 1 — shared
+  // SIZE_BY_COMBO_TIER). Additive/nullable; NEVER sizes a trade without the explicit
+  // "Size by combo tier" opt-in (default OFF).
+  suggestedContracts: integer("suggested_contracts"),
+  // SHADOW TAGS (2026-10-01 — RECORD-ONLY): the fire-time shadow-rule tags (JSON string array,
+  // e.g. '["box-side-wrong","range-below-0.25med"]'; '[]' = evaluated, none tripped) from
+  // shared/fact-engine computeShadowTags. Additive/nullable — NULL = pre-feature row (not
+  // evaluated). Never read by any gate; scored by GET /api/signals/shadow-tags/summary.
+  shadowTags: text("shadow_tags"),
+  // SOURCE PROVENANCE (2026-07-31, "live-fired records are permanent"): 'live' = written by a
+  // live tab (fire / live outcome update) — PERMANENT: the --persist wipe never deletes it and
+  // regen upserts yield to it (collision reported, not merged); 'regen' = harness --persist;
+  // NULL = legacy pre-column rows (live/regen indistinguishable — treated as regen).
+  // Immutable once 'live' (write-guard in POST /api/signals/history + both persist paths).
+  source: text("source"),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 }, (t) => [
   uniqueIndex("signal_history_sym_iv_ts_dir").on(t.symbol, t.interval, t.timestamp, t.direction),
@@ -233,6 +266,77 @@ export const footprintCandles = sqliteTable("footprint_candles", {
   uniqueIndex("footprint_candles_sym_iv_time").on(t.symbol, t.interval, t.time),
 ]);
 
+// SHADOW EXITS (2026-10-01): how alternative single exits would have resolved each fire on the real
+// 1m path (server/shadow-exits.ts). Natural key symbol|interval|timestamp|direction × variant × mode
+// ("carry" | "apex1655"). outcome: win_tp1 | loss | open | closed (market / moved-stop exit — see
+// exit_reason). ref_* = the shipped levels the row was resolved against (a re-levelled fire re-resolves).
+export const signalShadowExits = sqliteTable("signal_shadow_exits", {
+  id:         integer("id").primaryKey({ autoIncrement: true }),
+  symbol:     text("symbol").notNull(),
+  interval:   text("interval").notNull(),
+  timestamp:  integer("timestamp").notNull(),
+  direction:  text("direction").notNull(),
+  variant:    text("variant").notNull(),
+  mode:       text("mode").notNull(),
+  session:    text("session"),
+  refEntry:   real("ref_entry").notNull(),
+  refTp1:     real("ref_tp1").notNull(),
+  refSl:      real("ref_sl").notNull(),
+  tpPrice:    real("tp_price"),
+  slPrice:    real("sl_price"),
+  outcome:    text("outcome").notNull(),
+  exitReason: text("exit_reason"),
+  exitTs:     integer("exit_ts"),
+  exitPrice:  real("exit_price"),
+  points:     real("points"),
+  mae:        real("mae"),
+  mfe:        real("mfe"),
+  updatedAt:  text("updated_at").default(sql`(datetime('now'))`),
+}, (t) => [
+  uniqueIndex("signal_shadow_exits_key").on(t.symbol, t.interval, t.timestamp, t.direction, t.variant, t.mode),
+]);
+
+// SHADOW SCALPS (2026-10-06 — RECORD ONLY): one row per hypothetical small-target trade from the
+// S1 ORB-30 / S2 yellow-box edge-fade shadow test + their hour-matched random nulls (server/shadow-scalps.ts,
+// docs/shadow-scalps-README.md). Keyed per session day × strategy × variant × direction × signal bar × null
+// draw × bracket cell × fill model; a re-run of a day replaces that day's rows. points = GROSS (friction is
+// applied in the summary). era: "backfill" (sessions before the first live run) | "live" (forward record —
+// the only rows the kill/promotion rules count). Never read by any engine, gate or order path.
+export const shadowScalps = sqliteTable("shadow_scalps", {
+  id:          integer("id").primaryKey({ autoIncrement: true }),
+  symbol:      text("symbol").notNull(),
+  dayKey:      text("day_key").notNull(),
+  era:         text("era").notNull(),
+  strategy:    text("strategy").notNull(),
+  variant:     text("variant").notNull(),
+  direction:   text("direction").notNull(),
+  signalTs:    integer("signal_ts").notNull(),
+  seq:         integer("seq").notNull().default(0),
+  cell:        text("cell").notNull(),
+  tp:          real("tp").notNull(),
+  sl:          real("sl").notNull(),
+  fillModel:   text("fill_model").notNull(),
+  level:       real("level"),
+  entryTs:     integer("entry_ts").notNull(),
+  entryPrice:  real("entry_price").notNull(),
+  tpPrice:     real("tp_price").notNull(),
+  slPrice:     real("sl_price").notNull(),
+  outcome:     text("outcome").notNull(),
+  exitTs:      integer("exit_ts").notNull(),
+  exitPrice:   real("exit_price").notNull(),
+  points:      real("points").notNull(),
+  minutesHeld: integer("minutes_held").notNull(),
+  runAt:       integer("run_at").notNull(),
+  // S2 box provenance (per day): 'cached' = built from the day box frozen in yellowbox_day_zones (raw
+  // values below; S2 `level` = the tick-snapped edge); 'pending' = box not frozen yet, S2 deferred and
+  // retried; 'none' = the frozen day has no usable box.
+  zoneState:   text("zone_state"),
+  zoneTop:     real("zone_top"),
+  zoneBottom:  real("zone_bottom"),
+}, (t) => [
+  uniqueIndex("shadow_scalps_key").on(t.symbol, t.dayKey, t.strategy, t.variant, t.direction, t.signalTs, t.seq, t.cell, t.fillModel),
+]);
+
 export type CachedCandle      = typeof cachedCandles.$inferSelect;
 export type DownloadStatus    = typeof downloadStatus.$inferSelect;
 export type SignalHistory      = typeof signalHistory.$inferSelect;
@@ -242,3 +346,5 @@ export type LearningSession   = typeof learningSessions.$inferSelect;
 export type StrategyProposal  = typeof strategyProposals.$inferSelect;
 export type TradeJournalEntry = typeof tradeJournal.$inferSelect;
 export type FootprintCandleRow = typeof footprintCandles.$inferSelect;
+export type SignalShadowExit  = typeof signalShadowExits.$inferSelect;
+export type ShadowScalpRow     = typeof shadowScalps.$inferSelect;

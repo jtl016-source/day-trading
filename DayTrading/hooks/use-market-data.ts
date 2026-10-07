@@ -7,22 +7,9 @@ import { mapDbSignal, isPcDisplaySignal, type MobileSignal } from '@/lib/signal-
 const FETCH_INTERVAL: Record<Timeframe, string> = { '1m': '1m', '5m': '5m', '15m': '5m', '60m': '60m' };
 const DISPLAY_MIN: Record<Timeframe, number> = { '1m': 1, '5m': 5, '15m': 15, '60m': 60 };
 
-// Collapse "bundled" signals so the phone matches the PC exactly: the engine can emit several
-// same-direction signals on consecutive bars — keep only the FIRST of each same-direction
-// cluster within ~5 bars. (Mirror of dedupeSignals in the PC's useTerminalData.)
-function dedupeSignals(sigs: MobileSignal[], intervalSec: number): MobileSignal[] {
-  const windowSec = intervalSec * 5;
-  const asc = [...sigs].sort((a, b) => a.time - b.time);
-  const out: MobileSignal[] = [];
-  const lastBySide: Record<string, number> = {};
-  for (const sg of asc) {
-    const last = lastBySide[sg.direction];
-    if (last != null && sg.time - last < windowSec) continue;
-    out.push(sg);
-    lastBySide[sg.direction] = sg.time;
-  }
-  return out;
-}
+// (dedupeSignals DELETED 2026-08-04 — parity with the PC's SIGNAL-INTEGRITY D2 rule: the
+// 5-bar same-side cluster collapse HID persisted signals, so the phone's Signals tab
+// disagreed with both the PC and the phone's own chart. Every persisted row is shown.)
 
 // Canonical symbol — exact port of shared/symbol.ts normalizeSymbol() (matches chart-view.tsx).
 export function normalizeSymbol(instrument: string): string {
@@ -123,22 +110,22 @@ export function useMarketData(): MarketData {
     const loadSignals = async () => {
       try {
         const nowSec = Math.floor(Date.now() / 1000);
+        const cutoff = nowSec - 30 * 86400;
+        // ?since trims the payload server-side (the 1m interval ships ~2MB without it).
         const sr = await fetchRetry(
-          `${apiBaseUrl}/api/signals/history/${encodeURIComponent(sym.toUpperCase())}/${timeframe}`, 12000, 3,
+          `${apiBaseUrl}/api/signals/history/${encodeURIComponent(sym.toUpperCase())}/${timeframe}?since=${cutoff}`, 12000, 3,
         );
         if (cancelled) return;
         const sd = await sr.json();
-        const cutoff = nowSec - 30 * 86400;
         const mapped: MobileSignal[] = (sd.signals ?? [])
           // Reject corrupt FUTURE-dated rows and anything older than the 30-day window.
           .filter((s: any) => s.timestamp >= cutoff && s.timestamp <= nowSec + 3600)
           .filter(isPcDisplaySignal)
           .map(mapDbSignal)
           // USER RULE: in ETH, show ONLY vector side-entry signals — drop any other ETH signal.
-          .filter((s: MobileSignal) => s.rth || s.signalType === 'vector-side-entry');
-        const deduped = dedupeSignals(mapped, DISPLAY_MIN[timeframe] * 60)
-          .sort((a, b) => b.time - a.time);
-        if (!cancelled) setSignals(deduped);
+          .filter((s: MobileSignal) => s.rth || s.signalType === 'vector-side-entry')
+          .sort((a: MobileSignal, b: MobileSignal) => b.time - a.time);
+        if (!cancelled) setSignals(mapped);
       } catch { /* signals are non-fatal */ }
     };
 
@@ -177,8 +164,29 @@ export function useMarketData(): MarketData {
         const r = await fetchWithTimeout(`${apiBaseUrl}/api/live/bar/${encodeURIComponent(sym)}?res=${res}`, 6000);
         if (!r.ok || cancelled) return;
         const d = await r.json();
-        const price: number | null = typeof d?.price === 'number' ? d.price
-          : (typeof d?.bar?.close === 'number' ? d.bar.close : null);
+        // NEVER PIN A STALE PRICE (2026-09-18). /api/live/bar now answers
+        // {bar:null, price:null, stale:true} while MotiveWave is on the wrong contract month
+        // with no trusted offset (Yahoo's delayed feed drives) — leave the last candle exactly
+        // as the 20 s refetch built it. The explicit `stale` check is belt-and-braces over the
+        // null price. Second guard: the route's `price` is the server's LAST tick with no age
+        // attached — when the feed has stopped (halt / weekend / MW closed) its in-memory bar
+        // stays parked on an old bucket, and pinning that print onto the newest candle rewrote
+        // a closed bar's close/high/low every 4 s. A bar whose own bucket ended long ago means
+        // the price is not live either.
+        // CLOCK TOLERANCE (2026-09-18, adversarial review): this compares the PHONE clock with
+        // the SERVER's bar time. At the first cut (> 2 min) a phone clock running a few minutes
+        // fast made every answer look stale — the 4 s pin silently never ran again and the price
+        // only moved with the 20 s refetch. The cases this guard exists for (halt / weekend / MW
+        // closed) park the bar for an hour or more, so 10 min still catches them with room for
+        // any plausible phone-clock error; the contract-guard case is the server's own `stale`.
+        if (d?.stale === true) return;
+        const barSec = Number(d?.bar?.timeSec ?? d?.bar?.time);
+        if (Number.isFinite(barSec) && barSec > 0) {
+          const barEndSec = barSec + (res === '1' ? 60 : 300);
+          if (Date.now() / 1000 - barEndSec > 600) return;
+        }
+        const price: number | null = typeof d?.price === 'number' && Number.isFinite(d.price) && d.price > 0 ? d.price
+          : (typeof d?.bar?.close === 'number' && Number.isFinite(d.bar.close) && d.bar.close > 0 ? d.bar.close : null);
         if (price == null || cancelled) return;
         setCandles(prev => {
           if (!prev.length) return prev;

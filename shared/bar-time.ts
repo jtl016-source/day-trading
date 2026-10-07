@@ -3,13 +3,17 @@
  * Rejects corrupt rows that have no business in the candle store:
  *   - non-finite / non-positive
  *   - before 2010-01-01 (1262304000)  → bad filename / parse
- *   - more than 36h in the future       → corrupt (allows clock skew + the forming bar)
+ *   - more than 2h in the future        → corrupt. Bars are BUCKET-START stamped, so a
+ *     legitimate live bar is never ahead of the wall clock by more than clock skew; 2h is
+ *     already generous. (Was 36h — on 2026-08-10 MotiveWave reconnected from a network drop
+ *     with a +3h-skewed clock and a burst of future-stamped bars sailed straight into the
+ *     store through every ingest path. Nothing real needs more than minutes of skew.)
  * `sec` is a UNIX timestamp in SECONDS.
  */
 export function isSaneBarTime(sec: number, nowSec: number = Math.floor(Date.now() / 1000)): boolean {
   if (!Number.isFinite(sec) || sec <= 0) return false;
   if (sec < 1_262_304_000) return false;
-  if (sec > nowSec + 36 * 3600) return false;
+  if (sec > nowSec + 2 * 3600) return false;
   return true;
 }
 

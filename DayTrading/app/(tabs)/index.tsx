@@ -127,8 +127,9 @@ export default function MarketScreen() {
                 <View style={s.posGrid}>
                   <PosCell label="ENTRY" value={trade.entry.toFixed(2)} color={Trading.text} />
                   <PosCell label="STOP"  value={trade.sl.toFixed(2)}    color={Trading.short} />
-                  <PosCell label="TP1"   value={trade.tp1.toFixed(2)}   color={Trading.long} />
-                  <PosCell label="TP2"   value={trade.tp2.toFixed(2)}   color={Trading.long} />
+                  {/* TP1-only (2026-08-13): tp2 null on every current trade — raw .toFixed crashed here */}
+                  <PosCell label={trade.tp2 != null ? 'TP1' : 'TP'} value={trade.tp1.toFixed(2)} color={Trading.long} />
+                  {trade.tp2 != null && <PosCell label="TP2" value={trade.tp2.toFixed(2)} color={Trading.long} />}
                 </View>
                 <Text style={s.posMore}>View position →</Text>
               </Pressable>

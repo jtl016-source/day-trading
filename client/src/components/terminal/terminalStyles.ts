@@ -73,20 +73,27 @@ export const CSS = `
 .tt-strat-btn.open{ background:rgba(45,212,191,0.18); }
 
 .tt-backdrop{ position:fixed; inset:0; z-index:20; }
-.tt-dropdown{ position:absolute; top:calc(100% + 12px); right:0; z-index:30; width:340px;
+.tt-dropdown{ position:absolute; top:calc(100% + 12px); right:0; z-index:30; width:352px;
+  max-height:min(78vh, 660px); overflow-y:auto; overscroll-behavior:contain;
   background:rgba(11,13,20,0.96); border:1px solid ${C.line}; border-radius:14px; padding:8px;
   box-shadow:0 24px 60px rgba(0,0,0,0.6), 0 0 30px rgba(45,212,191,0.06);
   transform-origin:top right; animation:ddIn .32s cubic-bezier(.2,.85,.25,1); backdrop-filter:blur(16px); }
+.tt-dropdown::-webkit-scrollbar{ width:8px; }
+.tt-dropdown::-webkit-scrollbar-thumb{ background:rgba(255,255,255,0.10); border-radius:8px; }
 @keyframes ddIn{ from{ opacity:0; transform:translateY(-10px) scale(.97); } to{ opacity:1; transform:none; } }
-.tt-dd-head{ font-size:10px; letter-spacing:2px; color:${C.muted}; text-transform:uppercase; padding:8px 10px 10px; }
-.tt-dd-row{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 10px;
-  border-radius:10px; transition:background .18s; opacity:0; animation:rowDrop .4s ease forwards; }
+.tt-dd-head{ font-size:10px; letter-spacing:2px; color:${C.muted}; text-transform:uppercase; padding:8px 10px 6px; }
+/* DECLUTTER (2026-08-10): section headers split the 9 entries into signal / facts / display. */
+.tt-dd-group{ font-size:9px; letter-spacing:1.6px; text-transform:uppercase; color:${C.accent};
+  opacity:.75; padding:10px 10px 3px; margin-top:2px; border-top:1px solid ${C.lineSoft}; font-family:var(--fm); }
+.tt-dd-group:first-of-type{ border-top:0; margin-top:0; }
+.tt-dd-row{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px;
+  border-radius:10px; transition:background .18s; opacity:0; animation:rowDrop .3s ease forwards; }
 .tt-dd-row:hover{ background:rgba(255,255,255,0.03); }
 @keyframes rowDrop{ from{ opacity:0; transform:translateY(-8px); } to{ opacity:1; transform:none; } }
-.tt-dd-name{ font-size:14px; font-weight:600; color:${C.text}; display:flex; align-items:center; gap:8px; }
-.tt-dd-stat{ font-family:var(--fm); font-size:10px; color:${C.accent}; background:rgba(45,212,191,0.10);
-  padding:2px 7px; border-radius:5px; font-weight:500; }
-.tt-dd-desc{ font-size:11px; color:${C.muted}; margin-top:3px; }
+.tt-dd-name{ font-size:13.5px; font-weight:600; color:${C.text}; display:flex; align-items:center; gap:8px; }
+.tt-dd-stat{ font-family:var(--fm); font-size:9.5px; color:${C.accent}; background:rgba(45,212,191,0.10);
+  padding:2px 6px; border-radius:5px; font-weight:500; white-space:nowrap; }
+.tt-dd-desc{ font-size:10.5px; color:${C.muted}; margin-top:2px; }
 
 /* main */
 .tt-main{ flex:1; overflow-y:auto; overflow-x:hidden; }
@@ -396,5 +403,24 @@ export const CSS = `
   .tt-tabs{ gap:2px; }
   .tt-tab{ padding:9px 11px; font-size:11px; }
   .tt-brand-sub{ display:none; }
+}
+
+/* ── iPhone-width layout: the header must WRAP (brand + strategies on row 1, tab nav on a
+   full-width scrollable row 2) so Portfolio/Strategies and every toggle stay reachable.
+   Previously the single flex row pushed them off-screen at ≤540px. ─────────────────── */
+@media (max-width:640px){
+  .tt-header{ flex-wrap:wrap; gap:8px 10px; padding:10px 12px; }
+  .tt-brand{ order:1; }
+  .tt-strat-wrap{ order:2; margin-left:auto; }
+  .tt-tabs{ order:3; flex-basis:100%; justify-content:flex-start; gap:2px;
+    overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+  .tt-tabs::-webkit-scrollbar{ display:none; }
+  .tt-tab{ padding:7px 9px; font-size:10px; flex:0 0 auto; }
+  .tt-strat-btn{ padding:7px 10px; font-size:11px; }
+  /* Strategies dropdown: fit the viewport (it hangs off the right-anchored button) */
+  .tt-dropdown{ width:min(340px, calc(100vw - 20px)); max-height:70vh; overflow-y:auto; }
+  .tt-container{ padding:16px 12px 90px; }
+  .tt-clock{ right:10px; bottom:10px; padding:7px 10px; }
+  .tt-clock-time{ font-size:16px; }
 }
 `;

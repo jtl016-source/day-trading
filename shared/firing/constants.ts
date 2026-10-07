@@ -94,6 +94,9 @@ export const VEC_MAX_STOP = 8.0;
 
 // ── Firing loop gates (verbatim locals from allConfluenceSignals) ────────────
 export const ATR_PERIOD = 14;
+// RETIRED points-model value (2026-09-25 note): no live writer imports this — the fire cooldown
+// is FACT_ENGINE_DEFAULTS.COOLDOWN_BARS (shared/fact-engine.ts), read by catch-up, the live
+// engine, the tab and server/fire-admission.ts. Guarded by scripts/fire-admission.test.ts.
 export const COOLDOWN_BARS = 10;   // RTH cooldown between signals (RTH bars)
 export const ETH_COOLDOWN = 20;    // ETH cooldown (wider — low volume / wider spreads)
 export const PROX_PTS = 5.0;       // resistance-proximity tier downgrade distance

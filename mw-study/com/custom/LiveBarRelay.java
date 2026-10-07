@@ -34,7 +34,12 @@ import java.util.concurrent.atomic.AtomicReference;
  *    the obfuscated BarOperation interface can't be reflect.Proxy'd). If getBars is
  *    unavailable/empty it degrades to the loaded DataSeries slice.
  *
- * onTick + footprint accumulation are unchanged from v1.
+ * onTick footprint accumulation — FIXED 2026-10-06: aggressor side and trade size come
+ * straight from the SDK Tick (getVolume() / isAskTick()), never from reflection-guessed
+ * method names. The July-2026 v2 build copied the PRE-2026-06-02 onTick, whose reflection
+ * guess ("isAsk" / "askTick" / "isBuyTick") matched nothing on Tick and fell through to
+ * "bid" for every trade: footprint_candles carried askVol = 0 from 07-08 to
+ * 10-06 and every engine footprint fire went Short (LEARNINGS 2026-10-06).
  */
 @StudyHeader(
   namespace      = "com.custom",
@@ -50,6 +55,7 @@ public class LiveBarRelay extends Study {
 
   private static final String WS_ENDPOINT = "ws://localhost:5000/ws/mw-feed";
   private static final int    BATCH_SIZE  = 500;   // bars per bulk_bars message
+  private static final String VERSION     = "v2.1 (footprint aggressor fix 2026-10-06)";
 
   private final HttpClient http = HttpClient.newBuilder()
     .connectTimeout(Duration.ofSeconds(4))
@@ -90,6 +96,9 @@ public class LiveBarRelay extends Study {
   private final TreeMap<Float, long[]> footprintLevels = new TreeMap<>(); // price → [bidVol, askVol]
   private volatile long   footprintBucketMs  = 0;   // current 5-min bucket start (epoch ms)
   private volatile String footprintSymbol    = "";   // symbol of current bucket
+  // One-time console proof that BOTH aggressor sides are alive (verify after a reinstall).
+  private final AtomicBoolean loggedFirstAsk = new AtomicBoolean(false);
+  private final AtomicBoolean loggedFirstBid = new AtomicBoolean(false);
 
   private final ScheduledExecutorService scheduler =
     Executors.newSingleThreadScheduledExecutor(r -> {
@@ -101,6 +110,7 @@ public class LiveBarRelay extends Study {
   @Override
   public void initialize(Defaults defaults) {
     createSD();
+    System.out.println("[LiveBarRelay] " + VERSION + " initialize");
     Thread sender = new Thread(this::senderLoop, "LiveBarRelay-sender");
     sender.setDaemon(true);
     sender.start();
@@ -223,14 +233,27 @@ public class LiveBarRelay extends Study {
       footprintBucketMs = bucketMs;
       footprintSymbol   = symbol;
 
-      // Extract volume and direction from the Tick object via reflection
-      long    vol   = extractLong(tick, "getVolume", "getSize", "getQuantity", "getLastSize");
-      boolean isAsk = extractBool(tick, "isAsk", "askTick", "isBuyTick");
-      if (vol <= 0) vol = 1; // treat unknown as 1 contract
-
-      long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
-      if (isAsk) arr[1] += vol; // ask volume (aggressive buy)
-      else       arr[0] += vol; // bid volume (aggressive sell)
+      // Aggressor side + size straight from the SDK Tick (constant pool of mwave_sdk.jar
+      // Tick.class: int getVolume(), boolean isAskTick(), getBid/AskPrice/Size …).
+      // getVolume() == 0 is a quote-only tick (bid/ask change, no trade): it carries no
+      // footprint volume and is SKIPPED — the old "treat unknown as 1 contract" fabricated
+      // prints. NEVER reflect-guess SDK method names here: the 2026-07 v2 build did
+      // ("isAsk"/"askTick"/"isBuyTick" — none exist on Tick), every trade fell to the bid
+      // side and the engine fired Short-only footprint facts for three months
+      // (LEARNINGS 2026-06-02 and 2026-10-06).
+      int vol = tick.getVolume();
+      if (vol > 0) {
+        long[] arr = footprintLevels.computeIfAbsent(price, k -> new long[]{0L, 0L});
+        if (tick.isAskTick()) {
+          arr[1] += vol; // trade lifted the ask → aggressive BUY → ask volume
+          if (loggedFirstAsk.compareAndSet(false, true))
+            System.out.println("[LiveBarRelay] footprint: first ASK-side trade seen (" + vol + " @ " + price + ") — aggressor side is live");
+        } else {
+          arr[0] += vol; // trade hit the bid → aggressive SELL → bid volume
+          if (loggedFirstBid.compareAndSet(false, true))
+            System.out.println("[LiveBarRelay] footprint: first BID-side trade seen (" + vol + " @ " + price + ")");
+        }
+      }
     }
   }
 
@@ -251,29 +274,8 @@ public class LiveBarRelay extends Study {
       symbol, bucketMs / 1000L, levels));
   }
 
-  /** Extracts a long value from an object by trying method names in order (reflection). */
-  private static long extractLong(Object obj, String... methodNames) {
-    for (String name : methodNames) {
-      try {
-        java.lang.reflect.Method m = obj.getClass().getMethod(name);
-        Object v = m.invoke(obj);
-        if (v instanceof Number) return ((Number) v).longValue();
-      } catch (Exception ignored) {}
-    }
-    return 0L;
-  }
-
-  /** Extracts a boolean from an object by trying method names in order (reflection). */
-  private static boolean extractBool(Object obj, String... methodNames) {
-    for (String name : methodNames) {
-      try {
-        java.lang.reflect.Method m = obj.getClass().getMethod(name);
-        Object v = m.invoke(obj);
-        if (v instanceof Boolean) return (Boolean) v;
-      } catch (Exception ignored) {}
-    }
-    return false; // default: treat as bid (sell aggression) if direction unknown
-  }
+  // (extractLong / extractBool DELETED 2026-10-06 — reflection-guessed Tick accessors were the
+  //  one-sided-footprint fault. The SDK Tick is typed; call it directly.)
 
   // ── Bar callback ──────────────────────────────────────────────────────────────
 

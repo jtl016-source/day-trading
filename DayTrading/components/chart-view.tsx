@@ -5,6 +5,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useApp, Timeframe } from '@/context/app-context';
 import { Trading } from '@/constants/theme';
 import { isRTH, mapDbSignal, isPcDisplaySignal, type MobileSignal, type OutcomeResult } from '@/lib/signal-map';
+import { API_KEY } from '@/lib/api-key';
 // Re-export so existing imports from '@/components/chart-view' keep resolving.
 export type { MobileSignal, OutcomeResult } from '@/lib/signal-map';
 
@@ -15,8 +16,15 @@ const DISPLAY_MIN: Record<Timeframe, number> = {
   '1m': 1, '5m': 5, '15m': 15, '60m': 60,
 };
 
-const LW_CDN = 'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';
+// Chart library sources, tried in order: our OWN server first (always reachable when the app
+// has data at all — a blank chart from an unreachable third-party CDN was the #1 "chart
+// missing" cause), then two public CDNs. Cached in AsyncStorage after the first success.
 const LW_STORAGE_KEY = 'lw_script_v4.2.0';
+const LW_PATH = '/vendor/lightweight-charts.4.2.0.js';
+const LW_CDNS = [
+  'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js',
+  'https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js',
+];
 
 function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
   return new Promise((resolve, reject) => {
@@ -26,17 +34,25 @@ function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
 }
 
 // In-memory cache for the LW script within a single JS runtime session.
-// Backed by AsyncStorage so restarts don't re-hit the CDN once the script is saved.
+// Backed by AsyncStorage so restarts don't re-hit the network once the script is saved.
 let _lwCache: Promise<string> | null = null;
-function getLwScript(): Promise<string> {
+function getLwScript(apiBaseUrl?: string): Promise<string> {
   if (!_lwCache) {
     _lwCache = AsyncStorage.getItem(LW_STORAGE_KEY).then(async (saved) => {
       if (saved) return saved;
-      const r = await fetchWithTimeout(LW_CDN, 20000);
-      if (!r.ok) throw new Error('CDN HTTP ' + r.status);
-      const text = await r.text();
-      AsyncStorage.setItem(LW_STORAGE_KEY, text).catch(() => {});
-      return text;
+      const sources = [...(apiBaseUrl ? [`${apiBaseUrl}${LW_PATH}`] : []), ...LW_CDNS];
+      let lastErr: any = new Error('no source');
+      for (const url of sources) {
+        try {
+          const r = await fetchWithTimeout(url, 15000);
+          if (!r.ok) { lastErr = new Error(`HTTP ${r.status} from ${url}`); continue; }
+          const text = await r.text();
+          if (text.length < 10000) { lastErr = new Error(`suspiciously small script from ${url}`); continue; }
+          AsyncStorage.setItem(LW_STORAGE_KEY, text).catch(() => {});
+          return text;
+        } catch (e) { lastErr = e; }
+      }
+      throw lastErr;
     }).catch(e => { _lwCache = null; throw e; });
   }
   return _lwCache;
@@ -62,7 +78,10 @@ html,body{background:#000;overflow:hidden;width:100%;height:100%}
 var chart, candleSeries;
 var vecSeries = {};
 var zoneCanvas, currentZones = [], zonesVisible = false;
-var yboxCanvas, yboxVisible = false, yboxLevels = [], yboxSessionStart = 0, yboxSessionEnd = 0;
+// SERVER day-zones (2026-08-04): one entry per trading day from /api/yellowbox/day-zones —
+// the engine's real walk-forward Yellow Box (box + settle/IR/IS/ranges + NFV/ES-vector bands),
+// replacing the old locally-computed single-session approximation.
+var yboxCanvas, yboxVisible = false, yboxDays = [];
 var storedCandles = [];
 var fpCanvas, fpDataMap = {}, fpVisible = false, fpBarSec = 300;
 var sessZoneCanvas, sessZoneData = [], sessLastCandleT = 0;
@@ -305,7 +324,22 @@ function drawSessionZones() {
   ctx.restore();
 }
 
-// ── Yellow Box overlay ─────────────────────────────────────────────────────────
+// ── Yellow Box overlay — SERVER walk-forward day zones ────────────────────────
+// Per-day x-range mapping: timeToCoordinate returns null off the loaded range, so fall
+// back to 0 / w when a session extends past the visible data (same pattern as zone bands).
+function dayXRange(ts, start, end, w) {
+  var xL = ts.timeToCoordinate(start);
+  var xR = ts.timeToCoordinate(end);
+  if (xL === null && xR === null) {
+    var vr = ts.getVisibleRange();
+    if (!vr || end < vr.from || start > vr.to) return null; // day fully off-screen
+    xL = 0; xR = w;
+  }
+  if (xL === null) xL = 0;
+  if (xR === null) xR = w;
+  if (xR <= 0 || xL >= w || xR <= xL) return null;
+  return [Math.max(0, xL), Math.min(w, xR)];
+}
 function drawYellowBox() {
   if (!yboxCanvas || !candleSeries || !chart) return;
   var ctx = yboxCanvas.getContext('2d');
@@ -313,43 +347,73 @@ function drawYellowBox() {
   if (yboxCanvas.width !== w) yboxCanvas.width = w;
   if (yboxCanvas.height !== h) yboxCanvas.height = h;
   ctx.clearRect(0, 0, w, h);
-  if (!yboxVisible || !yboxLevels.length) return;
+  if (!yboxVisible || !yboxDays.length) return;
   var ts = chart.timeScale();
-  var xStart = 0, xEnd = w;
-  if (yboxSessionStart) {
-    var xS = ts.timeToCoordinate(yboxSessionStart);
-    if (xS !== null) xStart = Math.max(0, xS);
-  }
-  if (yboxSessionEnd) {
-    var xE = ts.timeToCoordinate(yboxSessionEnd);
-    if (xE !== null) xEnd = Math.min(w, xE);
-  }
-  if (xStart >= xEnd || xEnd <= 0 || xStart >= w) { xStart = 0; xEnd = w; }
-  ctx.fillStyle = 'rgba(50,70,15,0.18)';
-  ctx.fillRect(xStart, 0, xEnd - xStart, h);
-  if (yboxSessionStart) {
-    var xs = ts.timeToCoordinate(yboxSessionStart);
-    if (xs !== null) {
-      ctx.strokeStyle='rgba(160,190,30,0.45)';ctx.lineWidth=1;ctx.setLineDash([3,4]);
-      ctx.beginPath();ctx.moveTo(xs,0);ctx.lineTo(xs,h);ctx.stroke();ctx.setLineDash([]);
-    }
-  }
   ctx.font = 'bold 9px -apple-system, sans-serif';
-  for (var i = 0; i < yboxLevels.length; i++) {
-    var lv = yboxLevels[i];
-    var y = candleSeries.priceToCoordinate(lv.price);
-    if (y === null || y < -2 || y > h + 2) continue;
-    var col = lv.color || '#ffd700';
-    var isKey = (lv.label === 'RESISTANCE' || lv.label === 'SUPPORT');
-    ctx.strokeStyle = withAlpha(col, isKey ? 0.95 : 0.75);
-    ctx.lineWidth = isKey ? 2 : 1;
-    ctx.setLineDash(lv.label === 'Pivot' ? [6,3] : isKey ? [] : [4,3]);
-    ctx.beginPath();ctx.moveTo(xStart,y);ctx.lineTo(xEnd,y);ctx.stroke();ctx.setLineDash([]);
-    var labelX = Math.min(xEnd - 4, w - 4);
-    var labelText = lv.label + '  ' + lv.price.toFixed(2);
-    var tw = ctx.measureText(labelText).width + 6;
-    ctx.fillStyle='rgba(0,0,0,0.65)';ctx.fillRect(labelX-tw,y-10,tw,12);
-    ctx.fillStyle=col;ctx.textAlign='right';ctx.fillText(labelText,labelX,y-1);ctx.textAlign='left';
+  for (var di = 0; di < yboxDays.length; di++) {
+    var day = yboxDays[di];
+    var xr = dayXRange(ts, day.start, day.end, w);
+    if (!xr) continue;
+    var xL = xr[0], xR = xr[1];
+    var lastDay = di === yboxDays.length - 1;
+
+    // The box itself: translucent fill between boxTop/boxBottom + boundary lines.
+    if (day.boxTop != null && day.boxBottom != null) {
+      var yT = candleSeries.priceToCoordinate(day.boxTop);
+      var yB = candleSeries.priceToCoordinate(day.boxBottom);
+      if (yT !== null && yB !== null) {
+        var top = Math.min(yT, yB), bh = Math.max(2, Math.abs(yB - yT));
+        ctx.fillStyle = 'rgba(255,215,0,0.10)';
+        ctx.fillRect(xL, top, xR - xL, bh);
+        ctx.strokeStyle = 'rgba(255,215,0,0.75)'; ctx.lineWidth = 1.5; ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(xL, yT); ctx.lineTo(xR, yT); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(xL, yB); ctx.lineTo(xR, yB); ctx.stroke();
+      }
+    }
+
+    // Engine bands (NFV, ES-vector strip, …) — server supplies color + label per band.
+    var bands = day.bands || [];
+    for (var bi = 0; bi < bands.length; bi++) {
+      var bd = bands[bi];
+      var byT = candleSeries.priceToCoordinate(bd.top);
+      var byB = candleSeries.priceToCoordinate(bd.bottom);
+      if (byT === null || byB === null) continue;
+      var bTop = Math.min(byT, byB), bH = Math.max(1.5, Math.abs(byB - byT));
+      var bc = bd.color || '#66bb6a';
+      ctx.fillStyle = withAlpha(bc, 0.14);
+      ctx.fillRect(xL, bTop, xR - xL, bH);
+      ctx.strokeStyle = withAlpha(bc, 0.55); ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+      ctx.beginPath(); ctx.moveTo(xL, bTop); ctx.lineTo(xR, bTop); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(xL, bTop + bH); ctx.lineTo(xR, bTop + bH); ctx.stroke();
+      ctx.setLineDash([]);
+      if (lastDay && bd.label) {
+        ctx.fillStyle = withAlpha(bc, 0.9); ctx.textAlign = 'left';
+        ctx.fillText(bd.label, xL + 3, bTop + 9);
+      }
+    }
+
+    // Levels: settle / IR / IS / normal+max ranges etc.
+    var levels = day.levels || [];
+    for (var li = 0; li < levels.length; li++) {
+      var lv = levels[li];
+      if (lv.price == null) continue;
+      var y = candleSeries.priceToCoordinate(lv.price);
+      if (y === null || y < -2 || y > h + 2) continue;
+      var col = lv.color || '#ffd700';
+      var isKey = lv.key === true;
+      ctx.strokeStyle = withAlpha(col, isKey ? 0.95 : 0.6);
+      ctx.lineWidth = isKey ? 2 : 1;
+      ctx.setLineDash(isKey ? [] : [4,3]);
+      ctx.beginPath(); ctx.moveTo(xL, y); ctx.lineTo(xR, y); ctx.stroke(); ctx.setLineDash([]);
+      // Labels only on the most recent day — older days keep just the geometry.
+      if (lastDay) {
+        var labelX = Math.min(xR - 4, w - 4);
+        var labelText = lv.label + '  ' + Number(lv.price).toFixed(2);
+        var tw = ctx.measureText(labelText).width + 6;
+        ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(labelX - tw, y - 10, tw, 12);
+        ctx.fillStyle = col; ctx.textAlign = 'right'; ctx.fillText(labelText, labelX, y - 1); ctx.textAlign = 'left';
+      }
+    }
   }
 }
 
@@ -555,10 +619,9 @@ window.setVectorVisible = function(v) {
   for (var i = 0; i < tfs.length; i++) vecSeries[tfs[i]].applyOptions({ visible: !!v });
 };
 
-window.setYellowBoxData = function(levels, sessionStart, sessionEnd, visible) {
-  yboxLevels = levels || [];
-  yboxSessionStart = sessionStart || 0;
-  yboxSessionEnd = sessionEnd || 0;
+// Server day-zones: days = [{start, end, boxTop, boxBottom, levels:[{price,label,color,key}], bands:[{top,bottom,color,label}]}]
+window.setYellowBoxDays = function(days, visible) {
+  yboxDays = days || [];
   yboxVisible = !!visible;
   requestAnimationFrame(drawYellowBox);
 };
@@ -605,6 +668,27 @@ window.scrollToTime = function(t, barSec) {
 
 // Live tick feed
 var liveWs = null, liveSym = '', liveRes = '', liveResMin = 5, liveDisplaySec = 300, liveLastBar = null;
+// CHART LIVENESS (2026-09-18):
+//  liveMinTime  = newest display-bucket time this chart has ever shown. Anything bucketed BELOW
+//                 it is an OLDER bucket: it must never touch the live bar, and lightweight-charts
+//                 4.2 throws on series.update() of a time older than its last bar. It also
+//                 survives the contract-guard reset (liveLastBar = null), where a late bar would
+//                 otherwise pass the "no live bar yet" test and be painted as the current candle.
+//  liveTickAtMs = wall-clock ms of the last ACCEPTED tick — while ticks flow the forming close is
+//                 the tick's; a same-bucket bar that is not the live close may not rewind it.
+var liveMinTime = 0, liveTickAtMs = 0;
+// SOCKET-SCOPED HANDLERS (2026-09-18, adversarial review — reproduced): connectLive() used to
+// close the previous socket WITHOUT detaching its handlers. The old socket's onclose fired a few
+// ms later, set the GLOBAL liveWs = null (orphaning the NEW socket: it kept delivering, but no
+// later connectLive could ever close it) and 5 s later re-ran connectLive with the OLD
+// timeframe's params. With the liveMinTime anchor + the older-bucket drop that was fatal after
+// a coarser -> finer switch (60m -> 1m, 15m -> 5m ...): liveDisplaySec went back to the OLD grid
+// while the chart showed the new one, so every tick bucketed below liveMinTime and was dropped —
+// 0 series.update() calls per 100 ticks, the live candle frozen for up to a full OLD-grid bucket
+// while the badge said Live. Now: the old socket's handlers are detached BEFORE it is closed,
+// every handler belongs to ONE socket and returns unless that socket is still the current one,
+// and a pending reconnect timer is cancelled whenever connectLive runs again.
+var liveReconnectTimer = null;
 
 function setLiveBadge(connected) {
   var el = document.getElementById('live-badge');
@@ -621,15 +705,26 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
   liveRes = resolution || '';
   liveResMin = parseInt((liveRes || '5').replace('m','')) || 5;
   liveDisplaySec = displaySeconds || (liveResMin * 60);
-  if (liveWs) { try { liveWs.close(); } catch(ex) {} liveWs = null; }
+  if (liveReconnectTimer) { clearTimeout(liveReconnectTimer); liveReconnectTimer = null; }
+  if (liveWs) {
+    var old = liveWs; liveWs = null;
+    old.onopen = null; old.onclose = null; old.onerror = null; old.onmessage = null;
+    try { old.close(); } catch(ex) {}
+  }
   if (storedCandles.length) {
     var lc = storedCandles[storedCandles.length - 1];
     liveLastBar = { time: lc.time, open: lc.open, high: lc.high, low: lc.low, close: lc.close, volume: lc.volume || 0 };
   }
+  // Re-anchor per connection: a timeframe switch reloads storedCandles on a DIFFERENT bucket grid
+  // (a 60m hour-start is below the 1m chart's last minute) — a stale floor would drop every tick.
+  liveMinTime = liveLastBar ? liveLastBar.time : 0;
+  liveTickAtMs = 0;
   try {
-    liveWs = new WebSocket(wsUrl);
-    liveWs.onopen = function() { setLiveBadge(true); };
-    liveWs.onmessage = function(ev) {
+    var sock = new WebSocket(wsUrl);
+    liveWs = sock;
+    sock.onopen = function() { if (liveWs !== sock) return; setLiveBadge(true); };
+    sock.onmessage = function(ev) {
+      if (liveWs !== sock) return; // a superseded socket must never touch the live bar / the series
       try {
         var msg = JSON.parse(ev.data);
 
@@ -637,16 +732,31 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
         if (msg.type === 'tick' && msg.symbol && msg.symbol.startsWith(liveSym)) {
           if (!candleSeries) return;
           var p = msg.price;
+          if (typeof p !== 'number' || !isFinite(p) || p <= 0) return;
+          // STALE-TICK GUARD (2026-09-18): this WebView buckets by msg.time and had NO drop path
+          // at all, so a stale tick (a delayed-feed print stamped with an old bar-close time, a
+          // replay after a reconnect) fell into the same-bucket branch below and rewrote the
+          // CURRENT bar's close/high/low. Age = the SERVER-computed msg.ageMs when present (the
+          // phone clock is not trusted), else phone-clock now − msg.time; >2 min is not live.
+          var tickAtMs = msg.time ? (msg.time > 1e10 ? msg.time : msg.time * 1000) : 0;
+          var tickAgeMs = (typeof msg.ageMs === 'number' && isFinite(msg.ageMs)) ? msg.ageMs
+                        : (tickAtMs ? (Date.now() - tickAtMs) : 0);
+          if (tickAgeMs > 120000) return;
           // Bucket the tick to the display interval so a new candle appears the
           // instant the interval rolls over, without waiting for the next bar msg.
           // msg.time may be Unix seconds (MotiveWave) or milliseconds (browser Date.now).
           // Normalise to seconds before bucketing — values < 1e10 are already seconds.
           var tickRaw = msg.time || Date.now();
           var tickSec = tickRaw > 1e10 ? Math.floor(tickRaw / 1000) : tickRaw;
-          // 60m uses a 30-min offset so buckets start at :30 (13:30 UTC = RTH open) — MUST match
-          // the historical aggToInterval/get60mBucket or the forming 60m bar lands a half-hour off.
-          var liveOff = liveDisplaySec === 3600 ? 1800 : 0;
-          var bucketSec = Math.floor((tickSec - liveOff) / liveDisplaySec) * liveDisplaySec + liveOff;
+          // 60m buckets align to :00 top-of-hour — the CANON per trading-utils get60mBucket
+          // (floor ts/3600), the server's agg60mBucket, and Yahoo's ES=F 60m grid. The old
+          // :30 offset here predated that alignment and put live 60m bars a half-hour off.
+          var bucketSec = Math.floor(tickSec / liveDisplaySec) * liveDisplaySec;
+          // A tick bucketed BEFORE the newest bar on the chart belongs to a closed candle — it
+          // must not move the current one (mirrors the PC: bucket < last.time → ignore).
+          if (bucketSec < liveMinTime) return;
+          liveTickAtMs = Date.now();
+          liveMinTime = bucketSec;
           if (!liveLastBar || bucketSec > liveLastBar.time) {
             liveLastBar = { time: bucketSec, open: p, high: p, low: p, close: p, volume: 0 };
           } else {
@@ -674,20 +784,63 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
 
           // Map the fetch-resolution bar onto the display-resolution bucket.
           // For a 15m display chart receiving 5m bars, three 5m bars share one 15m bucket.
-          // 60m uses the 30-min offset to match historical aggregation (see tick handler).
-          var barOff = liveDisplaySec === 3600 ? 1800 : 0;
-          var dispBucket = Math.floor((bar.time - barOff) / liveDisplaySec) * liveDisplaySec + barOff;
+          // 60m aligns to :00 top-of-hour (canon — see tick handler).
+          var dispBucket = Math.floor(bar.time / liveDisplaySec) * liveDisplaySec;
+          var fetchSec = liveResMin * 60;
+
+          // OLDER display bucket (2026-09-18) — this branch did not exist: a late bar (the delayed
+          // feed's complete bars arrive ~10 min after the fact; MotiveWave replays recent bars on
+          // a study reconnect) fell into the same-bucket merge below and rewrote the LIVE bar's
+          // close/high/low with old prices. It never touches the live bar or the series now
+          // (lightweight-charts 4.2 throws on update() of a time before its last bar); a COMPLETE
+          // one is upserted into storedCandles so the next full repaint shows the canonical bar.
+          if (dispBucket < liveMinTime) {
+            if (bar.complete) {
+              for (var oi = storedCandles.length - 1; oi >= 0; oi--) {
+                var sc = storedCandles[oi];
+                if (sc.time === dispBucket) {
+                  if (fetchSec >= liveDisplaySec) {
+                    // Whole display bar — the canonical OHLC replaces the stored one.
+                    storedCandles[oi] = { time: dispBucket, open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume || 0, complete: true };
+                  } else {
+                    // Sub-bar of a coarser display bucket (5m into 15m): widen high/low; the open /
+                    // close only move when this is the bucket's FIRST / LAST sub-bar.
+                    var lastSub = (bar.time + fetchSec) >= (dispBucket + liveDisplaySec);
+                    storedCandles[oi] = { time: dispBucket, open: bar.time === dispBucket ? bar.open : sc.open,
+                      high: Math.max(sc.high, bar.high), low: Math.min(sc.low, bar.low),
+                      close: lastSub ? bar.close : sc.close, volume: sc.volume || 0, complete: true };
+                  }
+                  break;
+                }
+                if (sc.time < dispBucket) {
+                  // Missing bucket: only a whole display bar can stand alone as a stored candle.
+                  if (fetchSec >= liveDisplaySec) storedCandles.splice(oi + 1, 0, { time: dispBucket, open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume || 0, complete: true });
+                  break;
+                }
+              }
+            }
+            return;
+          }
 
           if (!liveLastBar || dispBucket > liveLastBar.time) {
             // New display bucket — start fresh
             liveLastBar = { time: dispBucket, open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume || 0 };
           } else {
             // Same display bucket — aggregate OHLCV into the running display bar
+            // LIVE-CLOSE OWNERSHIP (2026-09-18, mirrors the PC's useTerminalData): while ticks are
+            // flowing (one accepted within the last 5 s) the close is the TICK's. A forming bar
+            // (complete !== true) or a complete sub-bar whose own bucket ended >2 min ago (the
+            // delayed feed landing inside a still-forming 15m bucket) still widens high/low but
+            // may not rewind the close — that was the backward flicker between ticks.
+            var nowMs = Date.now();
+            var keepLiveClose = (nowMs - liveTickAtMs) < 5000 &&
+                                (!bar.complete || (nowMs - (bar.time + fetchSec) * 1000) > 120000);
             liveLastBar.high  = Math.max(liveLastBar.high, bar.high);
             liveLastBar.low   = Math.min(liveLastBar.low,  bar.low);
-            liveLastBar.close = bar.close;
+            if (!keepLiveClose) liveLastBar.close = bar.close;
             liveLastBar.volume = (liveLastBar.volume || 0) + (bar.volume || 0);
           }
+          liveMinTime = liveLastBar.time;
 
           // The display bar completes when the last fetch-bar of this bucket closes.
           // bar.time + fetchIntervalSec reaches the next display bucket boundary.
@@ -711,6 +864,19 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
           candleSeries.update({ time: liveLastBar.time, open: liveLastBar.open, high: liveLastBar.high, low: liveLastBar.low, close: liveLastBar.close,
             color: barUp ? '#26c87a' : '#ef5350', borderColor: barUp ? '#26c87a' : '#ef5350', wickColor: barUp ? '#26c87a' : '#ef5350' });
 
+        // ── CONTRACT GUARD (2026-09-18) ───────────────────────────────────────
+        // flip / roll / offset = the PRICE REGIME of live ticks just changed (raw MotiveWave
+        // prices <-> prices translated onto the front month, or a re-measured offset). The
+        // forming bar was built across both regimes (a wick the size of the contract spread),
+        // so forget it: the next tick / bar for this bucket starts a fresh bar and its update()
+        // REPLACES the straddling candle on the chart. liveMinTime stays, so a late older bar
+        // still cannot pose as the live one. "snapshot" (sent on every connect) changes nothing.
+        } else if (msg.type === 'contract_guard' && (!msg.symbol || String(msg.symbol).toUpperCase().indexOf(liveSym) === 0)) {
+          if (msg.event === 'flip' || msg.event === 'roll' || msg.event === 'offset') {
+            liveLastBar = null;
+            liveTickAtMs = 0;
+          }
+
         // ── SERVER PUSH MESSAGES ───────────────────────────────────────────────
         // Forward signal_new and auto_trade_state to React Native so it can
         // refetch signals or update the auto-trade indicator without polling.
@@ -719,12 +885,17 @@ window.connectLive = function(wsUrl, sym, resolution, displaySeconds) {
         }
       } catch(ex) {}
     };
-    liveWs.onerror = function() { setLiveBadge(false); };
-    liveWs.onclose = function() {
+    sock.onerror = function() { if (liveWs !== sock) return; setLiveBadge(false); };
+    sock.onclose = function() {
+      // Only the CURRENT socket's real drop reconnects — with ITS OWN params, which are the live
+      // ones precisely because it is still current. (A superseded socket has no handlers at all;
+      // this check also covers a close event that was already queued when they were detached.)
+      if (liveWs !== sock) return;
       setLiveBadge(false);
       liveWs = null;
       var u = wsUrl, s = sym, r = resolution, d = displaySeconds;
-      setTimeout(function() { if (liveSym) window.connectLive(u, s, r, d); }, 5000);
+      if (liveReconnectTimer) clearTimeout(liveReconnectTimer);
+      liveReconnectTimer = setTimeout(function() { liveReconnectTimer = null; if (liveSym) window.connectLive(u, s, r, d); }, 5000);
     };
   } catch(ex) { setLiveBadge(false); }
 };
@@ -745,11 +916,11 @@ if (document.readyState === 'loading') {
 
 function aggToInterval(bars: any[], intervalMin: number): any[] {
   if (intervalMin <= 1) return bars;
-  // Use a 30-minute offset for 60m buckets so the RTH open bar (9:30 AM ET = 13:30 UTC)
-  // starts its own bucket instead of falling into the 13:00 UTC bucket.
-  // This matches trading-utils.ts get60mBucket() and the PC chart behavior.
+  // 60m buckets align to :00 top-of-hour — the CANON per trading-utils get60mBucket()
+  // (floor ts/3600), the server's agg60mBucket(), and Yahoo's ES=F 60m grid. The old
+  // :30 offset predated that alignment and disagreed with lib/candles.ts + the PC.
   const intervalSec = intervalMin * 60;
-  const OFFSET = intervalMin === 60 ? 30 * 60 : 0;
+  const OFFSET = 0;
   const out: any[] = [];
   let bucket: any = null;
   for (const b of bars) {
@@ -950,72 +1121,9 @@ function buildProxyFp(c: any): FpCandle {
 // lib/signal-map.ts (shared with the Market & Signals screens) — imported above.
 
 
-// ── Yellow Box pivot levels from yesterday's RTH session ──────────────────────
-// (isRTH imported from lib/signal-map.ts)
-
-function computeYellowBoxLevels(rawBars: any[]): {
-  levels: { price: number; label: string; color: string }[];
-  sessionStart: number;
-  sessionEnd: number;
-} | null {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const dow = new Date(nowSec * 1000).getUTCDay();
-  const rollback = dow === 0 ? 2 : dow === 6 ? 1 : 0;
-  const tradingDay = (Math.floor(nowSec / 86400) - rollback) * 86400;
-  const rthOpen  = tradingDay + 13 * 3600 + 30 * 60;
-  const rthClose = tradingDay + 20 * 3600;
-
-  const prevOpen  = rthOpen  - 86400;
-  const prevClose = rthClose - 86400;
-  const prevBars = rawBars
-    .filter((b: any) => isRTH(b.time) && b.time >= prevOpen && b.time <= prevClose)
-    .sort((a: any, b: any) => a.time - b.time);
-  if (prevBars.length < 5) return null;
-
-  const pH = Math.max(...prevBars.map((b: any) => b.high));
-  const pL = Math.min(...prevBars.map((b: any) => b.low));
-  const pC = prevBars[prevBars.length - 1].close;
-  const range = pH - pL;
-  if (range <= 0) return null;
-
-  const P  = +((pH + pL + pC) / 3).toFixed(2);
-  const R1 = +(2 * P - pL).toFixed(2);
-  const S1 = +(2 * P - pH).toFixed(2);
-  const R2 = +(P + range).toFixed(2);
-  const S2 = +(P - range).toFixed(2);
-  const ivWall  = +(P + (R1 - P) * 0.5).toFixed(2);
-  const sellObj = +(P + (R1 - P) * 0.38).toFixed(2);
-  const buyObj  = +(P - (P - S1) * 0.38).toFixed(2);
-  const wkStart = rthOpen - 5 * 86400;
-  const wkBars  = rawBars.filter((b: any) => isRTH(b.time) && b.time >= wkStart && b.time < rthOpen);
-  const wkHigh  = wkBars.length ? Math.max(...wkBars.map((b: any) => b.high)) : pH;
-  const maxRange = +(P + range).toFixed(2);
-  const maxTrend = +(P + range * 1.5).toFixed(2);
-
-  const allLevels = [
-    { price: R1,       label: 'RESISTANCE',           color: '#ef4444' },
-    { price: S1,       label: 'SUPPORT',              color: '#22c55e' },
-    { price: P,        label: 'Pivot',                color: '#ffd700' },
-    { price: R2,       label: 'Non Fair Value Upper', color: '#f97316' },
-    { price: S2,       label: 'Non Fair Value Lower', color: '#60a5fa' },
-    { price: ivWall,   label: 'IV Wall',              color: '#a855f7' },
-    { price: sellObj,  label: 'Seller Objective',     color: '#fca5a5' },
-    { price: buyObj,   label: 'Buyer Objective',      color: '#86efac' },
-    { price: wkHigh,   label: 'Weekly Ceiling',       color: '#fbbf24' },
-    { price: maxRange, label: 'Max Range Day',        color: '#cbd5e1' },
-    { price: maxTrend, label: 'Max Trend Day',        color: '#94a3b8' },
-  ].filter(l => Number.isFinite(l.price) && l.price > 0);
-
-  const seen = new Set<number>();
-  const levels = allLevels.filter(l => {
-    const k = Math.round(l.price * 4);
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  return { levels, sessionStart: rthOpen, sessionEnd: rthClose };
-}
+// (computeYellowBoxLevels DELETED 2026-08-04 — the local pivot approximation is replaced by
+// the engine's real walk-forward day zones fetched from /api/yellowbox/day-zones, so the
+// phone chart shows the SAME boxes/levels/bands the strategy actually trades.)
 
 // ── Session aggregate zone helpers ────────────────────────────────────────────
 
@@ -1148,8 +1256,9 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
   const displayMin = DISPLAY_MIN[timeframe];
 
   useEffect(() => {
-    getLwScript().then(setLwScript).catch(e => setLwError(String(e)));
-  }, []);
+    setLwError(null);
+    getLwScript(apiBaseUrl).then(setLwScript).catch(e => setLwError(String(e)));
+  }, [apiBaseUrl]);
 
   const html = useMemo(() => (lwScript ? buildHtml(lwScript) : null), [lwScript]);
 
@@ -1256,10 +1365,11 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
           }
         }
 
-        // Connect live WebSocket
+        // Connect live WebSocket. ?key= rides along for the Cloudflare-Tunnel gate —
+        // browser WebSocket can't set headers; the server ignores it on LAN connections.
         const wsBase = apiBaseUrl.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
         webViewRef.current?.injectJavaScript(
-          `window.connectLive('${wsBase}/ws/live-bars','${sym}','${fetchInterval}',${displayMin * 60});true;`
+          `window.connectLive('${wsBase}/ws/live-bars?key=${encodeURIComponent(API_KEY)}','${sym}','${fetchInterval}',${displayMin * 60});true;`
         );
 
         // Report visible price range
@@ -1410,14 +1520,44 @@ export function ChartView({ onPriceRange, onSignals, scrollToTime }: ChartViewPr
           } catch { /* non-fatal */ }
         }
 
-        // ── Yellow Box pivot levels ───────────────────────────────────────────
+        // ── Yellow Box day zones — the ENGINE's real walk-forward zones from the server
+        // (/api/yellowbox/day-zones), replacing the old locally-computed approximation so the
+        // phone chart shows the SAME boxes/levels/bands the strategy actually trades.
         if (strategies.milkZones) {
-          const ybox = computeYellowBoxLevels(valid1m.length ? valid1m : candles);
-          if (ybox) {
-            webViewRef.current?.injectJavaScript(
-              `window.setYellowBoxData(${JSON.stringify(ybox.levels)},${ybox.sessionStart},${ybox.sessionEnd},true);true;`
+          try {
+            const zFrom = candles.length ? candles[0].time : Math.floor(Date.now() / 1000) - 14 * 86400;
+            const zTo = Math.floor(Date.now() / 1000) + 86400;
+            const zr = await fetchWithTimeout(
+              `${apiBaseUrl}/api/yellowbox/day-zones?symbol=${encodeURIComponent(sym)}&fromTs=${zFrom}&toTs=${zTo}`, 15000,
             );
-          }
+            if (zr.ok && !cancelled) {
+              const zj = await zr.json();
+              const days = (zj.days ?? []).map((d: any) => ({
+                start: d.sessionStartTs,
+                end: d.sessionEndTs,
+                boxTop: d.boxTop ?? null,
+                boxBottom: d.boxBottom ?? null,
+                levels: [
+                  { price: d.settle,        label: 'SETTLE',    color: '#ffd700', key: true },
+                  { price: d.initRes,       label: 'IR',        color: '#f0a05a', key: true },
+                  { price: d.initSup,       label: 'IS',        color: '#f0a05a', key: true },
+                  { price: d.normalRangeUp, label: 'NR↑',       color: '#9ccc65' },
+                  { price: d.normalRangeDn, label: 'NR↓',       color: '#9ccc65' },
+                  { price: d.maxRangeUp,    label: 'MAX↑',      color: '#ff8a65' },
+                  { price: d.maxRangeDn,    label: 'MAX↓',      color: '#ff8a65' },
+                  { price: d.maxTrendUp,    label: 'MAX TREND', color: '#ffb74d' },
+                  { price: d.longAve,       label: 'LONG AVE',  color: '#81c784' },
+                  { price: d.shortAve,      label: 'SHORT AVE', color: '#e57373' },
+                ].filter(l => typeof l.price === 'number' && Number.isFinite(l.price)),
+                bands: (d.bands ?? []).map((b: any) => ({ top: b.top, bottom: b.bottom, color: b.color, label: b.label })),
+              }));
+              webViewRef.current?.injectJavaScript(
+                `window.setYellowBoxDays(${JSON.stringify(days)},true);true;`
+              );
+            }
+          } catch { /* zones are non-fatal — chart still renders */ }
+        } else {
+          webViewRef.current?.injectJavaScript(`window.setYellowBoxDays([],false);true;`);
         }
 
       } catch (e) {

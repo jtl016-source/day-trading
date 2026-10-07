@@ -1,0 +1,363 @@
+{
+  "version": 1,
+  "generatedAt": "2026-10-01T19:41:59.517Z",
+  "window": {
+    "from": "2026-10-01",
+    "to": "2026-12-31"
+  },
+  "partialThrough": "2027-01-31",
+  "coverageNote": "window = COMPLETE coverage (every approved release is in events[]). Dates after 2026-12-31 through 2027-01-31 hold only the already-published rows (see pending[]); GET /api/news/blackouts reports covered:false for them.",
+  "timezone": "America/New_York",
+  "sources": [
+    "https://www.bls.gov/schedule/news_release/empsit.htm",
+    "https://www.bls.gov/schedule/news_release/cpi.htm",
+    "https://www.bls.gov/schedule/news_release/ppi.htm",
+    "https://www.bls.gov/schedule/news_release/jolts.htm",
+    "https://www.bea.gov/news/schedule",
+    "https://www.census.gov/economic-indicators/calendar-listview.html",
+    "https://www.census.gov/retail/release_schedule.html",
+    "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/",
+    "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+    "https://www.chicagofed.org/utilities/about-us/federal-reserve-calendars",
+    "https://www.mnimarkets.com/articles/mni-federal-reserve-sets-2027-fomc-meeting-schedule-1757093400287"
+  ],
+  "blackoutRules": {
+    "description": "Owner-approved entry blackout around scheduled prints (ET, wall clock). Apply per calendar day to every event on that day.",
+    "authoritative": "INFORMATIONAL COPY. The live gate applies the BLACKOUT_RULES literal in server/news-blackout.ts and never reads this block; scripts/news-calendar-data.test.ts, the daily digest and integrity-check N1 flag any disagreement.",
+    "rules": [
+      {
+        "printTimeET": "08:30",
+        "blackoutFromET": "08:25",
+        "blackoutToET": "08:40"
+      },
+      {
+        "printTimeET": "10:00",
+        "blackoutFromET": "09:55",
+        "blackoutToET": "10:05"
+      },
+      {
+        "printTimeET": "14:00",
+        "event": "FOMC",
+        "blackoutFromET": "13:55",
+        "blackoutToET": "14:30"
+      }
+    ]
+  },
+  "events": [
+    {
+      "date": "2026-10-01",
+      "timeET": "10:00",
+      "event": "ISM Manufacturing PMI",
+      "source": "ISM",
+      "tier": 2,
+      "ref": "September 2026"
+    },
+    {
+      "date": "2026-10-02",
+      "timeET": "08:30",
+      "event": "Employment Situation",
+      "source": "BLS",
+      "tier": 1,
+      "ref": "September 2026"
+    },
+    {
+      "date": "2026-10-05",
+      "timeET": "10:00",
+      "event": "ISM Services PMI",
+      "source": "ISM",
+      "tier": 2,
+      "ref": "September 2026"
+    },
+    {
+      "date": "2026-10-14",
+      "timeET": "08:30",
+      "event": "CPI",
+      "source": "BLS",
+      "tier": 1,
+      "ref": "September 2026"
+    },
+    {
+      "date": "2026-10-15",
+      "timeET": "08:30",
+      "event": "PPI",
+      "source": "BLS",
+      "tier": 2,
+      "ref": "September 2026"
+    },
+    {
+      "date": "2026-10-15",
+      "timeET": "08:30",
+      "event": "Retail Sales",
+      "source": "Census",
+      "tier": 2,
+      "ref": "September 2026 (Advance Monthly Sales for Retail and Food Services)"
+    },
+    {
+      "date": "2026-10-28",
+      "timeET": "14:00",
+      "event": "FOMC",
+      "source": "Federal Reserve",
+      "tier": 1,
+      "ref": "Oct 27-28 2026 meeting (statement; press conference 14:30)"
+    },
+    {
+      "date": "2026-10-29",
+      "timeET": "08:30",
+      "event": "GDP advance",
+      "source": "BEA",
+      "tier": 1,
+      "ref": "Q3 2026"
+    },
+    {
+      "date": "2026-10-29",
+      "timeET": "08:30",
+      "event": "PCE",
+      "source": "BEA",
+      "tier": 1,
+      "ref": "September 2026 (Personal Income and Outlays)"
+    },
+    {
+      "date": "2026-11-02",
+      "timeET": "10:00",
+      "event": "ISM Manufacturing PMI",
+      "source": "ISM",
+      "tier": 2,
+      "ref": "October 2026"
+    },
+    {
+      "date": "2026-11-03",
+      "timeET": "10:00",
+      "event": "JOLTS",
+      "source": "BLS",
+      "tier": 2,
+      "ref": "September 2026"
+    },
+    {
+      "date": "2026-11-04",
+      "timeET": "10:00",
+      "event": "ISM Services PMI",
+      "source": "ISM",
+      "tier": 2,
+      "ref": "October 2026"
+    },
+    {
+      "date": "2026-11-06",
+      "timeET": "08:30",
+      "event": "Employment Situation",
+      "source": "BLS",
+      "tier": 1,
+      "ref": "October 2026"
+    },
+    {
+      "date": "2026-11-10",
+      "timeET": "08:30",
+      "event": "CPI",
+      "source": "BLS",
+      "tier": 1,
+      "ref": "October 2026"
+    },
+    {
+      "date": "2026-11-13",
+      "timeET": "08:30",
+      "event": "PPI",
+      "source": "BLS",
+      "tier": 2,
+      "ref": "October 2026"
+    },
+    {
+      "date": "2026-11-17",
+      "timeET": "08:30",
+      "event": "Retail Sales",
+      "source": "Census",
+      "tier": 2,
+      "ref": "October 2026 (Advance Monthly Sales for Retail and Food Services)"
+    },
+    {
+      "date": "2026-11-25",
+      "timeET": "08:30",
+      "event": "GDP second",
+      "source": "BEA",
+      "tier": 2,
+      "ref": "Q3 2026"
+    },
+    {
+      "date": "2026-11-25",
+      "timeET": "08:30",
+      "event": "PCE",
+      "source": "BEA",
+      "tier": 1,
+      "ref": "October 2026 (Personal Income and Outlays)"
+    },
+    {
+      "date": "2026-12-01",
+      "timeET": "10:00",
+      "event": "ISM Manufacturing PMI",
+      "source": "ISM",
+      "tier": 2,
+      "ref": "November 2026"
+    },
+    {
+      "date": "2026-12-01",
+      "timeET": "10:00",
+      "event": "JOLTS",
+      "source": "BLS",
+      "tier": 2,
+      "ref": "October 2026"
+    },
+    {
+      "date": "2026-12-03",
+      "timeET": "10:00",
+      "event": "ISM Services PMI",
+      "source": "ISM",
+      "tier": 2,
+      "ref": "November 2026"
+    },
+    {
+      "date": "2026-12-04",
+      "timeET": "08:30",
+      "event": "Employment Situation",
+      "source": "BLS",
+      "tier": 1,
+      "ref": "November 2026"
+    },
+    {
+      "date": "2026-12-09",
+      "timeET": "14:00",
+      "event": "FOMC",
+      "source": "Federal Reserve",
+      "tier": 1,
+      "ref": "Dec 8-9 2026 meeting with SEP (statement; press conference 14:30)"
+    },
+    {
+      "date": "2026-12-10",
+      "timeET": "08:30",
+      "event": "CPI",
+      "source": "BLS",
+      "tier": 1,
+      "ref": "November 2026"
+    },
+    {
+      "date": "2026-12-15",
+      "timeET": "08:30",
+      "event": "PPI",
+      "source": "BLS",
+      "tier": 2,
+      "ref": "November 2026"
+    },
+    {
+      "date": "2026-12-16",
+      "timeET": "08:30",
+      "event": "Retail Sales",
+      "source": "Census",
+      "tier": 2,
+      "ref": "November 2026 (Advance Monthly Sales for Retail and Food Services)"
+    },
+    {
+      "date": "2026-12-23",
+      "timeET": "08:30",
+      "event": "GDP third",
+      "source": "BEA",
+      "tier": 2,
+      "ref": "Q3 2026"
+    },
+    {
+      "date": "2026-12-23",
+      "timeET": "08:30",
+      "event": "PCE",
+      "source": "BEA",
+      "tier": 1,
+      "ref": "November 2026 (Personal Income and Outlays)"
+    },
+    {
+      "date": "2027-01-27",
+      "timeET": "14:00",
+      "event": "FOMC",
+      "source": "Federal Reserve",
+      "tier": 1,
+      "ref": "Jan 26-27 2027 meeting (statement; press conference 14:30)"
+    }
+  ],
+  "pending": [
+    {
+      "month": "2027-01",
+      "event": "Employment Situation",
+      "source": "BLS",
+      "tier": 1,
+      "timeET": "08:30",
+      "status": "not yet published",
+      "note": "BLS 2027 schedule pages (bls.gov/schedule/2027/...) return 404 as of 2026-10-01; the empsit page ends at the Dec 4 2026 release."
+    },
+    {
+      "month": "2027-01",
+      "event": "CPI",
+      "source": "BLS",
+      "tier": 1,
+      "timeET": "08:30",
+      "status": "not yet published",
+      "note": "cpi.htm ends at the Dec 10 2026 release."
+    },
+    {
+      "month": "2027-01",
+      "event": "PPI",
+      "source": "BLS",
+      "tier": 2,
+      "timeET": "08:30",
+      "status": "not yet published",
+      "note": "ppi.htm ends at the Dec 15 2026 release."
+    },
+    {
+      "month": "2027-01",
+      "event": "JOLTS",
+      "source": "BLS",
+      "tier": 2,
+      "timeET": "10:00",
+      "status": "not yet published",
+      "note": "jolts.htm ends at the Dec 1 2026 release (November 2026 data would be an early-January 2027 print)."
+    },
+    {
+      "month": "2027-01",
+      "event": "GDP advance",
+      "source": "BEA",
+      "tier": 1,
+      "timeET": "08:30",
+      "status": "not yet published",
+      "note": "bea.gov/news/schedule shows no 2027 rows; Q4 2026 advance is normally late January."
+    },
+    {
+      "month": "2027-01",
+      "event": "PCE",
+      "source": "BEA",
+      "tier": 1,
+      "timeET": "08:30",
+      "status": "not yet published",
+      "note": "December 2026 Personal Income and Outlays normally lands late January / early February."
+    },
+    {
+      "month": "2027-01",
+      "event": "Retail Sales",
+      "source": "Census",
+      "tier": 2,
+      "timeET": "08:30",
+      "status": "to be announced",
+      "note": "census.gov/retail/release_schedule.html prints 'To be announced at a later date' for the December 2026 advance report."
+    },
+    {
+      "month": "2027-01",
+      "event": "ISM Manufacturing PMI",
+      "source": "ISM",
+      "tier": 2,
+      "timeET": "10:00",
+      "status": "not yet published",
+      "note": "ISM calendar page lists 2026 only. Rule of thumb is the first business day, but ISM shifted Jan 2026 to the 5th for an ISM holiday — do not assume Jan 4 2027."
+    },
+    {
+      "month": "2027-01",
+      "event": "ISM Services PMI",
+      "source": "ISM",
+      "tier": 2,
+      "timeET": "10:00",
+      "status": "not yet published",
+      "note": "ISM calendar page lists 2026 only; nominal third business day."
+    }
+  ]
+}

@@ -15,10 +15,14 @@ import { MarketView } from "@/components/terminal/MarketView";
 import { SignalsView } from "@/components/terminal/SignalsView";
 import { SettingsView } from "@/components/terminal/SettingsView";
 import { InfoView } from "@/components/terminal/InfoView";
+import { LedgerView } from "@/components/terminal/LedgerView"; // FORWARD-VALIDATION LEDGER (2026-08-02)
+import { JournalView } from "@/components/terminal/JournalView"; // TRADING JOURNAL (2026-08-07)
 import { NewsTicker } from "@/components/terminal/NewsTicker";
 import { Clock } from "@/components/terminal/Clock";
+import { FeedStatusBadge } from "@/components/terminal/FeedStatusBadge"; // YAHOO-FALLBACK: amber delayed-feed pill
 import { FootprintPanel } from "@/components/terminal/FootprintPanel";
-import { STRATS } from "@/components/terminal/strategyMeta";
+import { ThoughtsPanel } from "@/components/terminal/ThoughtsPanel"; // THOUGHTS narration (2026-08-12)
+import { STRATS, STRAT_GROUPS } from "@/components/terminal/strategyMeta";
 import { useTerminalData, type TerminalSignal } from "@/hooks/useTerminalData";
 import {
   loadSettings, saveSettings, loadStrategies, saveStrategies, getEngineInterval, setEngineInterval,
@@ -26,7 +30,7 @@ import {
 } from "@/lib/terminalSettings";
 import { loadMilkZones, uploadMilkZones, type MilkZone } from "@/lib/milkZones";
 
-type Tab = "home" | "signals" | "settings" | "info";
+type Tab = "home" | "signals" | "ledger" | "journal" | "settings" | "info";
 type SideFilter = "All" | "LONG" | "SHORT";
 
 // The four fractal probability concepts, each rendered individually on the chart and toggled on its own.
@@ -59,15 +63,12 @@ export default function TradingTerminal() {
 
   useEffect(() => { saveSettings(settings); }, [settings]);
   useEffect(() => { saveStrategies(strategies); }, [strategies]);
-  // Auto-trade follows the interval you're viewing: tell the server to fire signals on THIS
-  // interval (the hidden engine mirrors server config live). Runs on mount + every interval change.
-  useEffect(() => {
-    fetch("/api/trade/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ intervals: [interval] }),
-    }).catch(() => {});
-  }, [interval]);
+  // ALL-INTERVAL AUTO-TRADE (2026-08-13, user directive: "auto trade all intervals — no
+  // missed signals"): the old effect here narrowed tradeSettings.intervals to the VIEWED
+  // interval on every mount/switch, silently overwriting the user's "Trade on intervals"
+  // checkboxes and filtering every other interval's fires out of auto-execution (they then
+  // surfaced only as catch-up backfills — trades that never happened). The interval set is
+  // now owned ONLY by the auto-trade card's checkboxes; viewing an interval changes nothing.
   // Escape clears the selected signal (hides the TP/SL lines on the chart).
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") setChartSig(null); };
@@ -75,7 +76,10 @@ export default function TradingTerminal() {
     return () => window.removeEventListener("keydown", h);
   }, []);
 
-  const { candles, signals, lastPrice, source, connected, feedStatus, loadMoreHistory, fullyLoaded, autoTradeFired } = useTerminalData(settings.symbol, interval, chartKey);
+  // guard / candlesRevision (2026-09-18 chart-liveness round): contract-guard state for the HUD's
+  // LIVE/DELAYED badge; the interior-bar replacement counter that makes the chart repaint bars
+  // reconcile() swapped in place (provisional → canonical).
+  const { candles, signals, lastPrice, source, connected, feedStatus, guard, candlesRevision, loadMoreHistory, fullyLoaded, autoTradeFired, signalsResyncNonce } = useTerminalData(settings.symbol, interval, chartKey);
 
   // Visible "order placed" toast — the engine's own toast renders in the hidden MarketPage.
   const [tradeToast, setTradeToast] = useState<string | null>(null);
@@ -107,8 +111,14 @@ export default function TradingTerminal() {
   const onPickFile = async (file: File) => {
     setUploadBusy(true);
     setUploadMsg("Parsing…");
-    const visibleHigh = candles.length ? Math.max(...candles.map((c) => c.h)) : undefined;
-    const visibleLow = candles.length ? Math.min(...candles.map((c) => c.l)) : undefined;
+    // NOTE: never Math.max(...arr) over the candle array — with deep history loaded (~100k+
+    // bars) spreading that many arguments overflows the call stack. Loop instead.
+    let visibleHigh: number | undefined;
+    let visibleLow: number | undefined;
+    for (const c of candles) {
+      if (visibleHigh === undefined || c.h > visibleHigh) visibleHigh = c.h;
+      if (visibleLow === undefined || c.l < visibleLow) visibleLow = c.l;
+    }
     const res = await uploadMilkZones(file, settings.symbol, visibleHigh, visibleLow);
     setUploadBusy(false);
     if (res.error) { setUploadMsg(`Error: ${res.error}`); return; }
@@ -128,6 +138,8 @@ export default function TradingTerminal() {
   const tabs: { id: Tab; label: string; icon: () => JSX.Element }[] = [
     { id: "home", label: "Market", icon: Ico.bars },
     { id: "signals", label: "Signals", icon: Ico.signal },
+    { id: "ledger", label: "Ledger", icon: Ico.ledger }, // FORWARD-VALIDATION LEDGER (2026-08-02)
+    { id: "journal", label: "Journal", icon: Ico.journal }, // TRADING JOURNAL (2026-08-07)
     { id: "info", label: "Info", icon: Ico.info },
     { id: "settings", label: "Settings", icon: Ico.sliders },
   ];
@@ -149,6 +161,7 @@ export default function TradingTerminal() {
         selectedSig={chartSig}
         onNeedHistory={loadMoreHistory}
         fullyLoaded={fullyLoaded}
+        candlesRevision={candlesRevision}
       />
       <div className="tt-overlay" />
 
@@ -176,6 +189,9 @@ export default function TradingTerminal() {
             <button className="tt-tab" onClick={() => setLocation("/portfolio")}>Portfolio</button>
           </nav>
 
+          {/* YAHOO-FALLBACK: renders only while the server is on the delayed Yahoo feed (or stale) */}
+          <FeedStatusBadge />
+
           <div className="tt-strat-wrap">
             <button className={"tt-strat-btn" + (stratOpen ? " open" : "")} onClick={() => setStratOpen((o) => !o)}>
               Strategies <span style={{ display: "inline-flex", transition: "transform .25s", transform: stratOpen ? "rotate(180deg)" : "none" }}>{Ico.chevron()}</span>
@@ -186,12 +202,17 @@ export default function TradingTerminal() {
                 <div className="tt-dropdown">
                   <span className="tt-corner tl" /><span className="tt-corner tr" />
                   <span className="tt-corner bl" /><span className="tt-corner br" />
-                  <div className="tt-dd-head">CONFIRMATION STRATEGIES</div>
-                  {STRATS.map((s, i) => (
+                  <div className="tt-dd-head">STRATEGIES</div>
+                  {/* DECLUTTER (2026-08-10): sectioned by STRAT_GROUPS (signal / facts / display),
+                      stagger capped so the 9-row list settles fast instead of cascading ~500ms. */}
+                  {STRAT_GROUPS.map((g) => (
+                    <div key={g.id}>
+                      <div className="tt-dd-group">{g.label}</div>
+                      {STRATS.filter((s) => s.group === g.id).map((s, i) => (
                     <div key={s.key}>
-                      <div className="tt-dd-row" style={{ animationDelay: 60 + i * 55 + "ms" }}>
+                      <div className="tt-dd-row" style={{ animationDelay: 40 + Math.min(i, 4) * 35 + "ms" }}>
                         <div className="tt-dd-info">
-                          <div className="tt-dd-name">{s.key}<span className="tt-dd-stat">{s.stat}</span></div>
+                          <div className="tt-dd-name">{s.name ?? s.key}<span className="tt-dd-stat">{s.stat}</span></div>
                           <div className="tt-dd-desc">{s.desc}</div>
                         </div>
                         <Toggle
@@ -227,6 +248,8 @@ export default function TradingTerminal() {
                         </div>
                       )}
                     </div>
+                      ))}
+                    </div>
                   ))}
                 </div>
               </>
@@ -249,13 +272,16 @@ export default function TradingTerminal() {
                   source={source}
                   connected={connected}
                   feedStatus={feedStatus}
+                  guard={guard}
                   interval={interval}
                   onIntervalChange={changeInterval}
                 />
               )}
               {tab === "signals" && (
-                <SignalsView signals={signals} candles={candles} filter={filter} setFilter={setFilter} symbol={settings.symbol} interval={interval} />
+                <SignalsView signals={signals} candles={candles} filter={filter} setFilter={setFilter} symbol={settings.symbol} interval={interval} signalsResyncNonce={signalsResyncNonce} />
               )}
+              {tab === "ledger" && <LedgerView symbol={settings.symbol} />}
+              {tab === "journal" && <JournalView />}
               {tab === "info" && <InfoView />}
               {tab === "settings" && <SettingsView s={settings} set={setSettings} />}
             </div>
@@ -265,6 +291,10 @@ export default function TradingTerminal() {
 
       {effectiveStrategies.Footprint && tab === "home" && (
         <FootprintPanel symbol={settings.symbol} interval={interval} />
+      )}
+      {/* THOUGHTS (2026-08-12): live per-candle narration panel — same floating-HUD idiom. */}
+      {tab === "home" && (
+        <ThoughtsPanel symbol={settings.symbol} candles={candles} lastPrice={lastPrice} interval={interval} signals={signals} />
       )}
       {/* Probability is now shown as individual ON-CHART overlays (Value Area / Regime / Forecast /
           Target levels) — the floating numeric panel was removed (it overlapped the dropdown). */}

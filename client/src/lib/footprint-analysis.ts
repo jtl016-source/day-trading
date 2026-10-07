@@ -66,6 +66,8 @@ export interface UnfinishedAuction {
   atExtreme: "high" | "low";
 }
 
+// RULE 7 (2026-07-13): the candle-level delta FIELD is deleted — footprint contributes
+// imbalance ZONES only; displays that show a net delta compute totalAskVol − totalBidVol.
 export interface FootprintCandle {
   symbol:            string;
   interval:          string;
@@ -73,7 +75,6 @@ export interface FootprintCandle {
   levels:            PriceLevelData[];
   totalBidVol:       number;
   totalAskVol:       number;
-  candleDelta:       number;
   poc:               number;
   vah:               number;
   val:               number;
@@ -85,174 +86,10 @@ export interface FootprintCandle {
   complete:          boolean;
 }
 
-export interface FootprintExitAdjustments {
-  usePocStop:      boolean;
-  pocStopPrice:    number | null;
-  tp1Override:     number | null;
-  tp2Extension:    number | null;
-  tightenTrailing: boolean;
-}
-
-export interface FootprintReading {
-  confirmed:         boolean;
-  partial:           boolean;
-  vetoed:            boolean;
-  vetoReason:        string | null;
-  isProxyData:       boolean; // true when synthesized from OHLCV — no veto, max 2pts
-  deltaAgrees:       boolean;
-  divergence:        boolean;
-  absorption:        AbsorptionEvent | null;
-  stackedImbalance:  ImbalanceCluster | null;
-  trappedTraders:    "long" | "short" | null;
-  unfinishedAuction: UnfinishedAuction | null;
-  poc:               number;
-  candleDelta:       number;
-  exitAdjustments:   FootprintExitAdjustments;
-}
-
-const TICK_SIZE = 0.25;
-
-export function analyzeFootprint(
-  candle: FootprintCandle,
-  direction: "Long" | "Short",
-  priorCandles: FootprintCandle[],
-  zonePrice: number,
-): FootprintReading {
-  const isLong = direction === "Long";
-  const isProxy = !FOOTPRINT_DATA_CONFIRMED; // synthetic OHLCV data — no veto, max partial
-  const deltaAgrees = isLong ? candle.candleDelta > 0 : candle.candleDelta < 0;
-
-  let divergence = false;
-  if (priorCandles.length >= 3) {
-    const prior3 = priorCandles.slice(-3);
-    if (isLong && candle.high >= Math.max(...prior3.map(c => c.high))) {
-      divergence = prior3.every(pc => candle.candleDelta < pc.candleDelta);
-    } else if (!isLong && candle.low <= Math.min(...prior3.map(c => c.low))) {
-      divergence = prior3.every(pc => candle.candleDelta > pc.candleDelta);
-    }
-  }
-
-  // Delta divergence veto is suppressed for proxy data — synthetic volumes are not reliable
-  // enough to kill an entire signal based on delta pattern alone.
-  if (divergence && !isProxy) {
-    return {
-      confirmed: false, partial: false, vetoed: true,
-      vetoReason: "Delta divergence on signal candle — buyer/seller exhaustion detected",
-      isProxyData: false,
-      deltaAgrees, divergence,
-      absorption: null, stackedImbalance: null,
-      trappedTraders: null, unfinishedAuction: null,
-      poc: candle.poc, candleDelta: candle.candleDelta,
-      exitAdjustments: { usePocStop: false, pocStopPrice: null, tp1Override: null, tp2Extension: null, tightenTrailing: false },
-    };
-  }
-
-  if (!deltaAgrees) {
-    return {
-      confirmed: false, partial: false, vetoed: false, vetoReason: null,
-      isProxyData: isProxy,
-      deltaAgrees, divergence: false,
-      absorption: null, stackedImbalance: null,
-      trappedTraders: null, unfinishedAuction: null,
-      poc: candle.poc, candleDelta: candle.candleDelta,
-      exitAdjustments: buildExitAdjustments(candle, direction, null, null, null, zonePrice),
-    };
-  }
-
-  const ticksFromZone = 2 * TICK_SIZE;
-
-  let absorptionBonus: AbsorptionEvent | null = null;
-  if (candle.absorption) {
-    const zoneDist = Math.abs(candle.absorption.price - zonePrice);
-    const sideMatch = isLong ? candle.absorption.side === "buy" : candle.absorption.side === "sell";
-    if (zoneDist <= ticksFromZone && sideMatch) absorptionBonus = candle.absorption;
-  }
-
-  const stackedImbalance = candle.imbalances.find(
-    cl => cl.stacked && cl.direction === (isLong ? "buy" : "sell"),
-  ) ?? null;
-
-  let trappedTraders: "long" | "short" | null = null;
-  if (candle.levels.length > 0) {
-    const avgBid = candle.totalBidVol / candle.levels.length;
-    const avgAsk = candle.totalAskVol / candle.levels.length;
-    if (isLong) {
-      const botLevel = candle.levels[0];
-      if (botLevel && botLevel.bidVol >= avgBid * 3 && candle.candleDelta > 0) trappedTraders = "short";
-    } else {
-      const topLevel = candle.levels[candle.levels.length - 1];
-      if (topLevel && topLevel.askVol >= avgAsk * 3 && candle.candleDelta < 0) trappedTraders = "long";
-    }
-  }
-
-  const allCandles = [...priorCandles.slice(-3), candle];
-  const auctionSide = isLong ? "buy" : "sell";
-  let foundAuction: UnfinishedAuction | null = null;
-  for (const c of allCandles) {
-    if (c.unfinishedAuction && c.unfinishedAuction.side === auctionSide) foundAuction = c.unfinishedAuction;
-  }
-
-  const hasBonus = absorptionBonus !== null || stackedImbalance !== null ||
-                   trappedTraders !== null || foundAuction !== null;
-
-  // Proxy data: bonus features are still detected for display but cannot upgrade to confirmed.
-  // Keeps max footprint contribution at 2 pts (partial) to avoid rewarding synthetic signal strength.
-  return {
-    confirmed: isProxy ? false : hasBonus,
-    partial:   isProxy ? true  : !hasBonus,
-    vetoed: false, vetoReason: null,
-    isProxyData: isProxy,
-    deltaAgrees, divergence: false,
-    absorption: absorptionBonus,
-    stackedImbalance,
-    trappedTraders,
-    unfinishedAuction: foundAuction,
-    poc: candle.poc,
-    candleDelta: candle.candleDelta,
-    exitAdjustments: buildExitAdjustments(candle, direction, stackedImbalance, foundAuction, absorptionBonus, zonePrice),
-  };
-}
-
-const POC_STOP_BUFFER = 0.5; // points beyond POC to place stop (2 ticks for MES)
-
-function buildExitAdjustments(
-  candle: FootprintCandle,
-  direction: "Long" | "Short",
-  stackedImbalance: ImbalanceCluster | null,
-  auction: UnfinishedAuction | null,
-  _absorption: AbsorptionEvent | null,
-  zonePrice: number,
-): FootprintExitAdjustments {
-  const isLong      = direction === "Long";
-  const candleRange = Math.abs(candle.high - candle.low);
-
-  // POC stop only valid when POC is strictly on the correct side of entry:
-  //   Long  → POC must be below entry (it's a stop, not a trigger)
-  //   Short → POC must be above entry
-  const pocOnCorrectSide = isLong ? candle.poc < zonePrice : candle.poc > zonePrice;
-  const pocDist     = Math.abs(candle.poc - zonePrice);
-  const usePocStop  = pocOnCorrectSide && candleRange > 0 && (pocDist / candleRange) <= 0.60;
-
-  // Place stop just BEYOND the POC (not AT it) — "just beyond" = one buffer past
-  let pocStopPrice: number | null = null;
-  if (usePocStop) {
-    pocStopPrice = isLong ? candle.poc - POC_STOP_BUFFER : candle.poc + POC_STOP_BUFFER;
-  }
-
-  let tp1Override: number | null = null;
-  if (auction) {
-    if (isLong && auction.atExtreme === "high" && auction.price > zonePrice) tp1Override = auction.price;
-    else if (!isLong && auction.atExtreme === "low" && auction.price < zonePrice)  tp1Override = auction.price;
-  }
-
-  return {
-    usePocStop,
-    pocStopPrice,
-    tp1Override,
-    tp2Extension:  stackedImbalance?.stacked ? 0.20 : null,
-    tightenTrailing: false,
-  };
-}
+// ── (FootprintExitAdjustments / FootprintReading / analyzeFootprint / buildExitAdjustments
+//    DELETED 2026-07-13) — RULE 7: no delta logic in any signal path. The delta-agreement gate,
+//    divergence veto, trapped-traders read and POC-stop/TP exit adjustments were the retired
+//    points model's footprint scoring; the fact engine consumes imbalance ZONES only.
 
 // ── OHLCV proxy ───────────────────────────────────────────────────────────
 // Synthesizes a FootprintCandle from OHLCV bar data using whole-number price
@@ -382,7 +219,6 @@ export function buildProxyFootprintCandle(c: OHLCVBar): FootprintCandle { // FOO
   return {
     symbol: "", interval: "", time: c.time,
     levels, totalBidVol, totalAskVol,
-    candleDelta: totalAskVol - totalBidVol,
     poc, vah, val, high: c.high, low: c.low,
     absorption, imbalances, unfinishedAuction, complete: true,
   };
@@ -390,13 +226,14 @@ export function buildProxyFootprintCandle(c: OHLCVBar): FootprintCandle { // FOO
 
 // ── Session boundary helpers ─────────────────────────────────────────────────
 
-// FOOTPRINT-RULE: RTH = Mon-Fri 13:30-20:30 UTC (9:30am-4:30pm ET)
+// FOOTPRINT-RULE: RTH = Mon-Fri 13:30-21:00 UTC (9:30am-5:00pm ET). NOTE: UTC-based (EDT);
+// approximate in EST. Only used by frozen-imbalance zones, which require real MW data.
 export function getCurrentSessionType(nowSec: number): "rth" | "eth" { // FOOTPRINT-RULE:
   const d    = new Date(nowSec * 1000); // FOOTPRINT-RULE:
   const day  = d.getUTCDay(); // FOOTPRINT-RULE:
   if (day === 0 || day === 6) return "eth"; // FOOTPRINT-RULE:
   const mUTC = d.getUTCHours() * 60 + d.getUTCMinutes(); // FOOTPRINT-RULE:
-  return (mUTC >= 13 * 60 + 30 && mUTC < 20 * 60 + 30) ? "rth" : "eth"; // FOOTPRINT-RULE:
+  return (mUTC >= 13 * 60 + 30 && mUTC < 21 * 60) ? "rth" : "eth"; // FOOTPRINT-RULE: 9:30am–5:00pm ET
 } // FOOTPRINT-RULE:
 
 // FOOTPRINT-RULE: find start/end unix seconds of most recent completed session
@@ -412,8 +249,8 @@ export function getLastCompletedSession( // FOOTPRINT-RULE:
     const baseSec   = base.getTime() / 1000; // FOOTPRINT-RULE:
 
     if (type === "rth" && dayOfWeek >= 1 && dayOfWeek <= 5) { // FOOTPRINT-RULE:
-      const rthStart = baseSec + 13 * 3600 + 30 * 60; // FOOTPRINT-RULE:
-      const rthEnd   = baseSec + 20 * 3600 + 30 * 60; // FOOTPRINT-RULE:
+      const rthStart = baseSec + 13 * 3600 + 30 * 60; // FOOTPRINT-RULE: 9:30 AM ET
+      const rthEnd   = baseSec + 21 * 3600; // FOOTPRINT-RULE: 5:00 PM ET (moved from 4:30 PM)
       if (rthEnd < nowSec) return { start: rthStart, end: rthEnd }; // FOOTPRINT-RULE: session must be fully in the past
     } // FOOTPRINT-RULE:
 
@@ -421,7 +258,7 @@ export function getLastCompletedSession( // FOOTPRINT-RULE:
       // ETH ends at next trading day's 13:30 UTC — find the most recent 13:30 in the past
       const ethEnd   = baseSec + 13 * 3600 + 30 * 60; // FOOTPRINT-RULE:
       if (ethEnd < nowSec) { // FOOTPRINT-RULE:
-        const ethStart = ethEnd - 17 * 3600; // FOOTPRINT-RULE: ETH runs 17h: prior day 20:30→next day 13:30
+        const ethStart = ethEnd - (16 * 3600 + 30 * 60); // FOOTPRINT-RULE: ETH runs 16.5h: prior day 21:00 (5pm ET) → next day 13:30
         return { start: ethStart, end: ethEnd }; // FOOTPRINT-RULE:
       } // FOOTPRINT-RULE:
     } // FOOTPRINT-RULE:

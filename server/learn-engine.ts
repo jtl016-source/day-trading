@@ -1,5 +1,5 @@
 import { db } from "./db";
-import { signalHistory, learningSessions, cachedCandles } from "@shared/schema";
+import { signalHistory, learningSessions } from "@shared/schema";
 import { desc, and, eq, sql } from "drizzle-orm";
 
 export interface TradeLearning {
@@ -10,7 +10,7 @@ export interface TradeLearning {
   signalType: string;
   entry: number;
   tp1: number;
-  tp2: number;
+  tp2: number | null; // TP1-ONLY policy (2026-08-13): null on post-policy rows
   sl: number;
   outcome: string;
   sessionBucket: string;
@@ -29,7 +29,7 @@ export interface TradeLearning {
   tp2WasExtended:        boolean; // FOOTPRINT-LEARN:
   midTradeDivergence:    boolean; // FOOTPRINT-LEARN: set to false here; mid-trade alerts are ephemeral
   footprintFiredAlone:   boolean; // FOOTPRINT-LEARN: fp confirmed but no zone or secondary vec
-  footprintDeltaValue:   number;  // FOOTPRINT-LEARN: raw candleDelta value at signal
+  // (footprintDeltaValue DELETED 2026-07-13 — rule 7: delta logic removed everywhere)
   footprintWasDuringETH: boolean; // FOOTPRINT-LEARN: for ETH reliability analysis
   // VECTOR-LEARN: vector-specific metrics
   vectorTimeframesConfirmed: number; // VECTOR-LEARN: how many secondary intervals also confirmed
@@ -129,9 +129,8 @@ function buildWhyFailed(trade: typeof signalHistory.$inferSelect): string {
   if (bucket === "mid-day") parts.push("Mid-day chop — vector signals less reliable during consolidation phase");
   // FOOTPRINT-LEARN: order-flow failure notes
   const fp = parseFp(trade); // FOOTPRINT-LEARN:
-  if (fp?.partial)  parts.push("Footprint partial at entry — delta agreed but no absorption/imbalance/trap to confirm"); // FOOTPRINT-LEARN:
+  if (fp?.partial)  parts.push("Footprint partial at entry — no absorption/imbalance/trap to confirm"); // FOOTPRINT-LEARN:
   if (!fp)          parts.push("No footprint data — order-flow confirmation unavailable for this session"); // FOOTPRINT-LEARN:
-  if (fp?.candleDelta === 0) parts.push("Delta was exactly zero — no confirmed directional aggression at entry"); // FOOTPRINT-LEARN:
   // VECTOR-LEARN: vector failure notes
   if (trade.riskLevel === "risky" && trade.direction === "Short") parts.push("Short via vector only — vector is not strong confluence for shorts, extra confirmation required"); // VECTOR-LEARN:
   // ZONE-LEARN: zone failure notes
@@ -220,7 +219,6 @@ export async function runLearningSession(symbol = "MES", interval = "5m"): Promi
       tp2WasExtended:        fp?.exitAdjustments?.tp2Extension     != null,  // FOOTPRINT-LEARN:
       midTradeDivergence:    false, // FOOTPRINT-LEARN: ephemeral — not stored, only live alerts
       footprintFiredAlone:   (fp?.confirmed ?? false) && s.riskLevel === "risky", // FOOTPRINT-LEARN: risky + fp confirmed = likely standalone (no zone)
-      footprintDeltaValue:   fp?.candleDelta ?? 0, // FOOTPRINT-LEARN:
       footprintWasDuringETH: !isRTHsec(s.timestamp), // FOOTPRINT-LEARN: ETH = anything outside RTH
       // VECTOR-LEARN: inferred from signal type and tier
       vectorTimeframesConfirmed: 0, // VECTOR-LEARN: not stored in DB row; would need a schema column to track
@@ -423,126 +421,9 @@ export function generateStrategyProposals(log: LearningLog): StrategyProposal[] 
   return proposals;
 }
 
-// ── Backfill: compute signals for ALL cached_candles across every symbol+resolution ──────────────
-
-const VEC_N = 20;
-
-function computeVectorArr(lows: number[]): number[] {
-  const n = lows.length;
-  // Step 1: rolling min of lows over N bars
-  const lowestLow = new Array(n).fill(0);
-  for (let i = 0; i < n; i++) {
-    let m = Infinity;
-    for (let j = Math.max(0, i - VEC_N + 1); j <= i; j++) {
-      if (lows[j] < m) m = lows[j];
-    }
-    lowestLow[i] = m;
-  }
-  // Step 2: rolling max of lowestLow over N bars
-  const vector = new Array(n).fill(0);
-  for (let i = 0; i < n; i++) {
-    let m = 0;
-    for (let j = Math.max(0, i - VEC_N + 1); j <= i; j++) {
-      if (lowestLow[j] > m) m = lowestLow[j];
-    }
-    vector[i] = m;
-  }
-  return vector;
-}
-
-/** Walk forward from signalIdx to find outcome against fixed TP/SL levels. */
-function walkForwardServer(
-  candles: { high: number; low: number }[],
-  signalIdx: number,
-  tp1: number, tp2: number, sl: number, isLong: boolean,
-): "win_tp1" | "win_tp2" | "loss" | "open" {
-  for (let j = signalIdx + 1; j < Math.min(signalIdx + 120, candles.length); j++) {
-    const f = candles[j];
-    if (isLong) {
-      if (f.high >= tp2) return "win_tp2";
-      if (f.high >= tp1) return "win_tp1";
-      if (f.low  <= sl)  return "loss";
-    } else {
-      if (f.low  <= tp2) return "win_tp2";
-      if (f.low  <= tp1) return "win_tp1";
-      if (f.high >= sl)  return "loss";
-    }
-  }
-  return "open";
-}
-
-/** Compute and persist signals for every symbol+resolution in cached_candles that isn't already in signal_history. */
-export async function backfillSignals(): Promise<{ inserted: number; skipped: number }> {
-  // Fixed exit params (risky tier: no zone info server-side)
-  const TP1 = 8.0, TP2 = 16.0, SL = 5.0;
-  const COOLDOWN = 10; // bars between signals
-
-  // Get distinct symbol+resolution combos
-  const combos = db.all(
-    sql`SELECT DISTINCT symbol, resolution FROM cached_candles ORDER BY symbol, resolution`,
-  ) as { symbol: string; resolution: string }[];
-
-  let inserted = 0, skipped = 0;
-
-  for (const { symbol, resolution } of combos) {
-    const interval = resolution === "60" ? "60m" : resolution === "15" ? "15m" : resolution === "5" ? "5m" : "1m";
-
-    const rows = db.select().from(cachedCandles)
-      .where(and(eq(cachedCandles.symbol, symbol), eq(cachedCandles.resolution, resolution)))
-      .orderBy(cachedCandles.timestamp)
-      .all() as (typeof cachedCandles.$inferSelect)[];
-
-    if (rows.length < VEC_N * 2) continue;
-
-    const lows   = rows.map(r => r.low);
-    const vector = computeVectorArr(lows);
-
-    let lastSignalBar = -COOLDOWN;
-
-    for (let i = VEC_N; i < rows.length - 1; i++) {
-      const c    = rows[i];
-      const lb   = vector[i];
-      const prev = vector[i - 1];
-      if (!lb || !prev || lb <= 0) continue;
-
-      const rising   = lb >= prev;
-      const falling  = lb <= prev;
-      const isLong  = c.close > lb && rising;
-      const isShort = c.close < lb && falling;
-      if (!isLong && !isShort) continue;
-      if (i - lastSignalBar < COOLDOWN) continue;
-
-      // RTH filter: Mon–Fri 9:30 AM–4:00 PM ET (DST-safe)
-      if (!isRTHsec(c.timestamp)) continue;
-
-      lastSignalBar = i;
-
-      const tp1 = isLong ? c.close + TP1 : c.close - TP1;
-      const tp2 = isLong ? c.close + TP2 : c.close - TP2;
-      const sl  = isLong ? c.close - SL  : c.close + SL;
-
-      const outcome = walkForwardServer(rows, i, tp1, tp2, sl, isLong);
-      if (outcome === "open") { skipped++; continue; } // skip incomplete — no outcome yet
-
-      try {
-        db.insert(signalHistory).values({
-          symbol,
-          interval,
-          timestamp:   c.timestamp,
-          direction:   isLong ? "Long" : "Short",
-          riskLevel:   "risky", // no zone data server-side
-          signalType:  "confluence",
-          entry:       c.close,
-          tp1, tp2, sl,
-          outcome,
-          updatedAt:   new Date().toISOString(),
-        }).onConflictDoNothing().run();
-        inserted++;
-      } catch {
-        skipped++;
-      }
-    }
-  }
-
-  return { inserted, skipped };
-}
+// ── backfillSignals DELETED (SIGNAL-INTEGRITY A1, 2026-07-14) ────────────────────────────────
+// It regenerated signal_history rows with the RETIRED close-vs-vector model (cooldown 10,
+// fixed 8/16/5 exits, signalType "confluence", NULL label, no 15:15 gate) — reachable from
+// three UI actions via POST /api/learn/backfill. The route is now a write-nothing stub;
+// shared/fact-engine.ts is the ONLY legitimate signal source. computeVectorArr and
+// walkForwardServer went with it (they existed only for the backfill).

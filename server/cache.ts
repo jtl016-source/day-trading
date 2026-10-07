@@ -7,7 +7,10 @@ const TTL = {
   continuous: 5,       // cached-continuous — short TTL so new bars appear within 5s
 } as const;
 
-const store = new NodeCache({ checkperiod: 30, useClones: false });
+// checkperiod 30 → 5 (2026-09-18): cached-continuous now stores SERIALIZED bodies (up to ~9 MB
+// each, 5 s TTL); node-cache only frees an expired key on access or on its check tick, so a 30 s
+// tick kept six TTLs' worth of dead multi-MB strings resident on a memory-starved machine.
+const store = new NodeCache({ checkperiod: 5, useClones: false });
 
 export function cacheGet<T>(key: string): T | undefined {
   return store.get<T>(key);

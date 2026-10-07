@@ -7,11 +7,11 @@
 import { db } from "./db";
 import { discordMessages, discordSignals } from "@shared/schema";
 import { eq, desc } from "drizzle-orm";
-import { broadcast, broadcastOrderCommand } from "./live-bars";
+import { broadcast } from "./live-bars";
 import { parseDiscordMessage, updateContext, type ParsedSignal } from "./discord-parser";
 import { learner } from "./discord-learner";
 import { parseZonesFromMessage } from "./discord-zone-parser";
-import { tradeSettings, pushTokens, sendPushNotifications, resolveExits } from "./trade-state";
+import { tradeSettings, pushTokens, sendPushNotifications } from "./trade-state";
 
 export interface ChannelConfig {
   id:               string;
@@ -106,73 +106,10 @@ function saveZones(messageId: string, channelName: string, authorName: string, p
   }
 }
 
-async function checkOpenTrade(symbol: string): Promise<boolean> {
-  try {
-    const rows = db.$client.prepare(
-      `SELECT id FROM discord_signals WHERE symbol=? AND executed=1 AND outcome IS NULL LIMIT 1`
-    ).all(symbol) as any[];
-    return rows.length > 0;
-  } catch { return false; }
-}
-
-// ── Auto-execution ────────────────────────────────────────────────────────
-
-async function maybeExecute(sig: ParsedSignal, signalId: number) {
-  if (!tradeSettings.enabled || sig.historical) return;
-  if (!sig.sl && !sig.tp1) return;
-
-  // Direction filter
-  if (tradeSettings.direction !== "both") {
-    const sigDir = sig.direction.toLowerCase();
-    if (tradeSettings.direction === "long" && sigDir !== "long" && sigDir !== "buy") return;
-    if (tradeSettings.direction === "short" && sigDir !== "short" && sigDir !== "sell") return;
-  }
-
-  // Risk level filter (Discord signals use sig.confidence as riskLevel)
-  if (tradeSettings.riskLevels.length > 0 && !tradeSettings.riskLevels.includes(sig.confidence)) return;
-
-  // Already in a trade on this symbol
-  if (await checkOpenTrade(sig.symbol)) {
-    console.log(`[discord-parser] veto — already in open trade on ${sig.symbol}`);
-    return;
-  }
-
-  const veto = learner.shouldExecute(sig);
-  if (!veto.execute) {
-    console.log(`[discord-parser] veto — ${veto.reason}`);
-    return;
-  }
-
-  const entry  = sig.entryPrice ?? 0;
-  const isLong = sig.direction.toLowerCase() === "long" || sig.direction.toLowerCase() === "buy";
-  const tier: "safe" | "risky" = sig.confidence === "high" ? "safe" : "risky";
-  // Apply exit strategy — overrides signal's own TP/SL when set to anything other than "current"
-  const exits  = (tradeSettings.exitStrategy && tradeSettings.exitStrategy !== "current")
-    ? resolveExits(tradeSettings.exitStrategy, tier, isLong, entry)
-    : { tp1: sig.tp1 ?? (isLong ? entry + 10 : entry - 10), tp2: sig.tp2 ?? (isLong ? entry + 20 : entry - 20), sl: sig.sl ?? (isLong ? entry - 5 : entry + 5) };
-
-  const sent = broadcastOrderCommand({
-    type:            "order_command",
-    symbol:          sig.symbol,
-    direction:       sig.direction,
-    interval:        "discord",
-    riskLevel:       sig.confidence,
-    price:           entry,
-    tp1:             exits.tp1,
-    tp2:             exits.tp2,
-    sl:              exits.sl,
-    contracts:       tradeSettings.contracts,
-    tp1Only:         tradeSettings.tp1Only,
-    useTrailer:      false,
-    trailingOffset:  2,
-    discordSignalId: signalId,
-  });
-
-  if (sent) {
-    db.$client.prepare(`UPDATE discord_signals SET executed=1 WHERE id=?`).run(signalId);
-    console.log(`[discord-parser] executed ${sig.direction} ${sig.symbol} from @${sig.author} (${sig.confidence})`);
-  }
-}
+// ── Auto-execution DELETED (SIGNAL-INTEGRITY A4, 2026-07-14) ──────────────
+// maybeExecute + checkOpenTrade are GONE: third-party Discord-PARSED signals could
+// auto-place real orders (broadcastOrderCommand) and mark themselves executed. Discord
+// signals are DISPLAY-ONLY now — the fact engine is the only thing that trades.
 
 // ── Message processing ────────────────────────────────────────────────────
 
@@ -230,25 +167,25 @@ async function processMessage(
   // Parse + persist zone levels from every message (professional Discord zones)
   saveZones(m.id, ch.name, (m.author?.username ?? "unknown"), postedAt, content);
 
-  // Persist signal + maybe execute
+  // Persist signal — DISPLAY-ONLY (A4: auto-execution deleted; nothing places orders here).
   if (sig) {
     const sigId = await saveSignal(m.id, sig);
     if (sigId !== null && !historical) {
       broadcast({ type: "discord_signal", signal: { ...sig, id: sigId } });
-      // Push notification to mobile app even when closed
-      if (pushTokens.size > 0) {
+      // Push notification — gated behind an explicit opt-in (DEFAULT OFF) and clearly tagged
+      // as a third-party DISCORD-parsed signal so it can never masquerade as an engine signal.
+      if (tradeSettings.discordPushEnabled && pushTokens.size > 0) {
         const dir = sig.direction.toUpperCase();
         sendPushNotifications({
-          title: `${dir} ${sig.symbol} [${sig.confidence}]`,
+          title: `DISCORD (3rd-party) ${dir} ${sig.symbol} [${sig.confidence}]`,
           body: [
             sig.entryPrice ? `Entry ${sig.entryPrice}` : null,
             sig.tp1 ? `TP ${sig.tp1}` : null,
             sig.sl ? `SL ${sig.sl}` : null,
           ].filter(Boolean).join(' · '),
-          data: { signalId: sigId, symbol: sig.symbol, direction: sig.direction },
+          data: { signalId: sigId, symbol: sig.symbol, direction: sig.direction, source: "discord" },
         }).catch(() => {});
       }
-      await maybeExecute(sig, sigId);
     }
   }
 

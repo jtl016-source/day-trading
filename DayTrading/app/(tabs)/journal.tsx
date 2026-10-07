@@ -206,8 +206,9 @@ export default function JournalScreen() {
         {stats && (
           <Animated.View entering={FadeIn.duration(300)} style={s.statGrid}>
             <StatCell label="TOTAL"    value={String(stats.total)} />
-            <StatCell label="WIN RATE" value={stats.closed ? `${Math.round(stats.winRate)}%` : '—'}
-              color={stats.winRate >= 50 ? Trading.long : Trading.short} />
+            {/* Server returns winRate as a FRACTION (0.75) — ×100 for display (was rendering "0%"). */}
+            <StatCell label="WIN RATE" value={stats.closed ? `${Math.round(stats.winRate * 100)}%` : '—'}
+              color={stats.winRate >= 0.5 ? Trading.long : Trading.short} />
             <StatCell label="NET $"    value={`${stats.totalPnlDollars >= 0 ? '+' : ''}$${Math.abs(stats.totalPnlDollars).toFixed(0)}`}
               color={pnlColor(stats.totalPnlDollars)} />
             <StatCell label="CLOSED"  value={String(stats.closed)} />

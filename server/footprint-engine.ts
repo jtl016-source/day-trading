@@ -1,7 +1,8 @@
 // FOOTPRINT-STRATEGY: created by footprint integration — do not edit manually
 import { db } from "./db";
-import { signalHistory, footprintCandles } from "@shared/schema";
-import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
+import { footprintCandles } from "@shared/schema";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { footprintSideStats } from "@shared/footprint-side";
 
 // ── Broadcast reference (injected by index.ts) ─────────────────────────────
 let _broadcast: ((msg: object) => void) | null = null;
@@ -60,6 +61,11 @@ export interface UnfinishedAuction {
   atExtreme: "high" | "low";
 }
 
+// RULE 7 (2026-07-13): footprint = imbalance ZONES only. The candle-level delta field and the
+// whole delta-based reading (delta-agreement gate, divergence veto, trapped-traders,
+// exit adjustments) are DELETED — no delta logic may exist in any signal path. Consumers that
+// display a net delta compute totalAskVol − totalBidVol locally. Old DB rows containing the
+// removed field still parse (the extra JSON key is ignored).
 export interface FootprintCandle {
   symbol:           string;
   interval:         string;
@@ -67,7 +73,6 @@ export interface FootprintCandle {
   levels:           PriceLevelData[];
   totalBidVol:      number;
   totalAskVol:      number;
-  candleDelta:      number;
   poc:              number;
   vah:              number;
   val:              number;
@@ -77,30 +82,28 @@ export interface FootprintCandle {
   imbalances:       ImbalanceCluster[];
   unfinishedAuction: UnfinishedAuction | null;
   complete:         boolean;
+  /** 2026-10-06: a qualifying candle (≥4 levels, ≥50 contracts) whose bid OR ask side is exactly
+   *  zero — the relay's aggressor side is dead (shared/footprint-side.ts). Its imbalance zones are
+   *  feed artifacts, not order flow. Optional: rows stored before 2026-10-06 lack it. */
+  oneSided?:        boolean;
 }
 
-export interface FootprintExitAdjustments {
-  usePocStop:      boolean;
-  pocStopPrice:    number | null;
-  tp1Override:     number | null;
-  tp2Extension:    number | null;
-  tightenTrailing: boolean;
-}
-
-export interface FootprintReading {
-  confirmed:         boolean;
-  partial:           boolean;
-  vetoed:            boolean;
-  vetoReason:        string | null;
-  deltaAgrees:       boolean;
-  divergence:        boolean;
-  absorption:        AbsorptionEvent | null;
-  stackedImbalance:  ImbalanceCluster | null;
-  trappedTraders:    "long" | "short" | null;
-  unfinishedAuction: UnfinishedAuction | null;
-  poc:               number;
-  candleDelta:       number;
-  exitAdjustments:   FootprintExitAdjustments;
+// ── One-sided canary (2026-10-06) ──────────────────────────────────────────
+// From 2026-07-08 to 10-06 every complete 5m candle arrived with askVol = 0 (the LiveBarRelay
+// build shipped in July reflection-guessed the Tick aggressor method and every trade fell to
+// the bid side); the zero-vs-nonzero rule below then made EVERY level a "sell" imbalance and
+// 37/37 engine footprint fires went Short. Nothing logged. This warns (30-min rate limit per
+// key) the moment a complete candle shows the signature; scripts/integrity-check.ts W3 puts
+// the same test in the 8:30 digest. Data semantics are deliberately unchanged here.
+const oneSidedWarnedAt = new Map<string, number>();
+function noteSideCompleteness(c: FootprintCandle): void {
+  if (!c.oneSided) return;
+  const key = storeKey(c.symbol, c.interval);
+  const now = Date.now();
+  if (now - (oneSidedWarnedAt.get(key) ?? 0) < 30 * 60_000) return;
+  oneSidedWarnedAt.set(key, now);
+  const s = footprintSideStats(c.levels);
+  console.warn(`[footprint] ONE-SIDED complete ${c.interval} candle ${key} @${c.time}: bid=${s.bidVol} ask=${s.askVol} over ${s.levels} levels — the relay's aggressor side is dead (reinstall the fixed LiveBarRelay.jar; docs/footprint-feed-fix-2026-10-06.md). Its imbalance zones are feed artifacts, not order flow.`);
 }
 
 // ── In-memory candle store — last 50 per symbol+interval ──────────────────
@@ -231,6 +234,7 @@ class FootprintCandleBuilder {
     if (this.currentBucket !== 0 && bucket !== this.currentBucket) {
       // Bucket rolled — finalize previous candle
       const closed = this.closeCandle();
+      noteSideCompleteness(closed); // 2026-10-06 canary — log only, never alters the candle
       pushCandle(this.symbol, this.interval, closed);
       this.onCandleComplete(closed);
       this.levelMap.clear();
@@ -278,8 +282,7 @@ class FootprintCandleBuilder {
       return { price, bidVol, askVol, delta, imbalance };
     });
 
-    const candleDelta = totalAsk - totalBid;
-    const totalVol    = totalBid + totalAsk;
+    const totalVol = totalBid + totalAsk;
 
     // ── VAH / VAL (70% value area from POC outward) ──────────────────────
     let vahIndex = sortedPrices.indexOf(pocPrice);
@@ -409,7 +412,6 @@ class FootprintCandleBuilder {
       levels,
       totalBidVol:       totalBid,
       totalAskVol:       totalAsk,
-      candleDelta,
       poc:               pocPrice,
       vah,
       val,
@@ -419,6 +421,7 @@ class FootprintCandleBuilder {
       imbalances,
       unfinishedAuction,
       complete:          true,
+      oneSided:          footprintSideStats(levels).oneSided, // 2026-10-06: feed-defect flag (see noteSideCompleteness)
     };
   }
 }
@@ -455,210 +458,9 @@ export function addBar(
   }
 }
 
-// ── analyzeFootprint ───────────────────────────────────────────────────────
-
-const TICK_SIZE = 0.25; // ES/MES tick size
-
-export function analyzeFootprint(
-  candle: FootprintCandle,
-  direction: "Long" | "Short",
-  priorCandles: FootprintCandle[],
-  zonePrice: number,
-): FootprintReading {
-  const isLong = direction === "Long";
-
-  // ── CONDITION 1: Delta agreement ────────────────────────────────────────
-  const deltaAgrees = isLong ? candle.candleDelta >= 0 : candle.candleDelta <= 0;
-
-  // ── CONDITION 2: Divergence check ───────────────────────────────────────
-  let divergence = false;
-  if (priorCandles.length >= 3) {
-    const prior3 = priorCandles.slice(-3);
-    if (isLong && candle.high >= Math.max(...prior3.map(c => c.high))) {
-      // Price at or above prior highs — check if delta is lower than all 3
-      divergence = prior3.every(pc => candle.candleDelta < pc.candleDelta);
-    } else if (!isLong && candle.low <= Math.min(...prior3.map(c => c.low))) {
-      // Price at or below prior lows — check if delta is higher (less negative) than all 3
-      divergence = prior3.every(pc => candle.candleDelta > pc.candleDelta);
-    }
-  }
-
-  if (divergence) {
-    return {
-      confirmed: false, partial: false, vetoed: true,
-      vetoReason: "Delta divergence on signal candle — buyer/seller exhaustion detected",
-      deltaAgrees, divergence,
-      absorption: null, stackedImbalance: null,
-      trappedTraders: null, unfinishedAuction: null,
-      poc: candle.poc, candleDelta: candle.candleDelta,
-      exitAdjustments: { usePocStop: false, pocStopPrice: null, tp1Override: null, tp2Extension: null, tightenTrailing: false },
-    };
-  }
-
-  if (!deltaAgrees) {
-    return {
-      confirmed: false, partial: false, vetoed: false, vetoReason: null,
-      deltaAgrees, divergence: false,
-      absorption: null, stackedImbalance: null,
-      trappedTraders: null, unfinishedAuction: null,
-      poc: candle.poc, candleDelta: candle.candleDelta,
-      exitAdjustments: buildExitAdjustments(candle, direction, null, null, null, zonePrice),
-    };
-  }
-
-  // ── CONDITION 3: Bonus signals ───────────────────────────────────────────
-  const ticksFromZone = 2 * TICK_SIZE;
-
-  // a. Absorption at zone boundary
-  let absorptionBonus: AbsorptionEvent | null = null;
-  if (candle.absorption) {
-    const zoneDist = Math.abs(candle.absorption.price - zonePrice);
-    const sideMatch = isLong ? candle.absorption.side === "buy" : candle.absorption.side === "sell";
-    if (zoneDist <= ticksFromZone && sideMatch) {
-      absorptionBonus = candle.absorption;
-    }
-  }
-
-  // b. Stacked imbalances in signal direction
-  const stackedImbalance = candle.imbalances.find(
-    cl => cl.stacked && cl.direction === (isLong ? "buy" : "sell")
-  ) ?? null;
-
-  // c. Trapped traders
-  let trappedTraders: "long" | "short" | null = null;
-  if (candle.levels.length > 0) {
-    const avgBid = candle.totalBidVol / candle.levels.length;
-    const avgAsk = candle.totalAskVol / candle.levels.length;
-    if (isLong) {
-      // Sellers trapped: heavy bid vol at the LOW that price bounced from
-      const botLevel = candle.levels[0];
-      if (botLevel && botLevel.bidVol >= avgBid * 3 && candle.candleDelta > 0) {
-        trappedTraders = "short"; // trapped shorts at the low
-      }
-    } else {
-      // Buyers trapped: heavy ask vol at the HIGH that price rejected from
-      const topLevel = candle.levels[candle.levels.length - 1];
-      if (topLevel && topLevel.askVol >= avgAsk * 3 && candle.candleDelta < 0) {
-        trappedTraders = "long"; // trapped longs at the high
-      }
-    }
-  }
-
-  // d. Unfinished auction (current candle or prior 3)
-  const allCandles = [...priorCandles.slice(-3), candle];
-  const auctionSide = isLong ? "buy" : "sell";
-  let foundAuction: UnfinishedAuction | null = null;
-  for (const c of allCandles) {
-    if (c.unfinishedAuction && c.unfinishedAuction.side === auctionSide) {
-      foundAuction = c.unfinishedAuction;
-    }
-  }
-
-  const hasBonus = absorptionBonus !== null || stackedImbalance !== null ||
-                   trappedTraders !== null || foundAuction !== null;
-
-  const confirmed = hasBonus;
-  const partial   = !hasBonus;
-
-  const exitAdj = buildExitAdjustments(candle, direction, stackedImbalance, foundAuction, absorptionBonus, zonePrice);
-
-  return {
-    confirmed, partial, vetoed: false, vetoReason: null,
-    deltaAgrees, divergence: false,
-    absorption: absorptionBonus,
-    stackedImbalance,
-    trappedTraders,
-    unfinishedAuction: foundAuction,
-    poc: candle.poc,
-    candleDelta: candle.candleDelta,
-    exitAdjustments: exitAdj,
-  };
-}
-
-function buildExitAdjustments(
-  candle: FootprintCandle,
-  direction: "Long" | "Short",
-  stackedImbalan: ImbalanceCluster | null,
-  auction: UnfinishedAuction | null,
-  _absorption: AbsorptionEvent | null,
-  zonePrice: number,
-): FootprintExitAdjustments {
-  const isLong     = direction === "Long";
-  const candleRange = Math.abs(candle.high - candle.low);
-
-  // POC stop
-  const pocDist    = Math.abs(candle.poc - zonePrice);
-  const usePocStop = candleRange > 0 && (pocDist / candleRange) <= 0.60;
-
-  // TP1 override from unfinished auction
-  let tp1Override: number | null = null;
-  if (auction) {
-    if (isLong && auction.atExtreme === "high" && auction.price > zonePrice) {
-      tp1Override = auction.price;
-    } else if (!isLong && auction.atExtreme === "low" && auction.price < zonePrice) {
-      tp1Override = auction.price;
-    }
-  }
-
-  // TP2 extension from stacked imbalances
-  const tp2Extension = stackedImbalan?.stacked ? 0.20 : null;
-
-  return {
-    usePocStop,
-    pocStopPrice: usePocStop ? candle.poc : null,
-    tp1Override,
-    tp2Extension,
-    tightenTrailing: false,
-  };
-}
-
-// ── Mid-trade divergence monitoring ───────────────────────────────────────
-
-export function checkMidTradeDivergence(symbol: string, _currentPrice: number): void {
-  // Only check every 60s to avoid hammering the DB on every tick
-  const now = Date.now();
-  const lastCheck = _lastDivCheck.get(symbol) ?? 0;
-  if (now - lastCheck < 60_000) return;
-  _lastDivCheck.set(symbol, now);
-
-  try {
-    const openSignals = db
-      .select()
-      .from(signalHistory)
-      .where(
-        and(
-          eq(signalHistory.symbol, symbol.toUpperCase()),
-          or(isNull(signalHistory.outcome), eq(signalHistory.outcome, "open")),
-        )
-      )
-      .all() as (typeof signalHistory.$inferSelect)[];
-
-    for (const sig of openSignals) {
-      const interval = sig.interval ?? "5m";
-      const candle   = getLatestCandle(symbol, interval);
-      if (!candle || !candle.complete) continue;
-      const priors = getPriorCandles(symbol, interval, 3);
-      if (priors.length < 3) continue;
-
-      const isLong   = sig.direction === "Long";
-      const avgPrior = priors.reduce((s, c) => s + c.candleDelta, 0) / priors.length;
-
-      const midDivergence = isLong
-        ? candle.candleDelta < avgPrior && candle.high > candle.low // bearish delta on long
-        : candle.candleDelta > avgPrior && candle.high > candle.low; // bullish delta on short
-
-      if (midDivergence && _broadcast) {
-        _broadcast({
-          type:     "footprint_alert",
-          symbol,
-          signalId: sig.id,
-          alert:    "mid_trade_divergence",
-          pocPrice: candle.poc,
-          message:  `Delta divergence detected mid-trade — tighten trailing stop to POC (${candle.poc.toFixed(2)})`,
-        });
-      }
-    }
-  } catch { /* non-fatal — DB may not have signal_history yet */ }
-}
-
-const _lastDivCheck = new Map<string, number>();
+// ── (analyzeFootprint / buildExitAdjustments / checkMidTradeDivergence DELETED 2026-07-13) ──
+// RULE 7: footprint contributes imbalance ZONES only — extracted above in closeCandle() and
+// consumed by the shared fact engine as corroborating support/resistance facts. The delta-based
+// reading (delta-agreement gate, divergence veto, trapped traders, POC-stop/TP exit adjustments) and
+// the delta mid-trade divergence alert (which advised tightening the now-deleted trailer) are
+// signal-path delta logic and are permanently removed.

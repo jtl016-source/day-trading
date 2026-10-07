@@ -2,8 +2,10 @@ import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GraduationCap, RefreshCw, X as XIcon } from "lucide-react";
 import { CandlestickChart, type CandleBar, type ZoneBand, type ChartHandle } from "./CandlestickChart";
-import { type FrozenImbalanceZone, buildCandleFootprints, type FootprintCandle, analyzeFootprint, buildProxyFootprintCandle } from "@/lib/footprint-analysis";
+import { type FrozenImbalanceZone, buildCandleFootprints, type FootprintCandle } from "@/lib/footprint-analysis";
 import { buildFpImbalanceBands, type FpZoneBand } from "./FootprintLadder";
+import { isSessionLegalSignal } from "@shared/signal-rules";
+import { isRTH, isMarketBreak } from "@shared/firing/session";
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const MW = {
@@ -41,6 +43,7 @@ interface SignalEntry {
   zonesLoaded?: boolean;
   footprintReading?: string; // FOOTPRINT-UI: JSON FootprintReading
   confidence?: number; // 0–100 confidence score
+  label?: string; // FACT-ENGINE: composite fact-list label (replaces the tier badge)
 }
 
 interface Annotation {
@@ -64,6 +67,7 @@ export interface ExternalSignal {
   footprintReading?: string; // FOOTPRINT-UI: JSON-serialized FootprintReading
   confidence?: number; // 0–100 confidence score
   interval?: string; // FIX: interval at signal creation — used to filter panel by current interval
+  label?: string; // FACT-ENGINE: composite fact-list label (replaces the tier badge)
 }
 
 export interface SignalsPanelProps {
@@ -79,7 +83,7 @@ export interface SignalsPanelProps {
   /** Full candle dataset from the parent chart — used for preview lookups so any signal can be previewed. */
   allCandles?: CandleBar[];
   /** FOOTPRINT-UI: mid-trade divergence alerts keyed by signal id (signalId → alert data) */
-  footprintAlerts?: Record<number, { pocPrice: number; message: string }>; // FOOTPRINT-UI:
+  // (footprintAlerts prop DELETED 2026-07-13 — dead with the server's delta mid-trade alert.)
   /** Frozen imbalance zones from the parent (prior-session imbalance bands for preview chart overlay). */
   frozenImbalances?: FrozenImbalanceZone[];
   /** Called when user clicks the Refresh Signals button — parent refetches candle data */
@@ -89,24 +93,8 @@ export interface SignalsPanelProps {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-function isRTH(ts: number): boolean {
-  const d = new Date(ts * 1000);
-  if (d.getUTCDay() === 0 || d.getUTCDay() === 6) return false;
-  const m = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return m >= 13 * 60 + 30 && m < 21 * 60; // 9:30 AM – 5:00 PM ET (EDT)
-}
-
-/** Returns true if the timestamp falls in the CME ES/MES settlement break (4:30pm–6:00pm ET). */
-function isMarketBreak(ts: number): boolean {
-  const d = new Date(ts * 1000);
-  if (d.getUTCDay() === 0 || d.getUTCDay() === 6) return false;
-  const et = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false,
-  }).format(d);
-  const [h, m] = et.split(":").map(Number);
-  const etMins = h * 60 + m;
-  return etMins >= 16 * 60 + 30 && etMins < 18 * 60;
-}
+// (Local isRTH/isMarketBreak DELETED 2026-07-13 — D19: the local isRTH was a hardcoded
+//  21:00-UTC window (wrong under EST). Both now come from shared/firing/session, DST-safe.)
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString("en-US", {
@@ -183,18 +171,6 @@ function aggToInterval(candles: CandleBar[], intervalSec: number): CandleBar[] {
 }
 
 
-// Fixed-point exits — Monte Carlo calibrated on real MES 5m data
-const TP_FIXED_1    = 10.0;  // 10 pts (40 ticks)
-const TP_FIXED_2    = 20.0;  // 20 pts (80 ticks)
-const SL_FIXED      = 5.0;   // 5 pts  (20 ticks)
-const MILK_TOL      = 2.0;   // zone proximity tolerance in pts
-const COOLDOWN_BARS = 10;
-const ETH_COOLDOWN  = 20;
-// Legacy ATR constants kept for reference only
-const TP_ATR_MULT   = 1.0;
-const SL_ATR_MULT   = 0.5;
-const ATR_PERIOD    = 14;
-
 interface RawSignal {
   time: number; open: number; high: number; low: number; direction: "Long" | "Short";
   riskLevel: RiskLevel; price: number;
@@ -202,161 +178,16 @@ interface RawSignal {
   milkOk: boolean; secondaryVecOk: boolean;
   zonesLoaded?: boolean;
   /** Pre-computed outcome from market.tsx (only set when externalSignals provided) */
-  preOutcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
+  preOutcome?: "win_tp1" | "win_tp2" | "loss" | "open";
   footprintReading?: string; // FOOTPRINT-UI: JSON FootprintReading
   confidence?: number; // 0–100 confidence score
+  label?: string; // FACT-ENGINE: composite fact-list label (replaces the tier badge)
 }
 
-function isBullZone(z: ZoneBand): boolean {
-  if (z.label) {
-    const l = z.label.toLowerCase();
-    if (/sell|resist|bear|supply|absorb\s*buy|cap\s*session|ceiling|non.fair|iv.wall|iv.overflow|pivot(?!.*floor)|gex.wall.short|wall.short|short.median/i.test(l)) return false;
-    if (/buy|demand|support|bull|absorb\s*sell|floor|gex.wall.long|wall.long|long.median|spy.floor|ovn.spy.floor/i.test(l)) return true;
-  }
-  const c = z.color.toLowerCase().trim();
-  if (c === "#22c55e" || c === "#3b82f6" || c === "#14b8a6") return true;
-  const m = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  if (m) { const r = +m[1], g = +m[2], b = +m[3]; return g > r || (b > r && b > g); }
-  return false;
-}
-
-function computeSignals(candles: CandleBar[], secondaryCandles: CandleBar[][] = [], zones: ZoneBand[] = []): RawSignal[] {
-  if (!candles.length) return [];
-  const sorted     = [...candles].sort((a, b) => a.time - b.time);
-  const chartTimes = sorted.map(c => c.time);
-  const vecArr     = computeVectorLine(sorted);
-  const vecMap     = new Map(vecArr.map(v => [v.time, v.value]));
-
-  const secMaps = secondaryCandles.filter(sc => sc.length > 0).map(sc => {
-    const sv = computeVectorLine([...sc].sort((a, b) => a.time - b.time));
-    return new Map(forwardFillVector(sv, chartTimes).map(v => [v.time, v.value]));
-  });
-
-  // Pre-build proxy footprint for all bars
-  const fpByTime = new Map<number, FootprintCandle>();
-  for (const c of sorted) fpByTime.set(c.time, buildProxyFootprintCandle(c));
-
-  const raw: RawSignal[] = [];
-  let lastLongBar = -COOLDOWN_BARS, lastLongEthBar = -ETH_COOLDOWN;
-  let lastShortBar = -COOLDOWN_BARS, lastShortEthBar = -ETH_COOLDOWN;
-
-  for (let i = 0; i < sorted.length; i++) {
-    const c   = sorted[i];
-    const lb  = vecMap.get(c.time);
-    if (lb == null || isMarketBreak(c.time)) continue;
-
-    const rthFlag      = c.rth ?? isRTH(c.time);
-    const utcH         = (c.time / 3600 | 0) % 24;
-    const minsUtc      = utcH * 60 + ((c.time / 60 | 0) % 60);
-    const isRthForMilk = rthFlag && minsUtc >= 13 * 60 + 30 && minsUtc < 20 * 60 + 30;
-
-    const secLongOk  = secMaps.some(m => { const v = m.get(c.time); return v != null && c.close > v; });
-    const secShortOk = secMaps.some(m => { const v = m.get(c.time); return v != null && c.close < v; });
-
-    let milkBullOk = false, milkBearOk = false;
-    let milkPtsL = 0, milkPtsS = 0;
-    if (isRthForMilk) {
-      for (const z of zones) {
-        // Only dated zones (fromTime > 0) count for milk confirmation
-        if (!z.fromTime || c.time < z.fromTime || (z.toTime != null && c.time > z.toTime)) continue;
-        const bull = isBullZone(z);
-        if (bull) {
-          if (c.low <= z.topPrice + 0.5) {
-            const below = z.bottomPrice - c.close;
-            const pts = below <= 0.5 ? 3 : below <= 1.5 ? 1 : 0;
-            if (pts > milkPtsL) { milkPtsL = pts; if (pts > 0) milkBullOk = true; }
-          }
-        } else {
-          if (c.high >= z.bottomPrice - 0.5) {
-            const above = c.close - z.topPrice;
-            const pts = above <= 0.5 ? 3 : above <= 1.5 ? 1 : 0;
-            if (pts > milkPtsS) { milkPtsS = pts; if (pts > 0) milkBearOk = true; }
-          }
-        }
-      }
-    }
-
-    const fpCandle = fpByTime.get(c.time)!;
-    const priorFp  = sorted.slice(Math.max(0, i - 4), i).map(b => fpByTime.get(b.time)!);
-
-    const prevBarLb  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
-    const prevBarLb2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
-
-    // ── Long ──────────────────────────────────────────────────────────────
-    if (c.close > lb) {
-      const fpR = analyzeFootprint(fpCandle, "Long", priorFp, c.close);
-      if (!fpR?.vetoed) {
-        const sideEntry   = prevBarLb != null && sorted[i - 1].close <= prevBarLb && c.close > lb;
-        const tabletopTest = prevBarLb != null && prevBarLb2 != null
-          && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
-          && c.close > lb && c.close >= c.open;
-        const vecTestedL = sideEntry || tabletopTest;
-
-        const fpFires = fpR?.confirmed || fpR?.partial;
-        let fpStrong  = false;
-        if (fpFires) {
-          if (fpCandle.imbalances.some(cl => cl.direction === "buy"  && cl.levelCount >= 2)) fpStrong = true;
-          if (!fpStrong && priorFp.length > 0) {
-            const avg = priorFp.reduce((s, p) => s + Math.abs(p.candleDelta), 0) / priorFp.length;
-            if (avg > 0 && Math.abs(fpCandle.candleDelta) >= 2 * avg) fpStrong = true;
-          }
-        }
-        // FIX 4: proxy data cannot be "strong" — cap at weak (2pts max)
-        if (fpR?.isProxyData) fpStrong = false;
-        const totalPts = (fpFires ? (fpStrong ? 4 : 2) : 0) + milkPtsL + (vecTestedL ? 2 : 0);
-        // SINGLE-TIER: only safe-quality setups (≥4 pts) fire; every signal is labeled "safe".
-        // Weaker setups (the old risky/riskiest) are no longer signals — no categories.
-        if (totalPts >= 4) {
-          const level: RiskLevel = "safe";
-          const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-          if (i - (rthFlag ? lastLongBar : lastLongEthBar) >= cd) {
-            if (rthFlag) lastLongBar = i; else lastLongEthBar = i;
-            raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Long", riskLevel: level, price: c.close,
-              tp1: c.close + TP_FIXED_1, tp2: c.close + TP_FIXED_2, sl: c.close - SL_FIXED,
-              milkOk: milkBullOk, secondaryVecOk: secLongOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
-          }
-        }
-      }
-    }
-
-    // ── Short ─────────────────────────────────────────────────────────────
-    if (c.close < lb) {
-      const fpR = analyzeFootprint(fpCandle, "Short", priorFp, c.close);
-      if (!fpR?.vetoed) {
-        const sideEntry    = prevBarLb != null && sorted[i - 1].close >= prevBarLb && c.close < lb;
-        const tabletopTest = prevBarLb != null && prevBarLb2 != null
-          && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
-          && c.close < lb && c.close <= c.open;
-        const vecTestedS = sideEntry || tabletopTest;
-
-        const fpFires = fpR?.confirmed || fpR?.partial;
-        let fpStrong  = false;
-        if (fpFires) {
-          if (fpCandle.imbalances.some(cl => cl.direction === "sell" && cl.levelCount >= 2)) fpStrong = true;
-          if (!fpStrong && priorFp.length > 0) {
-            const avg = priorFp.reduce((s, p) => s + Math.abs(p.candleDelta), 0) / priorFp.length;
-            if (avg > 0 && Math.abs(fpCandle.candleDelta) >= 2 * avg) fpStrong = true;
-          }
-        }
-        // FIX 4: proxy data cannot be "strong" — cap at weak (2pts max)
-        if (fpR?.isProxyData) fpStrong = false;
-        const totalPts = (fpFires ? (fpStrong ? 4 : 2) : 0) + milkPtsS + (vecTestedS ? 2 : 0);
-        // SINGLE-TIER: only safe-quality setups (≥4 pts) fire; every signal is labeled "safe".
-        if (totalPts >= 4) {
-          const level: RiskLevel = "safe";
-          const cd = rthFlag ? COOLDOWN_BARS : ETH_COOLDOWN;
-          if (i - (rthFlag ? lastShortBar : lastShortEthBar) >= cd) {
-            if (rthFlag) lastShortBar = i; else lastShortEthBar = i;
-            raw.push({ time: c.time, open: c.open, high: c.high, low: c.low, direction: "Short", riskLevel: level, price: c.close,
-              tp1: c.close - TP_FIXED_1, tp2: c.close - TP_FIXED_2, sl: c.close + SL_FIXED,
-              milkOk: milkBearOk, secondaryVecOk: secShortOk, zonesLoaded: zones.some(z => (z.fromTime ?? 0) > 0), footprintReading: fpR ? JSON.stringify(fpR) : undefined });
-          }
-        }
-      }
-    }
-  }
-  return raw;
-}
+// (computeSignals DELETED 2026-07-14 — SIGNAL-INTEGRITY D4: the /today standalone panel no
+//  longer recomputes its OWN engine pass over panel-fetched candles (a second signal set that
+//  could disagree with the terminal). Standalone mode now consumes GET /api/signals/history —
+//  the same single source of truth the terminal uses; the server's C2 rule filter covers it.)
 
 function computeOutcome(
   sig: { direction: "Long"|"Short"; price: number; tp1: number; tp2: number; sl: number; time: number },
@@ -454,12 +285,13 @@ const SYMBOLS   = ["MES", "ES", "SPY", "QQQ", "NQ", "MNQ"];
 const IVAL_SEC: Record<string, number> = { "1m": 60, "5m": 300, "15m": 900, "60m": 3600 };
 
 function defaultStartDate(): string {
-  // Default to today's date so the panel opens showing today's signals
-  return new Date().toISOString().split("T")[0];
+  // Default to TODAY'S ET CALENDAR DAY (D3) — the old toISOString() used the UTC calendar day,
+  // which after 8 PM ET is already "tomorrow" and opened the panel on an empty date.
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
 }
 
 // ── main component ─────────────────────────────────────────────────────────────
-export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = "5m", onClose, onViewOnChart, externalSignals, milkZones, allCandles, footprintAlerts, frozenImbalances, onRefreshSignals, defaultRiskLevel }: SignalsPanelProps) { // FOOTPRINT-UI:
+export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = "5m", onClose, onViewOnChart, externalSignals, milkZones, allCandles, frozenImbalances, onRefreshSignals, defaultRiskLevel }: SignalsPanelProps) { // FOOTPRINT-UI:
   const [sym,       setSym]       = useState(defaultSymbol);
   const [ival,      setIval]      = useState<IntervalKey>(defaultInterval);
   const [activeTab,   setActiveTab]   = useState<"signals" | "learned" | "montecarlo">("signals");
@@ -507,10 +339,15 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   // after the panel was first mounted.
   const toTs   = 9_999_999_999;
   const fromTs = useMemo(() => {
-    // Interpret startDate as a calendar day in ET and find midnight UTC for that day.
-    // new Date(date + "T00:00:00") = midnight local; subtract local UTC offset to get UTC midnight.
-    const d = new Date(startDate + "T00:00:00");
-    return Math.floor(d.getTime() / 1000); // UTC midnight of the selected date
+    // D3: interpret startDate as an ET calendar day and cut at ET MIDNIGHT (DST-safe). The old
+    // `new Date(date + "T00:00:00")` used the MACHINE's local midnight, shifting the window by
+    // the local-vs-ET offset and dropping/adding edge signals.
+    const [y, m, d] = startDate.split("-").map(Number);
+    const probe = Date.UTC(y, m - 1, d, 16, 0, 0); // ~noon ET — safely the same ET date
+    const tz = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", timeZoneName: "short" })
+      .formatToParts(new Date(probe)).find(p => p.type === "timeZoneName")?.value;
+    const offH = tz === "EST" ? 5 : 4;
+    return Date.UTC(y, m - 1, d, offH, 0, 0) / 1000; // ET midnight of the selected date
   }, [startDate]);
 
   // ── data fetching ───────────────────────────────────────────────────────────
@@ -561,12 +398,7 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
     return candles60m;
   }, [ival, base1m, base5m, candles15m, candles60m]);
 
-  const secondaryCandles = useMemo(() => {
-    if (ival === "1m")  return [base5m, candles15m, candles60m];
-    if (ival === "5m")  return [candles15m, candles60m];
-    if (ival === "15m") return [base5m, candles60m];
-    return [base5m, candles15m];
-  }, [ival, base5m, candles15m, candles60m]);
+  // (secondaryCandles memo DELETED 2026-07-14 — it fed only the retired standalone computeSignals.)
 
   const sortedPrimary = useMemo(() => [...primaryCandles].sort((a, b) => a.time - b.time), [primaryCandles]);
   // For exit-view outcome scanning: prefer parent allCandles (full historical range) over panel's fetched data
@@ -608,6 +440,28 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
   const embedded = externalSignals != null;
   const useExternal = embedded;
 
+  // ── SIGNAL-INTEGRITY D4: standalone mode consumes the persisted signal history ──
+  // The /today standalone panel used to run its OWN engine pass over panel-fetched candles —
+  // a second signal set that could disagree with the terminal. It now reads
+  // GET /api/signals/history (server-filtered by the C2 rule backstop), exactly like the
+  // terminal: ONE source of truth everywhere.
+  interface HistRow {
+    timestamp: number; direction: string; riskLevel: string | null; signalType: string | null;
+    entry: number; tp1: number; tp2: number; sl: number; outcome: string | null;
+    confirmations: string | null; footprintReading: string | null; label: string | null;
+  }
+  const { data: historyData } = useQuery<{ signals: HistRow[] }>({
+    queryKey: ["sp-signal-history", sym, ival],
+    queryFn: async () => {
+      const r = await fetch(`/api/signals/history/${encodeURIComponent(sym)}/${ival}`);
+      if (!r.ok) throw new Error("fetch failed");
+      return r.json();
+    },
+    enabled: !embedded,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+
   // Sync ival/sym with parent props when interval or symbol changes on the chart.
   // useState only uses the initial value — without this effect the panel shows the wrong
   // interval's signals after the user switches intervals on the chart.
@@ -638,10 +492,36 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
         zonesLoaded: s.zonesLoaded,
         footprintReading: s.footprintReading, // FOOTPRINT-UI:
         confidence: s.confidence,
+        label: s.label, // FACT-ENGINE: composite fact-list label
       }));
     }
-    return computeSignals(primaryCandles, secondaryCandles, milkZones ?? []);
-  }, [useExternal, externalSignals, openMap, primaryCandles, secondaryCandles, milkZones]);
+    // D4: standalone — persisted engine rows from /api/signals/history, never a local recompute.
+    // The shared rule validator is applied client-side too (defense in depth, mirrors useTerminalData).
+    const rows = Array.isArray(historyData?.signals) ? historyData!.signals : [];
+    return rows
+      .filter(r => r && Number.isFinite(r.entry) && isSessionLegalSignal(r.timestamp, ival, r.signalType))
+      .map((r): RawSignal => {
+        let conf: { milkOk?: boolean; secondaryVecOk?: boolean } | null = null;
+        try { conf = r.confirmations ? JSON.parse(r.confirmations) : null; } catch { conf = null; }
+        const pre = (r.outcome === "win_tp1" || r.outcome === "win_tp2" || r.outcome === "loss" || r.outcome === "open")
+          ? r.outcome : undefined;
+        return {
+          time: r.timestamp,
+          open: openMap.get(r.timestamp) ?? r.entry,
+          high: r.entry, low: r.entry, // OHL not persisted — entry stands in (display-only fields)
+          direction: r.direction.toLowerCase().startsWith("l") ? "Long" : "Short",
+          riskLevel: (r.riskLevel ?? "safe") as RiskLevel,
+          price: r.entry,
+          tp1: r.tp1, tp2: r.tp2, sl: r.sl,
+          milkOk: conf?.milkOk === true || /Zone\(/.test(r.label ?? ""),
+          secondaryVecOk: conf?.secondaryVecOk === true,
+          preOutcome: pre,
+          footprintReading: r.footprintReading ?? undefined,
+          label: r.label ?? undefined,
+        };
+      })
+      .sort((a, b) => a.time - b.time);
+  }, [useExternal, externalSignals, openMap, historyData, ival]);
 
   const signals = useMemo((): SignalEntry[] => {
     return rawSignals
@@ -688,7 +568,6 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
           const isLong = s.direction === "Long";
           if (s.preOutcome === "win_tp2")         { outcome = "Win";  tpHit = 2;    points = isLong ? +(s.tp2 - s.price).toFixed(2) : +(s.price - s.tp2).toFixed(2); }
           else if (s.preOutcome === "win_tp1")    { outcome = "Win";  tpHit = 1;    points = isLong ? +(s.tp1 - s.price).toFixed(2) : +(s.price - s.tp1).toFixed(2); }
-          else if (s.preOutcome === "win_trailer"){ outcome = "Win";  tpHit = 1;    points = isLong ? +(s.tp1 - s.price).toFixed(2) : +(s.price - s.tp1).toFixed(2); }
           else if (s.preOutcome === "loss")       { outcome = "Loss"; tpHit = null; points = isLong ? +(s.sl  - s.price).toFixed(2) : +(s.price - s.sl ).toFixed(2); }
           else                                    { outcome = "Open"; tpHit = null; points = null; }
         } else {
@@ -1028,8 +907,8 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
               onClick={async () => {
                 setLearnLoading(true);
                 try {
-                  // Backfill signals from all cached_candles across every interval first
-                  await fetch("/api/learn/backfill", { method: "POST" });
+                  // (POST /api/learn/backfill REMOVED 2026-07-14 — SIGNAL-INTEGRITY A1: it
+                  //  regenerated retired-model signals. LEARN runs over existing engine rows.)
                   const res = await fetch("/api/learn/run", { method: "POST" });
                   const data = await res.json();
                   setLearnLog(data);
@@ -1388,11 +1267,10 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
                       <td style={{ padding: "5px 8px", color: s.direction === "Long" ? "#26c87a" : "#ef5350", fontWeight: 700, fontSize: 10 }}>
                         <span>{s.direction === "Long" ? "▲ L" : "▼ S"}</span>
                       </td>
-                      {/* Risk + MZ badge */}
+                      {/* FACT-ENGINE: composite fact-list label (replaces the tier badge) */}
                       <td style={{ padding: "5px 8px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: rl + "18", color: rl }}>{s.riskLevel}</span>
-                          {s.milkOk && <span style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: "rgba(245,158,11,0.15)", color: "#f59e0b", fontWeight: 700 }}>MZ</span>}
+                        <div style={{ display: "flex", alignItems: "center", gap: 4, maxWidth: 240 }}>
+                          <span title={s.label ?? s.riskLevel} style={{ fontSize: 9, color: "#cbd5e1", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.label ?? s.riskLevel}</span>
                         </div>
                       </td>
                       {/* Entry */}
@@ -1464,7 +1342,6 @@ export default function SignalsPanel({ defaultSymbol = "MES", defaultInterval = 
               onViewOnChart={() => setPreviewSig(selectedSignal)}
               onClose={() => setSelKey(null)}
               candles={sortedPrimary}
-              footprintAlert={footprintAlerts?.[selectedSignal.id as number]} // FOOTPRINT-UI:
             />
           </div>
         )}
@@ -1852,7 +1729,6 @@ interface DetailProps {
   onViewOnChart: () => void;
   onClose: () => void;
   candles: CandleBar[];
-  footprintAlert?: { pocPrice: number; message: string }; // FOOTPRINT-UI:
 }
 
 const FEEDBACK_REASONS = [
@@ -1868,7 +1744,7 @@ const FEEDBACK_REASONS = [
   "Other",
 ] as const;
 
-function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, onSave, onViewOnChart, onClose, candles, footprintAlert }: DetailProps) { // FOOTPRINT-UI:
+function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, onSave, onViewOnChart, onClose, candles }: DetailProps) { // FOOTPRINT-UI:
   const isFpDegraded = false; // reclassifyReason removed
   const rlC = s.riskLevel === "safe" ? (isFpDegraded ? "rgba(38,200,122,0.65)" : "#26c87a") : s.riskLevel === "risky" ? "#f59e0b" : "#ef4444"; // FIX: 65% opacity for footprint-degraded SAFE
   const ocC = s.outcome === "Win" ? "#26c87a" : s.outcome === "Loss" ? "#ef5350" : MW.muted;
@@ -2001,42 +1877,10 @@ function SignalDetail({ signal: s, annotation, editMode, editNote, setEditNote, 
 
       <div style={{ height: 1, background: MW.border }} />
 
-      {/* FOOTPRINT-UI: Footprint order-flow section */}
-      {(() => { // FOOTPRINT-UI:
-        const fp = s.footprintReading ? (() => { try { return JSON.parse(s.footprintReading as string); } catch { return null; } })() : null; // FOOTPRINT-UI:
-        if (!fp) return null; // FOOTPRINT-UI: no footprint data yet — section hidden
-        const fpColor = fp.vetoed ? "#ef4444" : fp.confirmed ? "#26c87a" : fp.partial ? "#f59e0b" : MW.muted; // FOOTPRINT-UI:
-        const fpLabel = fp.vetoed ? `✗ Vetoed — ${fp.vetoReason ?? "delta divergence"}` // FOOTPRINT-UI:
-          : fp.confirmed ? "✓ Footprint confirmed" : "◐ Footprint partial — delta agrees, no bonus yet"; // FOOTPRINT-UI:
-        return ( // FOOTPRINT-UI:
-          <div> {/* FOOTPRINT-UI: */}
-            <div style={{ fontSize: 9, color: MW.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 7 }}>Footprint</div>
-            {/* mid-trade divergence amber banner */} {/* FOOTPRINT-UI: */}
-            {footprintAlert && ( // FOOTPRINT-UI:
-              <div style={{ marginBottom: 6, fontSize: 10, color: "#f59e0b", background: "rgba(245,158,11,0.08)", borderRadius: 4, padding: "5px 8px", border: "1px solid rgba(245,158,11,0.3)" }}> {/* FOOTPRINT-UI: */}
-                ⚠ Mid-trade divergence — tighten stop to POC ({footprintAlert.pocPrice.toFixed(2)}) {/* FOOTPRINT-UI: */}
-              </div> // FOOTPRINT-UI:
-            )} {/* FOOTPRINT-UI: */}
-            <div style={{ fontSize: 11, color: fpColor, marginBottom: 4 }}>{fpLabel}</div> {/* FOOTPRINT-UI: */}
-            <div style={{ display: "flex", gap: 12, marginBottom: 4 }}> {/* FOOTPRINT-UI: */}
-              <span style={{ fontSize: 10, color: MW.muted }}>Delta: <span style={{ color: fp.candleDelta >= 0 ? "#26c87a" : "#ef5350", fontWeight: 600 }}>{fp.candleDelta >= 0 ? "+" : ""}{fp.candleDelta}</span></span> {/* FOOTPRINT-UI: */}
-              <span style={{ fontSize: 10, color: MW.muted }}>POC: <span style={{ color: MW.text }}>{fp.poc.toFixed(2)}</span></span> {/* FOOTPRINT-UI: */}
-            </div> {/* FOOTPRINT-UI: */}
-            {fp.exitAdjustments?.usePocStop && fp.exitAdjustments.pocStopPrice != null && ( // FOOTPRINT-UI:
-              <div style={{ fontSize: 10, color: "#60a5fa", marginBottom: 2 }}>Stop: {fp.exitAdjustments.pocStopPrice.toFixed(2)} (POC-based)</div> // FOOTPRINT-UI:
-            )} {/* FOOTPRINT-UI: */}
-            {fp.exitAdjustments?.tp1Override != null && ( // FOOTPRINT-UI:
-              <div style={{ fontSize: 10, color: "#a78bfa", marginBottom: 2 }}>TP1 → unfinished auction at {fp.exitAdjustments.tp1Override.toFixed(2)}</div> // FOOTPRINT-UI:
-            )} {/* FOOTPRINT-UI: */}
-            {fp.exitAdjustments?.tp2Extension != null && ( // FOOTPRINT-UI:
-              <div style={{ fontSize: 10, color: "#a78bfa", marginBottom: 2 }}>TP2 extended {(fp.exitAdjustments.tp2Extension * 100).toFixed(0)}% — stacked imbalances</div> // FOOTPRINT-UI:
-            )} {/* FOOTPRINT-UI: */}
-          </div> // FOOTPRINT-UI:
-        ); // FOOTPRINT-UI:
-      })()} {/* FOOTPRINT-UI: */}
-
-      {/* FOOTPRINT-UI: separator only when footprint data present */}
-      {s.footprintReading && <div style={{ height: 1, background: MW.border }} />} {/* FOOTPRINT-UI: */}
+      {/* (Footprint order-flow section DELETED 2026-07-13 — it rendered the RETIRED
+          FootprintReading shape: delta agreement, divergence veto, POC-stop/TP adjustments and
+          the mid-trade divergence banner, all removed under rule 7 / rule 12. Footprint now
+          appears as imbalance-zone facts inside the signal's composite label.) */}
 
       {/* Pattern Analysis */}
       {(() => {

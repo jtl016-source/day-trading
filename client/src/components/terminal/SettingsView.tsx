@@ -350,14 +350,8 @@ export function SettingsView({
         </div>
         <Row label="Direction"><Seg options={["Both", "Long", "Short"] as const} value={dirLabel} onChange={(v) => u("direction", v.toLowerCase() as TradeDirection)} /></Row>
         <Row label="Targets" hint="TP1 only, or TP1 + TP2"><Seg options={["TP1", "TP1+TP2"] as const} value={s.tp1Only ? "TP1" : "TP1+TP2"} onChange={(v) => u("tp1Only", v === "TP1")} /></Row>
-        <Row label="Trailer Stop" hint={s.useTrailer ? `trails ${s.trailerOffset}pt after TP1` : "fixed TP1 + TP2 bracket"}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            {s.useTrailer && <Stepper value={s.trailerOffset} step={0.25} min={0.25} max={10} onChange={(v) => u("trailerOffset", v)} fmt={(v) => v + "pt"} />}
-            <Toggle on={s.useTrailer} onClick={() => u("useTrailer", !s.useTrailer)} />
-          </div>
-        </Row>
-        <Row label="Zone Targets" hint="TP/SL snap to nearest zones"><Toggle on={s.useZoneTargets} onClick={() => u("useZoneTargets", !s.useZoneTargets)} /></Row>
-        <Row label="Side-Entry Longs" hint="every vector side entry → Long"><Toggle on={s.takeSideEntries} onClick={() => u("takeSideEntries", !s.takeSideEntries)} /></Row>
+        {/* (Trailer Stop / Zone Targets / Side-Entry Longs rows DELETED 2026-07-13 — trailer is
+            gone per spec rule 12; the other two toggles controlled nothing in the fact engine.) */}
       </Card>
 
       <Card icon={Ico.bars()} title="Signal Engine">

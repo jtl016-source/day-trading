@@ -10,7 +10,7 @@
 export function normalizeSymbol(raw: string | undefined | null): string {
   if (!raw) return "";
   let s = raw.toUpperCase().trim();
-  s = s.replace(/\.[A-Z]+$/, "");                 // strip exchange suffix: .CME, .CBOT, ...
+  s = s.replace(/(\.[A-Z]+)+$/, "");              // strip exchange/provider suffixes: .CME, .CBOT, .CME.RITHMIC (instrument getKey() form)
   s = s.replace(/=F$/, "");                        // strip Yahoo futures suffix: MES=F -> MES
   s = s.replace(/[FGHJKMNQUVXZ]\d{1,2}$/, "");     // strip futures month-code + year: MESM6 -> MES
   return s;

@@ -1,5 +1,20 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { normalizeSymbol } from "@shared/symbol";
+import { runFactEngine, evaluateFormingBar, FACT_ENGINE_DEFAULTS, DAILY_LOSS_STOP_DEFAULT_PTS, type IntervalSlice, type FpImbalanceZone, type Interval as FeInterval, type YellowboxDayZone, type PriorFire } from "@shared/fact-engine";
+import { parsePriorFiresResponse, stablePriors, latestFireTimeBefore, openTradesBefore, admissionKey, persistVerdictFor, orderAdmissionBlockReason, type PriorsByInterval, type PersistVerdict } from "@shared/engine-seed"; // B5 (2026-09-25): cross-writer seed + order admission for this tab
+import { fetchRiskComboStats } from "@/lib/riskStats"; // RISK DISPLAY: shared combo-stats cache (dead-tape median)
+import { resolveDayRange, daysStateOf, windowStartTs, windowCapHint, windowQueryPlan, bg15mFrom5mData, WINDOW_QUERY_OPTIONS } from "@/lib/candle-window"; // CANDLE WINDOW (2026-09-24): settled day window + per-interval fetch caps + ONE query key per URL (C2)
+import { classifyZoneBullish } from "@shared/firing/vector";
+import { etSessionDayBucket, isRTH as isRTHClose } from "@shared/firing/session"; // DAILY LOSS STOP (2026-08-02): session-day bucket (18:00 ET roll); isRTHClose: ETH alert mute (2026-10-01)
+import { SIGNAL_INTERVAL_SEC } from "@shared/signal-rules"; // ETH alert mute (2026-10-01): classify at the bar CLOSE like the engine
+// LIVE-ADAPTER PARITY (2026-07-17): the engine-input construction functions live in
+// shared/live-adapter.ts so the parity test (scripts/fact-engine-parity.test.ts) exercises
+// the LITERAL code this page uses — construction drift between live and backtest is a
+// compile-time/test failure, not a silent divergence.
+import {
+  filterCandlesForVector, computeVectorLine, aggToInterval, agg5mTo15m,
+  buildBaseCandles, normalizeServed15m, deriveEngineSlices, buildFootprintMap,
+} from "@shared/live-adapter";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CandlestickChart,
@@ -11,12 +26,18 @@ import {
   type DrawingTool,
   type Drawing,
   type RectDrawing,
-  type TradeSegment,
   type ChartTheme,
   type SignalClickInfo,
+  type YellowBox,
   CHART_THEMES,
 } from "@/components/CandlestickChart";
 import SignalsPanel, { type ExternalSignal } from "@/components/SignalsPanel";
+// YELLOW-BOX: one day's zone as returned by GET /api/yellowbox/day-zones.
+interface YbDayZone {
+  dayKeyET: string; sessionStartTs: number; sessionEndTs: number; settle: number;
+  boxTop: number; boxBottom: number; initRes: number; initSup: number;
+  maxRangeUp: number; maxRangeDn: number; normalRangeDn: number; maxTrendUp: number;
+}
 import FootprintLadder from "@/components/FootprintLadder";
 import StrategyGuardDialog from "@/components/StrategyGuardDialog";
 import { Button } from "@/components/ui/button";
@@ -50,17 +71,15 @@ import {
   Crosshair,
 } from "lucide-react";
 
-import { analyzeFootprint, buildProxyFootprintCandle, setFootprintDataConfirmed, FOOTPRINT_DATA_CONFIRMED, IMBALANCE_THRESHOLD, MW_IMBALANCE_THRESHOLDS, NET_THRESHOLDS, PROXY_TIER2, PROXY_TIER3, getCurrentSessionType, getLastCompletedSession, buildFrozenImbalances, updateMitigation, type FrozenImbalanceZone, type FootprintCandle, type ImbalanceCluster, type FootprintReading, type PriceLevelData } from "@/lib/footprint-analysis"; // FOOTPRINT-STRATEGY:
+import { buildProxyFootprintCandle, setFootprintDataConfirmed, FOOTPRINT_DATA_CONFIRMED, IMBALANCE_THRESHOLD, MW_IMBALANCE_THRESHOLDS, NET_THRESHOLDS, PROXY_TIER2, PROXY_TIER3, getCurrentSessionType, getLastCompletedSession, buildFrozenImbalances, updateMitigation, type FrozenImbalanceZone, type FootprintCandle, type ImbalanceCluster, type PriceLevelData } from "@/lib/footprint-analysis"; // FOOTPRINT-STRATEGY:
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface SymbolInfo { symbol: string; name: string }
 interface SymbolsData { stocks: SymbolInfo[]; etfs: SymbolInfo[]; futures: SymbolInfo[]; indices: SymbolInfo[] }
 interface DayInfo { date: string; open: number; high: number; low: number; close: number; volume: number }
 
-interface VectorSignal {
-  time: number; entryPrice: number;
-  tp1: number; tp2: number; stopInitial: number;
-}
+// (VectorSignal interface DELETED 2026-07-14 — SIGNAL-INTEGRITY A2: the legacy client-side
+//  vector-cross arrows bypassed the fact engine and appeared in no panel.)
 
 // ── RTH helper — Mon-Fri, 9:30 AM – 4:00 PM ET (DST-safe via Intl) ───────────
 // Must use America/New_York, NOT a hardcoded UTC offset: 9:30 ET is 13:30 UTC in summer
@@ -83,14 +102,22 @@ function isRTH(timestampSec: number): boolean {
 const _etFmt = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false,
 });
-/** CME ES/MES settlement break: 4:30pm–6:00pm ET — no signals should fire here. */
+/** CME ES/MES daily maintenance halt: 5:00pm–6:00pm ET — no signals should fire here. */
 function isMarketBreak(timestampSec: number): boolean {
   const d = new Date(timestampSec * 1000);
   if (d.getUTCDay() === 0 || d.getUTCDay() === 6) return false;
   const et = _etFmt.format(d);
   const col = et.indexOf(":");
   const etMins = parseInt(et.slice(0, col)) * 60 + parseInt(et.slice(col + 1));
-  return etMins >= 16 * 60 + 30 && etMins < 18 * 60;
+  return etMins >= 17 * 60 && etMins < 18 * 60; // 5:00–6:00 PM ET
+}
+// DST-safe ET calendar-day anchor: unix seconds of a wall-clock time (h:min) on the ET day of `ts`.
+const _etDayFmtM = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" });
+function etWallSecOfDay(ts: number, h: number, min: number): number {
+  const [y, mo, d] = _etDayFmtM.format(new Date(ts * 1000)).split("-").map(Number);
+  const edt = Date.UTC(y, mo - 1, d, h + 4, min, 0) / 1000; // assume EDT (UTC-4)
+  const wallH = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false }).format(new Date(edt * 1000)));
+  return wallH === h ? edt : Date.UTC(y, mo - 1, d, h + 5, min, 0) / 1000; // else EST (UTC-5)
 }
 /** User rule: no signals at or after 3:15 PM ET — too risky into the RTH close. */
 function isAfter315ET(timestampSec: number): boolean {
@@ -101,7 +128,6 @@ function isAfter315ET(timestampSec: number): boolean {
 }
 
 
-const RISK_QUALITY: Record<string, number> = { safeplus: 4, safe: 3, risky: 2, riskiest: 1 };
 
 // ── Milk Zone detector ────────────────────────────────────────────────────
 // Reverse-engineered from 15,000+ Milk Yellow Box MWML zones.
@@ -110,18 +136,18 @@ const RISK_QUALITY: Record<string, number> = { safeplus: 4, safe: 3, risky: 2, r
 //   2. Order Block     (ABSORPTION / RESISTIVE) — last candle before a big move
 //   3. Structural level (STRUCTURAL) — swing high/low with ≥3 confirming bars each side
 // historyBars: how many recent RTH bars to scan (0 = all). displayCap: max zones returned (0 = all).
-/** Returns the Unix timestamp of 21:00 UTC (RTH close) on the same calendar day as `ts`. */
+/** Unix ts of the 5:00 PM ET RTH close on the ET calendar day of `ts` (DST-safe). */
 function rthCloseOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 21 * 3600;
+  return etWallSecOfDay(ts, 17, 0);
 }
-/** Returns the Unix timestamp of 20:30 UTC (4:30 PM EDT / CME settlement) on the same calendar day as `ts`.
- *  Milk zones are scoped to the regular session and must end at market close (4:30 PM ET). */
+/** Unix ts of the 5:00 PM ET session settle / force-close on the ET calendar day of `ts` (DST-safe).
+ *  Moved 4:30 PM → 5:00 PM ET with the new signal model; day-trade positions force-close here. */
 function rthSettleOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 20 * 3600 + 30 * 60;
+  return etWallSecOfDay(ts, 17, 0);
 }
-/** Returns the Unix timestamp of 13:30 UTC (9:30 AM ET / RTH open) on the same calendar day as `ts`. */
+/** Unix ts of the 9:30 AM ET RTH open on the ET calendar day of `ts` (DST-safe). */
 function rthOpenOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 13 * 3600 + 30 * 60;
+  return etWallSecOfDay(ts, 9, 30);
 }
 
 function detectMilkZones(candles: CandleBar[], historyBars = 234, displayCap = 60): ZoneBand[] {
@@ -129,19 +155,17 @@ function detectMilkZones(candles: CandleBar[], historyBars = 234, displayCap = 6
   const zones: ZoneBand[] = [];
   const BAR_INT = 5 * 60; // 5-minute bar = 300 s
 
-  // Pre-build map of UTC calendar day → last RTH bar timestamp BEFORE 4:30 PM ET (20:30 UTC).
-  // isRTH() runs to 21:00 UTC (5:00 PM ET) but we cap zones at 4:30 PM ET.
-  // Using an actual bar timestamp guarantees timeToCoordinate() succeeds —
-  // rthSettleOfDay() (20:30 UTC) falls in the CME break where no bars exist.
-  const lastRthBarBefore430 = new Map<number, number>();
+  // Pre-build map of ET calendar day → last RTH bar timestamp at/before the 5:00 PM ET close.
+  // Milk zones are scoped to one RTH session (now 9:30 AM – 5:00 PM ET). Using an actual bar
+  // timestamp guarantees timeToCoordinate() succeeds.
+  const lastRthBarBeforeClose = new Map<number, number>();
   for (const c of rth) {
-    const secsIntoDay = c.time % 86400;
-    if (secsIntoDay >= 20 * 3600 + 30 * 60) continue; // skip bars at/after 4:30 PM ET
+    if (c.time > rthCloseOfDay(c.time)) continue; // skip bars after 5:00 PM ET
     const day = Math.floor(c.time / 86400);
-    lastRthBarBefore430.set(day, c.time); // later bars overwrite → map holds the last one before 4:30
+    lastRthBarBeforeClose.set(day, c.time); // later bars overwrite → map holds the last one before close
   }
   const sessionEndOf = (ts: number): number =>
-    lastRthBarBefore430.get(Math.floor(ts / 86400)) ?? rthSettleOfDay(ts);
+    lastRthBarBeforeClose.get(Math.floor(ts / 86400)) ?? rthSettleOfDay(ts);
 
   // 14-period ATR
   const atrAt = (i: number): number => {
@@ -262,8 +286,7 @@ function detectMilkZones(candles: CandleBar[], historyBars = 234, displayCap = 6
 //   TP=10pts / SL=5pts → 32% WR baseline; with milk zone price filter → ~50-60% WR
 //   TP=20pts / SL=5pts → 4:1 R:R, 2.05 expected pts/trade (best fixed-point config)
 // Safe signals (high confluence) get a bonus +2.5 on TP1 (10 → 12.5).
-const TP_FIXED_1_SAFE    = 12.5;  // TP1 for safe signals (strong confluence, zone + vec + imbalance)
-const TP_FIXED_1         = 10.0;  // TP1 for risky/riskiest signals
+const TP_FIXED_1         = 10.0;  // TP1 for risky/riskiest signals (legacy bg scanners only)
 const TP_FIXED_2         = 20.0;  // TP2: 20 pts (cap — market can't always extend)
 const SL_FIXED           = 5.0;   // SL: 5 pts (20 ticks, $25/MES)
 const MILK_TOLERANCE_PTS = 2.0;  // zone price proximity tolerance (8 ticks)
@@ -326,140 +349,61 @@ const EXIT_STRATEGY_PROFILES = {
   },
 } as const;
 
-// Legacy ATR multipliers (kept for VEC signal, not confluence)
-const TP_ATR_MULT = 1.0;
-const SL_ATR_MULT = 0.5;
+// (TP_ATR_MULT / SL_ATR_MULT / VEC_STOP_* / VEC_TP* / VEC_MAX_STOP DELETED 2026-07-14 —
+//  SIGNAL-INTEGRITY A2: they parameterized the retired computeVectorSignals arrows only.)
+// ── Candle sanity filter + vector computation ────────────────────────────
+// filterCandlesForVector and computeVectorLine now come from @shared/live-adapter
+// (verbatim extraction 2026-07-17) so the backtest parity test runs the SAME code.
 
-const VEC_LENGTH       = 20;
-const VEC_STOP_BELOW   = 3.5;
-const VEC_STOP_BE      = 15.0;
-const VEC_TP1          = 7.5;
-const VEC_TP2          = 26.0;
-const VEC_MAX_STOP     = 8.0;
-
-// ── Candle sanity filter ─────────────────────────────────────────────────
-// Shared filter applied to all raw candle arrays before vector computation.
-// Removes: zero/NaN values, doji-spike bars, extreme wick bars, and isolated bars
-// that don't share price range with at least 7 of their nearest 50 neighbours.
-function filterCandlesForVector(raw: CandleBar[]): CandleBar[] {
-  if (!raw.length) return raw;
-  const MIN_P = 1, MAX_P = 9e13;
-  const pass = raw
-    .filter(c => {
-      if (!isFinite(c.open) || !isFinite(c.high) || !isFinite(c.low) || !isFinite(c.close)) return false;
-      if (c.open < MIN_P || c.high < MIN_P || c.low < MIN_P || c.close < MIN_P) return false;
-      if (c.open >= MAX_P || c.high >= MAX_P || c.low >= MAX_P || c.close >= MAX_P) return false;
-      if (c.high <= c.low) return false;
-      const range = c.high - c.low;
-      if (range / c.close > 0.015 && Math.abs(c.open - c.close) / range < 0.10) return false;
-      const bL = Math.min(c.open, c.close), bH = Math.max(c.open, c.close);
-      if ((bL - c.low) / c.close > 0.015 || (c.high - bH) / c.close > 0.015) return false;
-      return true;
-    })
-    .sort((a, b) => a.time - b.time);
-  const MIN_CONN = 7, CONN_WIN = 25;
-  return pass.filter((c, i) => {
-    let conn = 0;
-    for (let j = Math.max(0, i - CONN_WIN); j <= Math.min(pass.length - 1, i + CONN_WIN); j++) {
-      if (j === i) continue;
-      if (pass[j].low <= c.high && pass[j].high >= c.low && ++conn >= MIN_CONN) break;
-    }
-    return conn >= MIN_CONN;
-  });
-}
-
-// ── Vector computation ────────────────────────────────────────────────────
-// O(n) sliding-window min/max using monotonic deques — replaces O(n * VEC_LENGTH).
-function computeVectorLine(candles: CandleBar[]): Array<{ time: number; value: number }> {
-  if (!candles.length) return [];
-  // All bars (RTH + ETH): matches ThinkorSwim vectorexitstrat behaviour.
-  const s = [...candles].sort((a, b) => a.time - b.time);
-  const n = s.length;
-  const lb = new Float64Array(n);
-
-  // Pass 1: Lowest(low, VEC_LENGTH) via monotonic min-deque
-  const dq1 = new Int32Array(n);
-  let d1f = 0, d1b = 0;
-  for (let i = 0; i < n; i++) {
-    while (d1f < d1b && dq1[d1f] <= i - VEC_LENGTH) d1f++;
-    while (d1f < d1b && s[dq1[d1b - 1]].low >= s[i].low) d1b--;
-    dq1[d1b++] = i;
-    lb[i] = s[dq1[d1f]].low;
+// BAR-CLOSE LATENCY FIX (2026-08-07): overlay a live completed-bar tail onto an HTTP-fetched
+// candle array (binary insert, live wins on same-time collision — the same rule as the
+// windowedCandles live merge). base==null (query disabled / not yet loaded) stays null so
+// enabled-gating semantics are unchanged; an empty tail returns base untouched (zero cost).
+function mergeCompletedTail(base: CandleBar[] | undefined, tail: CandleBar[] | undefined): CandleBar[] | undefined {
+  if (!base || !tail || !tail.length) return base;
+  const out = [...base];
+  for (const b of tail) {
+    let lo = 0, hi = out.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (out[mid].time < b.time) lo = mid + 1; else hi = mid; }
+    if (lo < out.length && out[lo].time === b.time) out[lo] = b;
+    else out.splice(lo, 0, b);
   }
-
-  // Pass 2: Highest(LowerBand, VEC_LENGTH) via monotonic max-deque
-  const result: Array<{ time: number; value: number }> = new Array(n);
-  const dq2 = new Int32Array(n);
-  let d2f = 0, d2b = 0;
-  for (let i = 0; i < n; i++) {
-    while (d2f < d2b && dq2[d2f] <= i - VEC_LENGTH) d2f++;
-    while (d2f < d2b && lb[dq2[d2b - 1]] <= lb[i]) d2b--;
-    dq2[d2b++] = i;
-    result[i] = { time: s[i].time, value: lb[dq2[d2f]] };
-  }
-  return result;
+  return out;
 }
 
 // ── Background signal scanner (used for all-interval notifications) ──────────
-// Lightweight version of allConfluenceSignals: finds safe signals (zone+vector)
-// from any candle array. No live candle merging, no extraVec maps needed.
+// A4 FIX 2026-07-13: the retired-model scanner (close-vs-vector cross + zone proximity,
+// cooldown 10, no 15:15 gate) is GONE. Background notifications now run the SAME fact
+// engine as the chart — single-interval slice, uploaded zones, no footprint (real
+// footprint data only exists for the viewed interval; absent data = no footprint fact,
+// per C12). riskLevel is the retired tier — always "safe" for back-compat consumers.
+// PERF (2026-07-30): stable empty-array identity for the bg-signal memo deps — a `?? []`
+// literal in the dep expression would mint a new identity every render and defeat the memo.
+const EMPTY_BG_CANDLES: CandleBar[] = [];
+
 function computeBgSignals(
   candles: CandleBar[],
-  vecLine: Array<{ time: number; value: number }>,
   milkZones: ZoneBand[],
-): Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; riskLevel: "safe" | "risky" | "riskiest" }> {
-  if (candles.length < 22 || !vecLine.length) return [];
-  const sorted = [...candles].sort((a, b) => a.time - b.time);
-  const vecMap = new Map(vecLine.map(v => [v.time, v.value]));
-  const isBullZone = (z: ZoneBand): boolean => {
-    const c = z.color.toLowerCase().trim();
-    if (c === "#22c55e" || c === "#3b82f6" || c === "#14b8a6") return true;
-    const m = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-    if (m) { const r = +m[1], g = +m[2], b = +m[3]; return g > r || (b > r && b > g); }
-    return false;
-  };
-
-  const results: Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; riskLevel: "safe" | "risky" | "riskiest" }> = [];
-  let lastLongBar = -20, lastShortBar = -20;
-  const COOLDOWN = 10;
-
-  for (let i = 1; i < sorted.length; i++) {
-    const c = sorted[i];
-    if (c.rth === false) continue;
-    const lb = vecMap.get(c.time);
-    if (lb == null) continue;
-    const prev  = sorted[i - 1];
-    const prevLb = vecMap.get(prev.time);
-
-    const utcH = new Date(c.time * 1000).getUTCHours();
-    // Skip settlement break (20:30–22:00 UTC = 4:30–6pm ET)
-    if (utcH >= 20) continue;
-
-    const milkBullOk = milkZones.some(z =>
-      isBullZone(z) &&
-      c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
-      c.low  <= z.topPrice    + MILK_TOLERANCE_PTS &&
-      c.close >= z.bottomPrice - MILK_TOLERANCE_PTS
-    );
-    const milkBearOk = milkZones.some(z =>
-      !isBullZone(z) &&
-      c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity) &&
-      c.high >= z.bottomPrice - MILK_TOLERANCE_PTS &&
-      c.close <= z.topPrice   + MILK_TOLERANCE_PTS
-    );
-
-    if (c.close > lb && (prevLb == null || lb >= prevLb) && i - lastLongBar >= COOLDOWN) {
-      const riskLevel: "safe" | "risky" | "riskiest" = milkBullOk ? "safe" : "risky";
-      lastLongBar = i;
-      results.push({ time: c.time, direction: "Long", price: c.close, tp1: c.close + TP_FIXED_1, tp2: c.close + TP_FIXED_2, sl: c.close - SL_FIXED, riskLevel });
-    }
-    if (c.close < lb && (prevLb == null || lb <= prevLb) && i - lastShortBar >= COOLDOWN) {
-      const riskLevel: "safe" | "risky" | "riskiest" = milkBearOk ? "safe" : "risky";
-      lastShortBar = i;
-      results.push({ time: c.time, direction: "Short", price: c.close, tp1: c.close - TP_FIXED_1, tp2: c.close - TP_FIXED_2, sl: c.close + SL_FIXED, riskLevel });
-    }
-  }
-  return results;
+  interval: FeInterval,
+  zoneReactionPts: number,
+  // B5 (2026-09-25): the interval's STORED fires (GET /api/signals/prior-fires) — this scanner's
+  // cooldown / open-trade state starts where the other writers left it, like every other replay.
+  priorFires?: PriorFire[],
+): Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number | null; sl: number; riskLevel: "safe" | "risky" | "riskiest"; label?: string; signalType?: string }> {
+  if (candles.length < 22) return [];
+  const zones = milkZones.map(z => ({ topPrice: z.topPrice, bottomPrice: z.bottomPrice, color: z.color, label: z.label, fromTime: z.fromTime, toTime: z.toTime }));
+  return runFactEngine({
+    primary: interval,
+    slices: [{ interval, candles: candles as unknown as IntervalSlice["candles"] }],
+    zones,
+    settings: { ZONE_REACTION_PTS: zoneReactionPts },
+    nowSec: Math.floor(Date.now() / 1000),
+    ...(priorFires?.length ? { priorFires } : {}),
+  }).map(fs => ({
+    time: fs.time, direction: fs.direction, price: fs.price,
+    tp1: fs.tp1, tp2: fs.tp2, sl: fs.sl,
+    riskLevel: "safe" as const, label: fs.label, signalType: fs.signalType,
+  }));
 }
 
 // ── Backtest engine ─────────────────────────────────────────────────────────
@@ -483,13 +427,10 @@ function btWalkForward(
   sorted: CandleBar[], startIdx: number,
   tp1: number, tp2: number, sl: number, isLong: boolean,
 ): "win_tp1" | "win_tp2" | "loss" | "open" {
-  const c = sorted[startIdx];
-  let settleTs = rthSettleOfDay(c.time);
-  for (let d = 0; c.time >= settleTs && d < 4; d++) settleTs = rthSettleOfDay(c.time + (d + 1) * 86400);
-  const pastEnd = Math.floor(Date.now() / 1000) > settleTs;
+  // CARRY-OVERNIGHT (2026-08-11 user directive): no session-end force-close — the walk runs
+  // across sessions on all available candles; untouched = open until a later touch resolves it.
   for (let j = startIdx + 1; j < sorted.length; j++) {
     const f = sorted[j];
-    if (f.time > settleTs) break;
     if (isLong) {
       if (f.high >= tp2) return "win_tp2";
       if (f.high >= tp1) return "win_tp1";
@@ -500,7 +441,7 @@ function btWalkForward(
       if (f.high >= sl)  return "loss";
     }
   }
-  return pastEnd ? "loss" : "open";
+  return "open"; // CARRY-OVERNIGHT: untouched trades stay open — no settle force-close
 }
 
 function runBacktest(
@@ -587,8 +528,7 @@ function runBacktest(
 
   for (let i = 1; i < sorted.length; i++) {
     const c = sorted[i];
-    if (!isRTH(c.time)) continue;
-    if (new Date(c.time * 1000).getUTCHours() >= 20) continue;
+    if (!isRTH(c.time)) continue; // isRTH now bounds RTH to 5:00 PM ET (DST-safe)
     const lb = vecMap.get(c.time);
     if (lb == null) continue;
     const prevLb = vecMap.get(sorted[i - 1].time);
@@ -639,88 +579,10 @@ function runBacktest(
   return { symbol, interval, exitStrategy: exitStratLabel, fromDate, toDate, totalBars: sorted.length, tiers, signals, ranAt: Date.now() };
 }
 
-function computeVectorSignals(
-  candles: CandleBar[],
-  vecLine: Array<{ time: number; value: number }>
-): VectorSignal[] {
-  if (candles.length < 2 || !vecLine.length) return [];
-  const s = [...candles].sort((a, b) => a.time - b.time);
-  const vecMap = new Map(vecLine.map(v => [v.time, v.value]));
-  const signals: VectorSignal[] = [];
-
-  for (let i = 1; i < s.length; i++) {
-    const c = s[i], prev = s[i - 1];
-    const lb     = vecMap.get(c.time);
-    const prevLb = vecMap.get(prev.time);
-    if (lb == null || prevLb == null) continue;
-    const slope     = lb - prevLb;
-    const sideEntry = prev.close < prevLb && c.close > lb && slope < 0;
-    if (!sideEntry) continue;
-    const entry    = c.close;
-    const stopVec  = lb - VEC_STOP_BELOW;
-    const stopMax  = entry - VEC_MAX_STOP;
-    signals.push({
-      time: c.time, entryPrice: entry,
-      tp1: entry + VEC_TP1,
-      tp2: entry + VEC_TP2,
-      stopInitial: Math.max(stopVec, stopMax),
-    });
-  }
-  return signals;
-}
-
-function computeVectorTradeOverlays(
-  signals: VectorSignal[],
-  candles: CandleBar[],
-  vecLine: Array<{ time: number; value: number }>
-): { bands: BandOverlay[]; segments: TradeSegment[] } {
-  if (!signals.length) return { bands: [], segments: [] };
-  const s = [...candles].sort((a, b) => a.time - b.time);
-  const vecMap = new Map(vecLine.map(v => [v.time, v.value]));
-  const bands: BandOverlay[] = [];
-  const segments: TradeSegment[] = [];
-
-  for (const sig of signals) {
-    const sigIdx = s.findIndex(c => c.time === sig.time);
-    if (sigIdx < 0) continue;
-    let stop = sig.stopInitial;
-    let beHit = false;
-    let endTime = s[s.length - 1].time;
-
-    for (let i = sigIdx + 1; i < s.length; i++) {
-      const c  = s[i];
-      const lb = vecMap.get(c.time);
-      if (!beHit && c.high >= sig.entryPrice + VEC_STOP_BE) {
-        beHit = true;
-        stop  = sig.entryPrice;
-      } else if (!beHit && lb != null) {
-        stop = Math.max(lb - VEC_STOP_BELOW, sig.entryPrice - VEC_MAX_STOP);
-      }
-        if (c.high >= sig.tp2 || c.low <= stop) { endTime = c.time; break; }
-    }
-
-    // Bounded fills — stop at TP1 for width (same as confluence signals)
-    let fillEnd = endTime;
-    for (let i = sigIdx + 1; i < s.length; i++) {
-      const c = s[i];
-      if (c.high >= sig.tp1 || c.low <= sig.stopInitial) { fillEnd = c.time; break; }
-    }
-    bands.push({ topPrice: sig.tp2,        bottomPrice: sig.entryPrice, fillColor: "rgba(38,166,154,0.06)", fromTime: sig.time, toTime: fillEnd });
-    bands.push({ topPrice: sig.entryPrice, bottomPrice: sig.stopInitial, fillColor: "rgba(239,83,80,0.06)",   fromTime: sig.time, toTime: fillEnd });
-
-    // Canvas-rendered segment — lines cut off exactly at toTime
-    segments.push({
-      fromTime: sig.time,
-      toTime: endTime,
-      entry: sig.entryPrice,
-      tp1: sig.tp1,
-      tp2: sig.tp2,
-      stop: sig.stopInitial,
-    });
-  }
-
-  return { bands, segments };
-}
+// (computeVectorSignals + computeVectorTradeOverlays DELETED 2026-07-14 — SIGNAL-INTEGRITY A2:
+//  legacy client-side vector-cross entry arrows + TP/SL trade overlays drawn on the market chart
+//  that appeared in NO panel, were never persisted, and bypassed shared/fact-engine.ts entirely.
+//  The fact engine is the only signal source; the chart draws only engine signals.)
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function fmt(n?: number | null, digits = 2): string {
@@ -762,55 +624,21 @@ function dateToTs(s: string, h = 0): number {
   return Math.floor(new Date(Date.UTC(y, m-1, d, h)).getTime() / 1000);
 }
 
-
-function agg5mTo15m(candles: CandleBar[]): CandleBar[] {
-  if (!candles.length) return [];
-  const s = [...candles].sort((a,b) => a.time-b.time);
-  const result: CandleBar[] = [];
-  let bucket: CandleBar | null = null, bucketStart = 0;
-  const T = 15 * 60;
-  for (const c of s) {
-    const aligned = Math.floor(c.time / T) * T;
-    if (bucket && bucketStart === aligned) {
-      bucket.high   = Math.max(bucket.high, c.high);
-      bucket.low    = Math.min(bucket.low, c.low);
-      bucket.close  = c.close;
-      bucket.volume = (bucket.volume ?? 0) + (c.volume ?? 0);
-      if (c.rth) bucket.rth = true;
-    } else {
-      if (bucket) result.push(bucket);
-      bucketStart = aligned;
-      bucket = { ...c, time: aligned };
-    }
-  }
-  if (bucket) result.push(bucket);
-  return result;
+// CANDLE WINDOW (2026-09-24): the ONE fetcher behind every cached-continuous window query on this
+// page. Queries that share a URL share a key, so they must share the queryFn too. `signal` is
+// react-query's AbortSignal: a window whose key is abandoned (interval / window switch) aborts
+// its download instead of completing and being parsed anyway.
+async function fetchContinuousWindow(sym: string, iv: string, from: number, to: number, signal?: AbortSignal): Promise<any> {
+  const r = await fetch(`/api/data/cached-continuous/${sym}/${iv}?from=${from}&to=${to}`, { signal });
+  if (!r.ok) throw new Error("Failed");
+  const d = await r.json();
+  if (d?.error) throw new Error(d.error);
+  return d;
 }
 
 
-// Generic candle aggregation to any interval (e.g. 5m→15m, 5m→60m, 1m→5m)
-function aggToInterval(candles: CandleBar[], intervalSec: number): CandleBar[] {
-  if (!candles.length) return [];
-  const s = [...candles].sort((a, b) => a.time - b.time);
-  const map = new Map<number, CandleBar>();
-  for (const c of s) {
-    const bucket = Math.floor(c.time / intervalSec) * intervalSec;
-    const ex = map.get(bucket);
-    if (!ex) {
-      map.set(bucket, { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume ?? 0, rth: c.rth });
-    } else {
-      ex.high   = Math.max(ex.high, c.high);
-      ex.low    = Math.min(ex.low,  c.low);
-      ex.close  = c.close;
-      ex.volume = (ex.volume ?? 0) + (c.volume ?? 0);
-      // If any bar in the bucket is RTH, promote the bucket to RTH.
-      // Without this, a boundary bucket whose first bar is ETH gets rth:false
-      // and is excluded from computeVectorLine, making the vector appear flat.
-      if (!ex.rth && c.rth) ex.rth = c.rth;
-    }
-  }
-  return Array.from(map.values()).sort((a, b) => a.time - b.time);
-}
+// agg5mTo15m and aggToInterval now come from @shared/live-adapter (verbatim
+// extraction 2026-07-17) so the backtest parity test runs the SAME code.
 
 // Forward-fill a vector (computed at one interval) onto another interval's timestamps.
 // For each chart time T, emits the last vector value whose time ≤ T.
@@ -862,6 +690,125 @@ const MW = {
   down:     "#ef4444",   // down / short — vivid red
 };
 
+// ── ACCOUNT GUARD + ALERT SWITCHES (2026-10-01 verifier round) ─────────────
+/** Settings for the Apex guard dollars, account carry-over, daily-loss pause, the guard
+ *  tracker reset, and the overnight-alert / news-blackout switches. Before this section the
+ *  only way to change them was a raw POST /api/trade/settings. Each control POSTs ONLY its own
+ *  fields — never `enabled`, contracts or intervals — so it cannot arm, disarm or resize
+ *  auto-trade. An older server (pre-restart) answers without these keys; the section says so
+ *  instead of guessing. */
+type AccountSafetyState = {
+  apexHeadroomDollars?: number; apexGuardMarginDollars?: number; apexDailyLossLimitDollars?: number;
+  apexGuardCarryOver?: boolean; ethAlertsEnabled?: boolean; newsBlackoutEnabled?: boolean;
+};
+type AccountGuardView = { day?: string; realized?: number; peak?: number; acctRealized?: number; acctPeak?: number; acctSince?: string };
+function AccountSafetySettings({ ethAlertsRef }: { ethAlertsRef: { current: boolean } }) {
+  const [st, setSt] = useState<AccountSafetyState | null>(null);
+  const [guard, setGuard] = useState<AccountGuardView | null>(null);
+  const [draft, setDraft] = useState({ headroom: "", margin: "", dll: "" });
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const draftSynced = useRef(false);
+  const load = useCallback((resyncDraft = false) => {
+    fetch("/api/trade/settings", { cache: "no-store" }).then(r => (r.ok ? r.json() : null)).then((d: AccountSafetyState | null) => {
+      if (!d) return;
+      setSt(d);
+      if (typeof d.ethAlertsEnabled === "boolean") ethAlertsRef.current = d.ethAlertsEnabled;
+      if (resyncDraft || !draftSynced.current) {
+        draftSynced.current = true;
+        setDraft({ headroom: String(d.apexHeadroomDollars ?? ""), margin: String(d.apexGuardMarginDollars ?? ""), dll: String(d.apexDailyLossLimitDollars ?? 0) });
+      }
+    }).catch(() => {});
+    fetch("/api/trade/actives", { cache: "no-store" }).then(r => (r.ok ? r.json() : null))
+      .then((d: { apexGuard?: AccountGuardView } | null) => { if (d?.apexGuard) setGuard(d.apexGuard); }).catch(() => {});
+  }, [ethAlertsRef]);
+  useEffect(() => {
+    load();
+    const t = window.setInterval(() => load(), 30_000);
+    return () => window.clearInterval(t);
+  }, [load]);
+  const post = (patch: Record<string, unknown>, okText: string) => {
+    fetch("/api/trade/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) })
+      .then(r => { setMsg(r.ok ? { ok: true, text: okText } : { ok: false, text: `Save failed (HTTP ${r.status})` }); load(true); })
+      .catch(e => setMsg({ ok: false, text: `Network error: ${e?.message ?? e}` }));
+  };
+  const saveDollars = () => {
+    const h = Number(draft.headroom), m = Number(draft.margin), dll = Number(draft.dll);
+    if (!Number.isFinite(h) || h <= 0) { setMsg({ ok: false, text: "Headroom must be a positive dollar amount" }); return; }
+    if (!Number.isFinite(m) || m < 0 || m >= h) { setMsg({ ok: false, text: "Margin must be ≥ 0 and below the headroom" }); return; }
+    if (!Number.isFinite(dll) || dll < 0) { setMsg({ ok: false, text: "Daily loss pause must be ≥ 0 (0 = off)" }); return; }
+    post({ apexHeadroomDollars: h, apexGuardMarginDollars: m, apexDailyLossLimitDollars: dll }, `Saved: pause at $${h - m} used${dll > 0 ? `, daily pause at −$${dll}` : ""}`);
+  };
+  const resetGuard = () => {
+    if (!window.confirm("Reset the Apex guard tracker?\n\nDo this only AFTER setting the headroom to RTrader's real distance-to-threshold. It zeroes today's tracker and re-anchors the account tracker (carried losses).")) return;
+    fetch("/api/trade/guard/reset", { method: "POST" })
+      .then(r => { setMsg(r.ok ? { ok: true, text: "Guard tracker reset" } : { ok: false, text: `Reset failed (HTTP ${r.status})` }); load(); })
+      .catch(e => setMsg({ ok: false, text: `Network error: ${e?.message ?? e}` }));
+  };
+  const serverHasKeys = st != null && typeof st.ethAlertsEnabled === "boolean";
+  const toggle = (label: string, on: boolean | undefined, onClick: () => void, hint: string) => (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, gap: 8 }}>
+      <div>
+        <div style={{ fontSize: 11, color: MW.text }}>{label}</div>
+        <div style={{ fontSize: 9.5, color: MW.muted, lineHeight: 1.4 }}>{hint}</div>
+      </div>
+      <button disabled={!serverHasKeys} onClick={onClick}
+        style={{ padding: "3px 10px", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: serverHasKeys ? "pointer" : "not-allowed", flexShrink: 0,
+          background: on ? "rgba(38,200,122,0.12)" : "rgba(255,255,255,0.03)", border: `1px solid ${on ? "#26c87a" : MW.border}`, color: on ? "#26c87a" : MW.muted }}
+      >{on ? "ON" : "OFF"}</button>
+    </div>
+  );
+  const input = (key: "headroom" | "margin" | "dll", label: string) => (
+    <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 9.5, color: MW.muted, flex: 1 }}>
+      {label}
+      <input type="number" min={0} step={50} value={draft[key]} onChange={e => setDraft(d => ({ ...d, [key]: e.target.value }))}
+        style={{ width: "100%", padding: "4px 6px", borderRadius: 4, fontSize: 12, background: "rgba(255,255,255,0.03)", border: `1px solid ${MW.border}`, color: MW.text }} />
+    </label>
+  );
+  const acctUsed = guard && Number.isFinite(guard.acctPeak) && Number.isFinite(guard.acctRealized) ? (guard.acctPeak as number) - (guard.acctRealized as number) : null;
+  return (
+    <div className="px-3 py-3" style={{ borderBottom: `1px solid ${MW.border}` }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: MW.muted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+        Account guard &amp; alerts
+      </div>
+      {st && !serverHasKeys && (
+        <div style={{ fontSize: 10, color: "#f59e0b", marginBottom: 8, lineHeight: 1.4 }}>
+          The running server predates these settings. Restart the app server to use them (auto-trade comes back disarmed).
+        </div>
+      )}
+      <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6, lineHeight: 1.45 }}>
+        Apex 25K: set the headroom to RTrader's real distance to the drawdown threshold ($1,000 on current 25K plans, $1,500 only on a legacy 25K). Orders pause at headroom − margin.
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+        {input("headroom", "Headroom $")}
+        {input("margin", "Margin $")}
+        {input("dll", "Daily pause $ (0=off)")}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+        <button onClick={saveDollars} disabled={!st}
+          style={{ flex: 1, padding: "4px 0", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: "pointer", background: "rgba(47,155,255,0.12)", border: `1px solid ${MW.accent}`, color: MW.accent }}>Save guard $</button>
+        <button onClick={resetGuard}
+          style={{ flex: 1, padding: "4px 0", borderRadius: 4, fontSize: 10, cursor: "pointer", background: "rgba(255,255,255,0.03)", border: `1px solid ${MW.border}`, color: MW.muted }}>Reset guard tracker</button>
+      </div>
+      {guard && (
+        <div style={{ fontSize: 10, color: MW.muted, marginBottom: 8, lineHeight: 1.45 }}>
+          Today: ${(guard.realized ?? 0).toFixed(0)} realized.
+          {acctUsed != null && <> Account tracker since {guard.acctSince || "?"}: ${(guard.acctRealized ?? 0).toFixed(0)} realized, ${acctUsed.toFixed(0)} below its peak.</>}
+        </div>
+      )}
+      {toggle("Carry losses across days", st?.apexGuardCarryOver !== false,
+        () => post({ apexGuardCarryOver: !(st?.apexGuardCarryOver !== false) }, "Saved"),
+        "Apex's threshold doesn't reset overnight, so the guard keeps counting until you reset it.")}
+      {toggle("Overnight (ETH) alerts", st?.ethAlertsEnabled === true,
+        () => { const next = !(st?.ethAlertsEnabled === true); ethAlertsRef.current = next; post({ ethAlertsEnabled: next }, next ? "Overnight alerts ON" : "Overnight alerts muted"); },
+        "Off = overnight fires are recorded but send no Discord, desktop or sound alert.")}
+      {toggle("News blackout", st?.newsBlackoutEnabled !== false,
+        () => { const next = !(st?.newsBlackoutEnabled !== false); post({ newsBlackoutEnabled: next }, next ? "News blackout ON" : "News blackout OFF"); },
+        "No auto-trade orders or alerts 08:25–08:40, 09:55–10:05 and FOMC 13:55–14:30 ET on scheduled-release days.")}
+      {msg && <div style={{ fontSize: 10, color: msg.ok ? "#26c87a" : "#ef5350", marginTop: 4 }}>{msg.text}</div>}
+    </div>
+  );
+}
+
 // ── Page component ────────────────────────────────────────────────────────
 export default function MarketPage() {
   // Read initial symbol/interval from URL query params (e.g. /?symbol=MES&interval=5m)
@@ -884,13 +831,48 @@ export default function MarketPage() {
   const [manualEditMode, setManualEditMode] = useState(false);
   const [chartRiskLevel, setChartRiskLevel] = useState<"safe" | "risky" | "riskiest" | "all">(() => getPersistedSetting("chartRiskLevel", "risky" as "safe" | "risky" | "riskiest" | "all"));
   const [exitStrategy,  setExitStrategy]   = useState<"safe" | "risky" | "riskiest">(() => getPersistedSetting("exitStrategy", "risky" as "safe" | "risky" | "riskiest"));
-  const [useTrailer,    setUseTrailer]     = useState(() => getPersistedSetting("useTrailer", false));
-  const [trailerOffset, setTrailerOffset]  = useState(() => getPersistedSetting("trailerOffset", 2.0));
-  const [useZoneTargets, setUseZoneTargets] = useState(() => getPersistedSetting("useZoneTargets", false));
-  // Feature: take EVERY vector side-entry as a Long, exiting with the vector's exit strategy.
-  // When on, these become first-class signals (chart + panel + persisted + iPhone) and are
-  // auto-trade eligible (explicit override of the safe/safe+ auto-trade gate — see fire logic).
-  const [takeSideEntries, setTakeSideEntries] = useState(() => getPersistedSetting("takeSideEntries", false));
+  // (trailer settings / useZoneTargets / takeSideEntries DELETED 2026-07-13 — trailer
+  //  removed per spec rule 12; the two toggles controlled nothing in the fact-engine model.)
+  // FACT-ENGINE: milk-zone reaction distance N — a wick touches the zone and price must move
+  // ≥ this many points away for a reaction to fire. User-exposed (Settings → Signal Model).
+  const [zoneReactionPts, setZoneReactionPts] = useState(() => getPersistedSetting("zoneReactionPts", 2.0));
+  // YELLOW-BOX: draw every trading day's gold Yellow Box (default ON per user request) and, separately,
+  // allow a lone box-break to fire a signal (default OFF — full-history backtest showed solo box-breaks
+  // are negative-EV, PF 0.80-0.89; they still count toward confluence when the toggle is off).
+  const [yellowBoxEnabled, setYellowBoxEnabled] = useState(() => getPersistedSetting("yellowBoxEnabled", true));
+  const [yellowBoxSolo,    setYellowBoxSolo]    = useState(() => getPersistedSetting("yellowBoxSolo", false));
+  // QUALITY GATE (data-driven, shared/quality-gate.ts): DEFAULT ON. A setup class (signalType ×
+  // interval) that failed the full-history bar (PF ≥ 1.05 AND expectancy > 0.1 pts) emits nothing.
+  // Persisted escape hatch only — deliberately NOT exposed in the Settings UI yet.
+  const [qualityGateEnabled] = useState(() => getPersistedSetting("qualityGateEnabled", true));
+  // ICT + FRACTAL CONFIRMATIONS (2026-07-15): corroborator-only fact toggles, DEFAULT ON.
+  // The terminal's Strategies dropdown owns the UI (terminalSettings mirrors them into
+  // mwb_settings as ictConfirmEnabled / fractalConfirmEnabled); read-only here at mount —
+  // this page never writes them, so a terminal change applies on the next reload.
+  const [ictConfirmEnabled] = useState(() => getPersistedSetting("ictConfirmEnabled", true));
+  const [fractalConfirmEnabled] = useState(() => getPersistedSetting("fractalConfirmEnabled", true));
+  // FRACTAL GEOMETRY CONFIRMATIONS (2026-07-15 guide-study mission): corroborator-only facts
+  // from shared/fractal-geometry.ts (vector reclaim / flat bounce / compression / wave room /
+  // yesterday's-closes cross + chase/exhaustion contradictions). Same contract as ICT/fractal.
+  const [fractalGeoConfirmEnabled] = useState(() => getPersistedSetting("fractalGeoConfirmEnabled", true));
+  // DAILY LOSS STOP — REMOVED FROM DEFAULTS 2026-08-17 (user directive: "take away the rule
+  // for the funded accounts" after the −80 stop, tripped by the overnight ETH loss run closing
+  // at the open, suppressed the whole RTH session; the prop firm's own daily limits govern).
+  // Was default ON at DAILY_LOSS_STOP_DEFAULT_PTS since 2026-08-02. The persistence key is
+  // BUMPED (dailyLossStopEnabled → dailyLossStopEnabled2) so the new default-OFF wins over the
+  // old persisted true on every client; the toggle in Settings → Risk Controls still re-enables.
+  // Server mirror (catchup.ts computeDayLossStop) is likewise 0 by default.
+  const [dailyLossStopEnabled, setDailyLossStopEnabled] = useState(() => getPersistedSetting("dailyLossStopEnabled2", false));
+  const [dailyLossStopPts, setDailyLossStopPts] = useState(() => getPersistedSetting("dailyLossStopPts", DAILY_LOSS_STOP_DEFAULT_PTS));
+  // DEAD-TAPE SUPPRESSION (2026-08-02 — the measured 5.6%-win rule promoted to gate-level
+  // enforcement, default ON; this is the escape hatch back to flag-only display).
+  const [deadTapeSuppressEnabled, setDeadTapeSuppressEnabled] = useState(() => getPersistedSetting("deadTapeSuppressEnabled", true));
+  // POSITION SIZING (2026-08-02 — EXPLICIT OPT-IN, default OFF): when ON, auto-trade orders use
+  // the engine's combo-tier suggestedContracts (PROVEN combo = 2, else 1) instead of the fixed
+  // "Contracts per trade" setting. OFF = behavior unchanged (the stored setting stays
+  // authoritative server-side). UI: Settings drawer → Auto Trade.
+  const [sizeByComboTier, setSizeByComboTier] = useState(() => getPersistedSetting("sizeByComboTier", false));
+  const sizeByComboTierRef = useRef(false);
   const [showSignalsPanel, setShowSignalsPanel] = useState(false);
   const [showLabels,    setShowLabels]    = useState(() => getPersistedSetting("showLabels", true));
   const [autoScale,     setAutoScale]     = useState(true);
@@ -901,6 +883,10 @@ export default function MarketPage() {
   const [showZoneList,  setShowZoneList]  = useState(false);
   const [startDayIdx, setStartDayIdx] = useState(0);
   const [endDayIdx,   setEndDayIdx]   = useState(59);
+  // CANDLE WINDOW (2026-09-24): "<symbol>|<day count>|<windowSize>" the indices above were last
+  // SET for by the window effect. Until it matches, windowedDays uses the default window (last
+  // windowSize days) — the initial 0..59 must never reach a query (it asked for 2019-08-04).
+  const [dayWindowSettledFor, setDayWindowSettledFor] = useState("");
   // Default window = 90 days so the initial load is fast & reliable. Loading "ALL"
   // (2yr of 5m ≈ 100k candles ≈ 10MB / 12s) is too heavy to fetch on first paint and
   // leaves the chart blank — the user can still pick a larger window from the dropdown
@@ -937,7 +923,7 @@ export default function MarketPage() {
   const footprintCandlesRef = useRef<FootprintCandle[]>([]); // PERF: ref for signal computation — avoids triggering recompute on every heartbeat
   const [footprintCandles, setFootprintCandles]           = useState<FootprintCandle[]>([]); // FOOTPRINT-TIER: kept for display (ladder panel count)
   const [fpCompletedVersion, setFpCompletedVersion]       = useState(0); // PERF: increments only on new complete bar — gates allConfluenceSignals recompute
-  const [footprintAlerts, setFootprintAlerts]             = useState<Record<number, { pocPrice: number; message: string }>>({}); // FOOTPRINT-TIER:
+  // (footprintAlerts state DELETED 2026-07-13 — dead with the server's delta mid-trade alert.)
 const [showFpPanel, setShowFpPanel]                     = useState(false); // FOOTPRINT-TIER: toggle side-panel ladder
   const [fpSession, setFpSession] = useState<"rth" | "eth">("rth"); // FIX: controlled session; was hardcoded rth=true in fpLadderData and internal useState in badge — badge toggle had no effect on canvas column
   const [showBacktest, setShowBacktest]   = useState(false);
@@ -956,7 +942,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const [autoTradeToast, setAutoTradeToast] = useState<{ ok: boolean; msg: string; direction: string; price: number } | null>(null);
   const autoTradeToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Confirmed auto-trade: signal must persist 3s before order is sent.
-  const pendingAutoTradeRef  = useRef<{ timer: ReturnType<typeof setTimeout>; key: string } | null>(null);
+  // ALL-INTERVAL AUTO-TRADE (2026-08-13 user directive: "auto trade all intervals — no
+  // missed signals"): each interval+direction owns its own pending confirm slot (the old
+  // single slot let a 1m fire CANCEL a pending 15m order), and order attempts are deduped
+  // per interval+direction+bar INDEPENDENTLY of the notification keys (the degraded bg
+  // scanner consuming a notification key must never starve the engine stream's order).
+  const pendingAutoTradeMapRef = useRef<Map<string, { timer: ReturnType<typeof setTimeout>; key: string }>>(new Map());
+  const orderAttemptRef = useRef<Record<string, number>>({});
   // Live snapshot of all active signal keys (time_direction) across every interval.
   // Updated synchronously so the 3s confirmation callback always reads fresh data.
   const latestSignalsRef     = useRef<Set<string>>(new Set());
@@ -967,8 +959,6 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const autoTradeIntervalRef     = useRef<Set<string>>(new Set(["5m"]));
   const autoTradeTp1OnlyRef      = useRef(false);
   const autoTradeDirectionRef    = useRef<"both" | "long" | "short">("both");
-  const useTrailerRef            = useRef(getPersistedSetting("useTrailer", false));
-  const trailerOffsetRef         = useRef(getPersistedSetting("trailerOffset", 2.0));
   const [themeKey, setThemeKey] = useState<string>(() => getPersistedSetting("themeKey", "motivewave"));
   const [customTheme, setCustomTheme] = useState<ChartTheme>(() => getPersistedSetting("customTheme", CHART_THEMES.motivewave));
   const currentTheme: ChartTheme = themeKey === "custom" ? customTheme : (CHART_THEMES[themeKey] ?? CHART_THEMES.motivewave);
@@ -988,7 +978,8 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     try { return JSON.parse(localStorage.getItem("saved_views") ?? "[]"); } catch { return []; }
   });
   const [viewNameInput, setViewNameInput] = useState("");
-  const [signalWinRates, setSignalWinRates] = useState<Record<string, { winRate: number; sampleCount: number }>>({});
+  // (signalWinRates state + /api/signals/win-rates fetch DELETED 2026-07-13 — dead since the
+  //  points model was retired; nothing read it.)
 
   function toggleFavSymbol(sym: string) {
     setFavoriteSymbols(prev => {
@@ -1074,18 +1065,19 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           setAutoTradeTp1Only(d.tp1Only);
           autoTradeTp1OnlyRef.current = d.tp1Only;
         }
+        ethAlertsEnabledRef.current = (d as { ethAlertsEnabled?: boolean }).ethAlertsEnabled === true;
       })
       .catch(() => {});
   }, []); // mount only
-
-  // Fetch data-driven win rates for ML confidence scores (loads once, updates signalWinRates)
+  // ETH alert switch (2026-10-01): re-read every 60 s so a Settings change reaches this tab
+  // without a reload (the auto_trade_state WS broadcast does not carry it).
   useEffect(() => {
-    fetch("/api/signals/win-rates")
-      .then(r => r.json())
-      .then((d: { winRates?: Record<string, { winRate: number; sampleCount: number }> }) => {
-        if (d.winRates) setSignalWinRates(d.winRates);
-      })
-      .catch(() => {});
+    const t = window.setInterval(() => {
+      fetch("/api/trade/settings").then(r => r.ok ? r.json() : null)
+        .then((d: { ethAlertsEnabled?: boolean } | null) => { if (d) ethAlertsEnabledRef.current = d.ethAlertsEnabled === true; })
+        .catch(() => {});
+    }, 60_000);
+    return () => window.clearInterval(t);
   }, []);
 
   // Load Discord webhook — localStorage first (survives server restarts when DB is over quota),
@@ -1145,8 +1137,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   useEffect(() => { autoTradeIntervalRef.current     = autoTradeIntervals; },    [autoTradeIntervals]);
   useEffect(() => { autoTradeTp1OnlyRef.current      = autoTradeTp1Only; },      [autoTradeTp1Only]);
   useEffect(() => { autoTradeDirectionRef.current    = autoTradeDirection; },    [autoTradeDirection]);
-  useEffect(() => { useTrailerRef.current            = useTrailer; },             [useTrailer]);
-  useEffect(() => { trailerOffsetRef.current         = trailerOffset; },          [trailerOffset]);
+  useEffect(() => { sizeByComboTierRef.current       = sizeByComboTier; },       [sizeByComboTier]); // POSITION SIZING (2026-08-02)
 
   // ── Persist settings to localStorage ──────────────────────────────────────
   useEffect(() => {
@@ -1161,29 +1152,29 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         autoTradeIntervals:  [...autoTradeIntervals],
         autoTradeTp1Only,
         autoTradeDirection,
-        useTrailer,
-        trailerOffset,
-        useZoneTargets,
-        takeSideEntries,
+        zoneReactionPts,
+        yellowBoxEnabled, yellowBoxSolo,
+        // RISK CONTROLS + POSITION SIZING (2026-08-02; loss-stop key bumped 2026-08-17)
+        dailyLossStopEnabled2: dailyLossStopEnabled, dailyLossStopPts, deadTapeSuppressEnabled, sizeByComboTier,
       }));
     } catch {}
   }, [selectedSymbol, themeKey, customTheme, showVector, showMlZones, showMilkZones, showETH, showLabels,
       chartRiskLevel, exitStrategy, windowSize, interval, autoTradeEnabled, autoTradeContracts, autoTradeContractType,
-      autoTradeRiskLevels, autoTradeIntervals, autoTradeTp1Only, autoTradeDirection, useTrailer, trailerOffset, useZoneTargets, takeSideEntries]);
+      autoTradeRiskLevels, autoTradeIntervals, autoTradeTp1Only, autoTradeDirection, zoneReactionPts,
+      yellowBoxEnabled, yellowBoxSolo, dailyLossStopEnabled, dailyLossStopPts, deadTapeSuppressEnabled, sizeByComboTier]);
 
   // When exit strategy changes, clear all non-DB-locked signal levels so they recompute
   // with the new TP/SL parameters. DB-locked signals are re-applied on the next render.
   // Verified (permanent) signals are immediately re-seeded so their TP/SL never change mid-trade.
   useEffect(() => {
     lockedSignalLevelsRef.current.clear();
-    beTriggeredRef.current.clear();
     permanentSignalLevelsRef.current.forEach((val, key) => lockedSignalLevelsRef.current.set(key, val));
-  }, [exitStrategy, useTrailer, trailerOffset, useZoneTargets]);
+  }, [exitStrategy]);
 
   // ── Live confluence alert ─────────────────────────────────────────────────
   const [liveAlert, setLiveAlert] = useState<{
     direction: "Long" | "Short";
-    price: number; tp1: number; tp2: number; sl: number;
+    price: number; tp1: number; tp2: number | null; sl: number;
     time: number; interval: string;
     riskLevel?: string;
     confidence?: number;
@@ -1209,6 +1200,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const discordSentRef = useRef<Set<string>>(new Set());
   // Ref so fireSignalNotification always sees latest discordWebhook without stale closure
   const discordWebhookRef = useRef<string>("");
+  // MUTE OVERNIGHT ALERTS (2026-10-01, owner-approved R2a): mirrors tradeSettings.ethAlertsEnabled
+  // (GET /api/trade/settings, mount + 60 s poll). Default false = ETH fires are record-only: no
+  // Discord POST, no desktop notification, no sound. The server route gates Discord too.
+  const ethAlertsEnabledRef = useRef<boolean>(false);
 
   const chartRef          = useRef<ChartHandle>(null);
   const timelineRef       = useRef<HTMLDivElement>(null);
@@ -1239,6 +1234,18 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const lastWsTickMsRef = useRef<number>(0);
   // PERF: throttle forming-bar setLiveCandles updates — complete bars always update immediately
   const lastFormingBarUpdateMs = useRef<number>(0);
+  // BAR-CLOSE LATENCY FIX (2026-08-07): live COMPLETED-bar tails for EVERY engine resolution.
+  // The HTTP secondary fetches (raw1mData / rawCandleData / raw60mData) have staleTime:Infinity
+  // and refetch only on rare data_updated invalidations — in a long-lived tab the engine's
+  // non-primary slices froze at page load, so cross-interval facts (1m/5m vector tabletops on
+  // the 15m chart etc.) silently vanished and gate-passing signals were MISSED live (the
+  // 2026-08-07 09:30 15m Long was only back-filled by catchup at 09:48). These tails accumulate
+  // complete:true WS bars per resolution and are merged onto the HTTP arrays inside the engine
+  // memos; completedBarVersion triggers exactly one evaluation per completed bar per interval
+  // (React 18 batching folds the visible-interval liveCandles update into the same render).
+  const liveCompleteTailRef = useRef<Record<"1" | "5" | "15" | "60", CandleBar[]>>({ "1": [], "5": [], "15": [], "60": [] });
+  const [completedBarVersion, setCompletedBarVersion] = useState(0);
+  const LIVE_TAIL_CAP = 600; // bars kept per resolution (10h of 1m) — history depth comes from HTTP
   // Tracks last handleRefresh timestamp — HTTP poll skips for 3s after refresh to prevent
   // stale in-memory server bars from overwriting freshly loaded DB data
   const lastRefreshMsRef = useRef<number>(0);
@@ -1369,6 +1376,190 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         .catch(() => {}); // gap-fill is best-effort, never fatal
     }
 
+    // RANGED data_updated (2026-09-18 — "the chart is having trouble staying live / is laggy").
+    // The server now stamps data_updated with `fromTs` (sec): ONLY rows at/after it changed
+    // (gap-heal inserts, contract-guard flips, roll repair). The old handler invalidated EVERY
+    // cached-continuous query on every message — this hidden engine page holds up to seven
+    // multi-week windows (the 1m ones are several MB each), and their refetch + JSON parse + full
+    // engine recompute run on the SAME main thread as the visible terminal chart. For a ranged
+    // message each ACTIVE query instead refetches only [fromTs − 6h context .. its own `to`] and
+    // splices the rows at/after the (hour-aligned) fromTs into its cached snapshot.
+    //   • SELF-VERIFYING: the 6h of context rows must byte-match the cached rows for the same
+    //     span (proves the ranged response went through the identical serve-time filter chain /
+    //     resolution as the full one) — any mismatch, resolution/source change, error, inactive
+    //     query or whole-window range falls back to the old full invalidation of THAT query, so
+    //     the engine input is always exactly what a full refetch would have produced.
+    //   • A window that ends BEFORE fromTs cannot contain a changed row (the HTTP windows are
+    //     load-time snapshots ending ~1h after mount; the live edge is WS-fed) — no refetch.
+    //   • Hour alignment keeps every 5m/15m/60m bucket whole (the server floors `from` to the
+    //     hour too, and its 15m-from-5m fallback aggregates whole buckets).
+    let rangedChain: Promise<void> = Promise.resolve(); // ranged refreshes run one at a time
+    async function refreshRangedFrom(fromSec: number): Promise<void> {
+      const CONTEXT_SEC = 6 * 3600;
+      const spliceFrom = Math.floor(fromSec / 3600) * 3600;
+      const queries = queryClient.getQueryCache().findAll({ queryKey: ["/api/data/cached-continuous", selectedSymbol] });
+      await Promise.all(queries.map(async (q) => {
+        const key = q.queryKey as readonly unknown[];
+        const fullRefetch = () => queryClient.invalidateQueries({ queryKey: key, exact: true });
+        const iv = key[2], qFrom = key[3], qTo = key[4];
+        const cached = q.state.data as { candles?: CandleBar[]; source?: string; resolution?: string } | undefined;
+        if (typeof qTo === "number" && spliceFrom > qTo) return; // window ends before the changed range
+        if (!q.isActive() || typeof iv !== "string" || typeof qFrom !== "number" || typeof qTo !== "number" || !cached?.candles?.length) return fullRefetch();
+        // (CANDLE WINDOW 2026-09-24: the background-15m "bg" query is gone — bg15m is now a memo
+        // over the 5m entry, so splicing the 5m key re-derives it; every remaining key is a
+        // passthrough of its own URL.)
+        if (spliceFrom <= qFrom) return fullRefetch(); // the changed range covers the whole window
+        try {
+          const ctxFrom = Math.max(qFrom, spliceFrom - CONTEXT_SEC);
+          const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/${iv}?from=${ctxFrom}&to=${qTo}`);
+          if (!r.ok) throw new Error("ranged refresh failed");
+          const d = await r.json();
+          if (d?.error || !Array.isArray(d?.candles)) throw new Error("ranged refresh malformed");
+          if ((d.resolution ?? null) !== (cached.resolution ?? null) || (d.source ?? null) !== (cached.source ?? null)) throw new Error("ranged refresh basis changed");
+          const fresh = d.candles as CandleBar[];
+          // Compare only what the snapshot could have held: it was taken at page load, so rows
+          // after its own newest bar never existed in it, and that newest bar itself may be a
+          // then-partial coarse bucket (60m in progress at load) — both are excluded.
+          const ctxEnd = Math.min(spliceFrom, cached.candles[cached.candles.length - 1].time);
+          const ctxNew = fresh.filter(c => c.time >= ctxFrom && c.time < ctxEnd);
+          const ctxOld = cached.candles.filter(c => c.time >= ctxFrom && c.time < ctxEnd);
+          // An EMPTY context (weekend / halt before the range) proves nothing → full refetch.
+          const sameCtx = ctxNew.length > 0 && ctxNew.length === ctxOld.length && ctxNew.every((c, i) => {
+            const o = ctxOld[i];
+            return o.time === c.time && o.open === c.open && o.high === c.high && o.low === c.low && o.close === c.close;
+          });
+          if (!sameCtx) throw new Error("ranged refresh context mismatch");
+          // A refetch / window change landed while we awaited — that data is newer; leave it.
+          if (queryClient.getQueryData(key) !== cached) return;
+          queryClient.setQueryData(key, {
+            ...cached,
+            candles: [...cached.candles.filter(c => c.time < spliceFrom), ...fresh.filter(c => c.time >= spliceFrom)],
+          });
+        } catch {
+          return fullRefetch();
+        }
+      }));
+    }
+
+    // LIVE-EDGE BACKFILL (2026-09-18, adversarial review). This page is always mounted and every
+    // cached-continuous window ends at mount + 1 h, so once the tab is older than that
+    // refreshRangedFrom returns early for EVERY query ("the live edge is WS-fed") — and a bare
+    // data_updated only refetches those same load-time windows. That assumption no longer always
+    // holds: yahoo-live sends ONE {data_updated, fromTs} instead of per-bar messages when a cycle
+    // inserts > 10 new 1m bars (outage catch-up), gap-heal's > 10-bar path does the same, and at
+    // a contract-guard RECOVERY the last ~10–15 min were only ever sent as PROVISIONAL bars (which
+    // this page skips by design). Those minutes never reached liveCompleteTailRef / liveCandles,
+    // so the engine evaluated bar closes on slices with a HOLE just behind the live edge until a
+    // reload. On every data_updated (ranged or bare) the stored rows since
+    // max(fromTs, now − 10 h = LIVE_TAIL_CAP of 1m) are therefore upserted for every resolution
+    // the tails track — REPLACE semantics (the store is canonical: heals / roll-purge refills
+    // must win over what the WS delivered) — and into liveCandles for the visible interval,
+    // then completedBarVersion is bumped ONCE.
+    //   • CLOSED buckets only, never the current wall-clock bucket (the live stream owns it).
+    //   • PARTIAL COARSE ROWS: deriveRange rewrites the 5m/15m/60m row after EVERY completed 1m,
+    //     and while Yahoo drives its rows trail the wall clock by ~10 min — a wall-clock-closed
+    //     coarse bucket can still be a partial row. 1m is fetched FIRST (derive runs in the same
+    //     turn as the 1m commit, so every coarse row read afterwards already contains it) and a
+    //     coarse row is taken only when the newest stored 1m bar covers the bucket's END — the
+    //     same "complete" rule yahoo-live uses for its bar broadcasts. A partial row admitted
+    //     here would be evaluated as a bar close and AGAIN when the complete bar arrives.
+    //   • Upsert only — nothing is deleted here (the contract_guard handler owns regime drops).
+    //   • Serialized on rangedChain (after the ranged splice) and coalesced: a burst of
+    //     data_updated queues one pass from the earliest fromTs.
+    //   • Independent of the chart lock (the hole is ENGINE input); liveCandles still honours
+    //     it exactly like fetchGapCandles (nothing at/below baseEndTs).
+    let wsEffectDisposed = false; // set by the effect cleanup — a late response must not write the next symbol's tails
+    let backfillQueued = false;
+    let backfillFromSec = Infinity;
+    async function backfillLiveEdge(fromSec: number): Promise<void> {
+      const sym = selectedSymbol.toUpperCase();
+      if (!sym.match(/^(ES|NQ|YM|CL|GC|SI|NG|MES|MNQ|RTY)[A-Z]?\d*$/i)) return; // futures only — same gate as fetchGapCandles
+      const startSec = Math.floor(Date.now() / 1000);
+      const from = Math.floor(Math.max(fromSec, startSec - 10 * 3600) / 3600) * 3600; // hour-aligned = whole coarse buckets (the server floors it too)
+      const pull = async (ivName: "1m" | "5m" | "15m" | "60m"): Promise<{ candles: CandleBar[]; resolution?: string } | null> => {
+        try {
+          const r = await fetch(`/api/data/cached-continuous/${sym}/${ivName}?from=${from}`);
+          if (!r.ok) return null;
+          const d = await r.json();
+          return d && !d.error && Array.isArray(d.candles) ? d : null;
+        } catch { return null; }
+      };
+      const d1 = await pull("1m");
+      const [d5, d15, d60] = await Promise.all([pull("5m"), pull("15m"), pull("60m")]);
+      if (wsEffectDisposed) return;
+      const nowSec = Math.floor(Date.now() / 1000);
+      // Newest instant the stored 1m bars cover. Without a 1m answer fall back to Yahoo's lag
+      // with margin (20 min) — never assume a young coarse row is whole.
+      const last1m = d1?.candles?.length ? d1.candles[d1.candles.length - 1].time : 0;
+      const coveredEnd = last1m > 0 ? last1m + 60 : nowSec - 20 * 60;
+      const usable = (c: CandleBar, sec: number): boolean =>
+        Number.isFinite(c.time) && c.time % sec === 0 &&
+        c.time + sec <= nowSec && (sec === 60 || c.time + sec <= coveredEnd) &&
+        isFinite(c.open) && isFinite(c.high) && isFinite(c.low) && isFinite(c.close) &&
+        c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0 && c.high > c.low;
+      const toBar = (c: CandleBar): CandleBar => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, rth: isRTH(c.time) });
+      // /15m serves native "15" rows, or 5m rows already aggregated to 15m server-side — both are
+      // 15m bars; normalizeServed15m is the SAME clean/align step candleData applies to them.
+      const rows15 = d15 ? normalizeServed15m(d15.candles, d15.resolution) : [];
+      const sets: Array<{ res: "1" | "5" | "15" | "60"; iv: string; sec: number; rows: CandleBar[] }> = [
+        { res: "1",  iv: "1m",  sec: 60,   rows: d1?.candles ?? [] },
+        { res: "5",  iv: "5m",  sec: 300,  rows: d5?.candles ?? [] },
+        { res: "15", iv: "15m", sec: 900,  rows: rows15 },
+        { res: "60", iv: "60m", sec: 3600, rows: d60?.candles ?? [] },
+      ];
+      let tailsChanged = false;
+      for (const s of sets) {
+        const tail = liveCompleteTailRef.current[s.res];
+        for (const c of s.rows) {
+          if (!usable(c, s.sec)) continue;
+          let lo = 0, hi = tail.length;
+          while (lo < hi) { const mid = (lo + hi) >> 1; if (tail[mid].time < c.time) lo = mid + 1; else hi = mid; }
+          const ex = lo < tail.length && tail[lo].time === c.time ? tail[lo] : null;
+          if (ex) {
+            if (ex.open === c.open && ex.high === c.high && ex.low === c.low && ex.close === c.close) continue;
+            tail[lo] = toBar(c);
+          } else {
+            tail.splice(lo, 0, toBar(c));
+          }
+          tailsChanged = true;
+        }
+        if (tail.length > LIVE_TAIL_CAP) tail.splice(0, tail.length - LIVE_TAIL_CAP);
+      }
+      // Visible interval → liveCandles (the engine's PRIMARY input via windowedCandles). Chosen
+      // at APPLY time from the already-fetched set, so an interval switch that landed while the
+      // fetches were in flight can never be fed the old interval's bars.
+      const vis = sets.find(s => s.iv === intervalRef.current);
+      const visRows = (vis ? vis.rows.filter(c => usable(c, vis.sec)) : [])
+        .filter(c => !(chartLockedRef.current && c.time <= baseEndTsRef.current))
+        .map(toBar);
+      if (visRows.length) {
+        setLiveCandles(prev => {
+          const byTime = new Map<number, CandleBar>();
+          for (const c of prev) byTime.set(c.time, c);
+          let changed = false;
+          for (const c of visRows) {
+            const ex = byTime.get(c.time);
+            if (ex && ex.open === c.open && ex.high === c.high && ex.low === c.low && ex.close === c.close) continue;
+            byTime.set(c.time, c);
+            changed = true;
+          }
+          return changed ? [...byTime.values()].sort((a, b) => a.time - b.time) : prev;
+        });
+      }
+      if (tailsChanged) setCompletedBarVersion(v => v + 1); // ONE evaluation for the whole backfill
+    }
+    function queueLiveEdgeBackfill(fromSec: number): void {
+      backfillFromSec = Math.min(backfillFromSec, fromSec);
+      if (backfillQueued) return;
+      backfillQueued = true;
+      rangedChain = rangedChain.then(() => {
+        const f = backfillFromSec;
+        backfillQueued = false;
+        backfillFromSec = Infinity;
+        return backfillLiveEdge(f);
+      }).catch(() => {});
+    }
+
     function connect() {
       setLiveStatus("connecting");
       const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws/live-bars`;
@@ -1391,7 +1582,16 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             const sel     = normalizeSymbol(selectedSymbol);
             if (tickSym && sel && tickSym === sel) {
               const p = msg.price as number;
-              if (typeof p === "number" && isFinite(p) && p > 0) {
+              // STALE-TICK GUARD (2026-09-17): the Yahoo fallback's tick carries a bar-close
+              // time and Yahoo's CME feed runs ~10 min delayed — never let a ten-minute-old
+              // print pose as the live price (same rule as useTerminalData).
+              // (2026-09-18) Prefer the SERVER-computed msg.ageMs — browser-clock math dropped
+              // every live tick on a client whose clock ran >2 min ahead and admitted stale ones
+              // on a clock running behind; Date.now() − msg.time is only the old-server fallback.
+              const tickAge = typeof msg.ageMs === "number" && Number.isFinite(msg.ageMs) ? msg.ageMs
+                : Number.isFinite(msg.time as number) ? Date.now() - Number(msg.time) : 0;
+              const stale = tickAge > 120_000;
+              if (typeof p === "number" && isFinite(p) && p > 0 && !stale) {
                 // Track last tick time so HTTP poll doesn't overwrite live prices
                 lastWsTickMsRef.current = Date.now();
                 lastLivePriceRef.current = p;
@@ -1405,27 +1605,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 const _ivSec = _iv === "1m" ? 60 : _iv === "60m" ? 3600 : _iv === "15m" ? 900 : 300;
                 const _bucket = Math.floor(Date.now() / 1000 / _ivSec) * _ivSec;
                 chartRef.current?.updateLastBarClose(p, _bucket);
-
-                // Break-even: once price is 3+ pts in profit, move SL to entry (once per signal)
-                const BE_TRIGGER = 3;
-                let beFired = false;
-                for (const sig of openSignalsRef.current) { // PERF: pre-filtered to open signals only
-                  const isLong = sig.direction === "Long";
-                  const keyBase = `${sig.time}_${sig.direction}`;
-                  if (beTriggeredRef.current.has(keyBase)) continue;
-                  const locked = lockedSignalLevelsRef.current.get(keyBase);
-                  if (!locked) continue;
-                  const entry = locked.price;
-                  const triggered = isLong
-                    ? p >= entry + BE_TRIGGER && locked.sl < entry
-                    : p <= entry - BE_TRIGGER && locked.sl > entry;
-                  if (triggered) {
-                    lockedSignalLevelsRef.current.set(keyBase, { ...locked, sl: entry });
-                    beTriggeredRef.current.add(keyBase);
-                    beFired = true;
-                  }
-                }
-                if (beFired) setBeVersion(v => v + 1);
+                // (Break-even logic DELETED 2026-07-13 per user spec rule 12 — SL never moves.)
               }
             }
             return;
@@ -1456,23 +1636,85 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             // reverting the chart). Exception: within 60s of a manual Reload the MW study
             // was just forced to reconnect, so this bulk_bars IS the fresh data we want.
             const isPostReload = Date.now() - lastRefreshMsRef.current < 60_000;
-            if (chartLockedRef.current && !isPostReload) return;
-            // Before first manual Refresh: gate 10s to avoid double-refetch on initial load.
-            // Skip this gate during post-reload window — we WANT the bulk_bars data_updated.
-            if (!isPostReload && Date.now() - lastRefreshMsRef.current < 10_000) return;
             const updatedSym = normalizeSymbol(msg.symbol as string);
             const selSym = normalizeSymbol(selectedSymbol);
+            // LIVE-EDGE BACKFILL (2026-09-18): queued for EVERY data_updated of this symbol, ranged
+            // or bare, BEFORE the chart-lock gate — the lock protects the displayed history from a
+            // revert, but the hole this fills is engine input behind the live edge (see
+            // backfillLiveEdge; its liveCandles upsert honours the lock itself). Runs on
+            // rangedChain, i.e. after the ranged splice queued below.
+            const queueBackfill = () => {
+              if (updatedSym && selSym && updatedSym === selSym) {
+                queueLiveEdgeBackfill(typeof msg.fromTs === "number" && Number.isFinite(msg.fromTs) && msg.fromTs > 0 ? msg.fromTs as number : 0);
+              }
+            };
+            if (chartLockedRef.current && !isPostReload) { queueBackfill(); return; }
+            // Before first manual Refresh: gate 10s to avoid double-refetch on initial load.
+            // Skip this gate during post-reload window — we WANT the bulk_bars data_updated.
+            if (!isPostReload && Date.now() - lastRefreshMsRef.current < 10_000) { queueBackfill(); return; }
             if (updatedSym && selSym && updatedSym === selSym) {
-              queryClient.invalidateQueries({ queryKey: ["/api/data/cached-continuous"] });
+              // RANGED (2026-09-18): a finite msg.fromTs = only rows at/after it changed → splice
+              // that range into the cached windows (refreshRangedFrom, self-verifying, falls back
+              // to a full invalidation per query). No fromTs → the old full invalidation.
+              if (typeof msg.fromTs === "number" && Number.isFinite(msg.fromTs) && msg.fromTs > 0) {
+                // Serialized: two overlapping splices would each start from the same cached
+                // snapshot and the later (possibly WIDER) one would be discarded as stale.
+                const rangedFrom = msg.fromTs as number;
+                rangedChain = rangedChain.then(() => refreshRangedFrom(rangedFrom)).catch(() => {});
+              } else {
+                queryClient.invalidateQueries({ queryKey: ["/api/data/cached-continuous"] });
+              }
               queryClient.invalidateQueries({ queryKey: ["/api/data/cached-days", selectedSymbol] });
+              queueBackfill(); // after the splice above on rangedChain — the windows end at mount + 1 h, the live edge is past them
+            }
+            return;
+          }
+          // CONTRACT GUARD (2026-09-18): flip / roll / offset = the PRICE REGIME of MotiveWave's
+          // live data just changed (raw ↔ translated onto the front month, or a re-measured
+          // offset). The forming entry for the CURRENT bucket was built across both regimes —
+          // drop it (and any current-bucket entry of the completed tails) so the engine never
+          // evaluates a candle with a ~66-pt regime seam inside it; the next canonical bar
+          // re-seeds it. "snapshot" (sent on every WS connect) is state only — no reset.
+          // DETECTION WINDOW (2026-09-18, adversarial review): dropping only the CURRENT bucket
+          // was not enough for flip / roll. The verdict lands ~15–40 min after the mismatch began
+          // (Yahoo's ~10-min lag + the 4-pair rule) and MotiveWave's bars of that whole window are
+          // already in liveCandles / the completed tails on the OLD regime. At a TRIP Yahoo's
+          // canonical bars for the SAME buckets then merged max/min INTO them → cross-contract
+          // seam candles (a 66-pt range) in the engine's primary slice, and the secondaries kept
+          // wrong-month closed bars. flip / roll therefore drop every entry whose bucket reaches
+          // into the last 45 min (bucket END after now − 45 min — a coarse bar that STARTED earlier
+          // still holds window minutes). The server purges the same window from the store at the
+          // trip and follows with a ranged data_updated → backfillLiveEdge restores the canonical
+          // rows. An "offset" re-measure stays current-bucket only (1–2 pt re-centre).
+          if (msg.type === "contract_guard") {
+            const gSym = normalizeSymbol(msg.symbol as string);
+            const gSel = normalizeSymbol(selectedSymbol);
+            if (gSym && gSel && gSym === gSel && (msg.event === "flip" || msg.event === "roll" || msg.event === "offset")) {
+              const nowSec = Math.floor(Date.now() / 1000);
+              const REGIME_WINDOW_SEC = 45 * 60;
+              const cutSec = msg.event === "offset" ? nowSec : nowSec - REGIME_WINDOW_SEC;
+              // First bucket (per bar size) that overlaps [cutSec, now]; cutSec = now → the current bucket.
+              const dropFrom = (sec: number) => Math.floor(cutSec / sec) * sec;
+              const _giv = intervalRef.current;
+              const _gSec = _giv === "1m" ? 60 : _giv === "60m" ? 3600 : _giv === "15m" ? 900 : 300;
+              const liveDropFrom = dropFrom(_gSec);
+              setLiveCandles(prev => (prev.some(c => c.time >= liveDropFrom) ? prev.filter(c => c.time < liveDropFrom) : prev));
+              const tails = liveCompleteTailRef.current;
+              for (const [res, sec] of [["1", 60], ["5", 300], ["15", 900], ["60", 3600]] as const) {
+                const tail = tails[res];
+                const cb = dropFrom(sec);
+                while (tail.length && tail[tail.length - 1].time >= cb) tail.pop();
+              }
+              lastFormingBarUpdateMs.current = 0; // let the next forming bar through immediately
             }
             return;
           }
           if (msg.type === "bar_persisted") {
             // Fired when a single completed bar is written to DB. The bar is already in
             // liveCandles via the WS "bar" message above, so no query refetch is needed —
-            // the chart already shows it. Background signal queries self-refresh on their
-            // own refetchInterval (30s). This handler exists only to consume the message.
+            // the chart already shows it. (2026-08-07 note: the engine's live edge for ALL
+            // resolutions now comes from liveCompleteTailRef, fed by the complete "bar"
+            // messages — the HTTP queries stay load-time snapshots by design.)
             return;
           }
           // AutoTrader ack/error/queued forwarded from Java study
@@ -1573,11 +1815,8 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             } // PERF:
             return; // FOOTPRINT-TIER:
           } // FOOTPRINT-TIER:
-          if (msg.type === "footprint_alert") { // FOOTPRINT-TIER:
-            const { signalId, pocPrice, message } = msg as { signalId: number; pocPrice: number; message: string }; // FOOTPRINT-TIER:
-            setFootprintAlerts(prev => ({ ...prev, [signalId]: { pocPrice, message } })); // FOOTPRINT-TIER:
-            return; // FOOTPRINT-TIER:
-          } // FOOTPRINT-TIER:
+          // (footprint_alert handler DELETED 2026-07-13 — the server's delta mid-trade
+          //  divergence producer is gone under rule 7.)
           if (msg.type === "footprint_data_confirmed") { // FOOTPRINT-RULE: real MW tick bid/ask data has arrived
             setFootprintDataConfirmed(true); // FOOTPRINT-RULE: flip flag — ladder now shows real data, not blank
             return; // FOOTPRINT-RULE:
@@ -1588,6 +1827,17 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           const sym = normalizeSymbol(raw.symbol as string);
           const sel = normalizeSymbol(selectedSymbol);
           if (!sym || !sel || sym !== sel) return;
+          // PROVISIONAL BARS ARE DISPLAY-ONLY (2026-09-18, contract guard): bar.provisional ===
+          // true = built from MotiveWave ticks TRANSLATED onto the front month while MW's chart
+          // is on the wrong contract — never stored; Yahoo's canonical bar for the same bucket
+          // arrives ~10 min later as a normal bar message. This page is the ENGINE: admitting
+          // them made it evaluate a bar close on translated OHLC and then AGAIN on the canonical
+          // bar (tailChanged → a second completedBarVersion bump) — duplicate / contradictory
+          // persisted live fires. They therefore never enter liveCompleteTailRef (no version
+          // bump) and never merge into liveCandles (the engine's primary input, forming-bar
+          // path included). This hidden page's own chart stays tick-live regardless: translated
+          // ticks keep driving updateLastBarClose above.
+          if (raw.provisional === true) return;
           // Filter by resolution: only apply bars that match the visible interval
           // 1m chart → accept resolution "1"; 5m/15m → accept resolution "5" or "15"; 60m → accept "60"
           const iv = intervalRef.current;
@@ -1595,6 +1845,26 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           const wantRes = iv === "1m" ? "1" : iv === "60m" ? "60" : "5";
           // For 15m: accept either "5" (bucket client-side) or "15" (exact MW bars — use directly)
           const isExact15m = iv === "15m" && msgRes === "15";
+          // BAR-CLOSE LATENCY FIX (2026-08-07): accumulate COMPLETED bars for every engine
+          // resolution — including ones the visible chart filters out below — so the engine's
+          // non-primary slices track the live edge (see liveCompleteTailRef). One version bump
+          // per completed bar per interval = one engine evaluation (React batches the visible-
+          // interval's setLiveCandles into the same render, so no double pass).
+          if (raw.complete === true && (msgRes === "1" || msgRes === "5" || msgRes === "15" || msgRes === "60") &&
+              isFinite(raw.open) && isFinite(raw.high) && isFinite(raw.low) && isFinite(raw.close) &&
+              raw.open > 0 && raw.high > 0 && raw.low > 0 && raw.close > 0 && raw.high >= raw.low) {
+            const tail = liveCompleteTailRef.current[msgRes];
+            const cb: CandleBar = { time: raw.time, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume, rth: isRTH(raw.time) };
+            let tlo = 0, thi = tail.length;
+            while (tlo < thi) { const tmid = (tlo + thi) >> 1; if (tail[tmid].time < cb.time) tlo = tmid + 1; else thi = tmid; }
+            const ex = tlo < tail.length && tail[tlo].time === cb.time ? tail[tlo] : null;
+            // Re-broadcasts of an identical bar (tick-rollover + MW official push) don't re-trigger;
+            // an MW-official HEAL with different OHLC does (the engine should see healed data).
+            const tailChanged = !ex || ex.open !== cb.open || ex.high !== cb.high || ex.low !== cb.low || ex.close !== cb.close;
+            if (ex) { if (tailChanged) tail[tlo] = cb; }
+            else { tail.splice(tlo, 0, cb); if (tail.length > LIVE_TAIL_CAP) tail.splice(0, tail.length - LIVE_TAIL_CAP); }
+            if (tailChanged) setCompletedBarVersion(v => v + 1);
+          }
           if (msgRes && msgRes !== wantRes && !isExact15m) return;
           // For 15m with 5m bars: bucket client-side. For exact "15" bars: use time as-is.
           const bucketSec = (iv === "15m" && !isExact15m) ? Math.floor(raw.time / 900) * 900 : raw.time;
@@ -1606,11 +1876,31 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
               raw.high < raw.low) return;
 
           const bar: CandleBar = { time: bucketSec, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume, rth: isRTH(bucketSec) };
-          // PERF: throttle forming-bar state updates to at most 1/2s — reduces allConfluenceSignals recomputes
-          // Complete bars (raw.complete === true) always pass through immediately
+          // FORMING BAR FOR AN ALREADY-CLOSED BUCKET (2026-09-18, captured live): the only
+          // connected LiveBarRelay sat on a MotiveWave chart set to 10-MINUTE bars while still
+          // tagging them resolution "5" (the study resolves its resolution once) — {resolution:"5",
+          // complete:false} bars starting :40/:50 whose range keeps growing PAST the 5m boundary,
+          // re-broadcast ~7/s. The same-time merge below matched them to the already-CLOSED 5m
+          // entry in liveCandles (on 15m the :10–:20 / :40–:50 bars hit the closed :00 / :30
+          // buckets): that closed candle took the current price as its close and absorbed the
+          // next minutes' range — and windowedCandles lets liveCandles override the DB row, so the
+          // engine's primary slice carried a wrong LAST-CLOSED bar. A forming bar can only ever
+          // describe the CURRENT wall-clock bucket; one whose display bucket has already ended
+          // is dropped (useTerminalData has the equivalent older-bucket return). BEFORE the
+          // throttle, so that stream cannot consume the 5 s slot and starve the true forming bar.
+          // Complete bars are untouched (late heals / Yahoo's delayed canonical bars).
+          if (raw.complete !== true) {
+            const _barIvSecs = iv === "1m" ? 60 : iv === "60m" ? 3600 : iv === "15m" ? 900 : 300;
+            if (bucketSec + _barIvSecs <= Math.floor(Date.now() / 1000)) return;
+          }
+          // PERF: throttle forming-bar state updates — each one triggers a FULL runFactEngine
+          // pass over the ~6.6k-bar window (measured 150–400ms typical, ~1s spikes). 2026-07-30:
+          // 2s → 5s; the engine main-thread share dropped accordingly. Complete bars
+          // (raw.complete === true) always pass through immediately, so BAR-CLOSE signal latency
+          // is unchanged — only intra-candle (C8 forming-bar) evaluation cadence widened.
           if (!raw.complete) {
             const now = Date.now();
-            if (now - lastFormingBarUpdateMs.current < 2000) return;
+            if (now - lastFormingBarUpdateMs.current < 5000) return;
             lastFormingBarUpdateMs.current = now;
           }
           setLiveCandles(prev => {
@@ -1625,6 +1915,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
               const newHigh = Math.max(existing.high, bar.high);
               const newLow  = Math.min(existing.low,  bar.low);
               // Skip state update if nothing meaningful changed (suppresses heartbeat noise)
+              // (2026-09-18 NOTE — deliberately NOT mirroring useTerminalData's "a tick within 5 s
+              //  owns the close" merge rule here: on this page ticks never touch liveCandles (they
+              //  go straight to the chart via updateLastBarClose), so existing.close is always the
+              //  PREVIOUS bar message's close, never a fresher tick. Keeping it while ticks flow
+              //  would FREEZE the forming close the engine's intra-candle pass reads. With
+              //  provisional bars excluded above, every bar reaching this merge is either MW-live
+              //  (on-contract) or Yahoo-canonical (MW absent/off-contract) — never a mix.)
               if (existing.close === bar.close && existing.high === newHigh && existing.low === newLow && existing.rth === bar.rth) return prev;
               const merged: CandleBar = {
                 time:   bar.time,
@@ -1647,6 +1944,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       };
 
       ws.onclose = () => {
+        // ZOMBIE SOCKET (2026-09-18): the effect cleanup closes the socket, and this handler then
+        // fired AFTER the cleanup had cleared the timer — re-arming connect() inside the DISPOSED
+        // closure. Every symbol change / manual Refresh (wsReconnectKey) / HMR save left one more
+        // immortal socket running the OLD closure's handlers (old symbol filter, old code) next to
+        // the new one. A disposed effect never reconnects (useTerminalData's `closed` flag).
+        if (wsEffectDisposed) return;
         setLiveStatus("disconnected");
         reconnectTimer = setTimeout(connect, 2000); // reconnect in 2s, not 5s
       };
@@ -1662,6 +1965,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
     connect();
     return () => {
+      wsEffectDisposed = true; // no reconnect from onclose, no late backfill write into the next symbol's tails
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     };
@@ -1669,6 +1973,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
   // Reset live candles when the symbol or interval changes
   useEffect(() => { setLiveCandles([]); }, [selectedSymbol, interval]);
+  // BAR-CLOSE LATENCY FIX: tails are per-symbol — drop them when the symbol changes.
+  // (Interval changes keep them: tails cover ALL resolutions regardless of the visible chart.)
+  useEffect(() => { liveCompleteTailRef.current = { "1": [], "5": [], "15": [], "60": [] }; }, [selectedSymbol]);
 
   // Reset alert trackers when symbol changes — new symbol's history should not fire
   useEffect(() => {
@@ -1698,7 +2005,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // ── Queries ─────────────────────────────────────────────────────────────
   const { data: symbolsData } = useQuery<SymbolsData>({ queryKey: ["/api/market/symbols"] });
 
-  const { data: cachedDaysData, isLoading: daysLoading } = useQuery<{ symbol: string; days: DayInfo[] }>({
+  const { data: cachedDaysData, isLoading: daysLoading, isError: daysError } = useQuery<{ symbol: string; days: DayInfo[] }>({
     queryKey: ["/api/data/cached-days", selectedSymbol],
     staleTime: 60_000,
   });
@@ -1718,12 +2025,20 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       const end = sortedDays.length - 1;
       setEndDayIdx(end);
       setStartDayIdx(Math.max(0, end - windowSize + 1));
+      setDayWindowSettledFor(`${selectedSymbol}|${sortedDays.length}|${windowSize}`);
     }
   }, [sortedDays.length, selectedSymbol, windowSize]);
 
-  const windowedDays = useMemo(() =>
-    sortedDays.slice(startDayIdx, endDayIdx + 1),
-    [sortedDays, startDayIdx, endDayIdx]);
+  // CANDLE WINDOW (2026-09-24): the effect above runs AFTER the render in which the day list
+  // lands, so that render used the stale initial 0..59 → windowedDays[0] = the FIRST cached day
+  // (2019-08-04) and all seven candle queries fired with it (1m = 248 MB / ~20 s of server
+  // thread, twice). resolveDayRange substitutes the default window (the same one the effect is
+  // about to set) until the indices are settled for this symbol / day count / window size.
+  const dayWindowSettled = dayWindowSettledFor === `${selectedSymbol}|${sortedDays.length}|${windowSize}`;
+  const windowedDays = useMemo(() => {
+    const r = resolveDayRange(sortedDays.length, windowSize, startDayIdx, endDayIdx, dayWindowSettled);
+    return r ? sortedDays.slice(r.start, r.end + 1) : [];
+  }, [sortedDays, startDayIdx, endDayIdx, windowSize, dayWindowSettled]);
 
   const monthTicks = useMemo(() => {
     const ticks: { label: string; pct: number }[] = [];
@@ -1741,38 +2056,128 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
   scrubberStateRef.current = { total: sortedDays.length, windowSize };
 
-  // Fallback: when no DB days loaded yet, use last 730 days so the query always fires
-  const fallbackFromTs = useMemo(() => Math.floor(Date.now() / 1000) - 730 * 86400, []);
+  // CANDLE WINDOW (2026-09-24): no candle query fires while cached-days is loading (fromTs 0 →
+  // every `enabled:` below is false). The old "last 730 days so the query always fires" fallback
+  // was a 71 MB 1m request (twice) on every page load, discarded one render later. The fallback
+  // now serves ONLY the cached-days-failed / no-days path, and is 10 days.
+  const mountNowSec = useMemo(() => Math.floor(Date.now() / 1000), []);
+  const daysState = daysStateOf({ loading: daysLoading, error: daysError, count: sortedDays.length });
   // toTs is always "now + 24h" — stable (computed once on mount), always covers today's session
   // regardless of how long the user keeps the app open.
   // Using windowedDays last date for toTs would exclude today's bars if today isn't yet in the
   // day list, causing the query key to cascade-change the moment today's date is added.
   const stableToTs = useMemo(() => Math.floor(Date.now() / 1000) + 86400, []);
-  const fromTs = useMemo(() => windowedDays.length ? dateToTs(windowedDays[0].date, 0) : fallbackFromTs, [windowedDays, fallbackFromTs]);
+  // 0 = not ready (queries disabled). Used as-is by day-zones (server caps its span); every
+  // candle fetch uses the per-interval capped `from` below.
+  const fromTs = useMemo(
+    () => windowStartTs(daysState, windowedDays.length ? dateToTs(windowedDays[0].date, 0) : null, mountNowSec),
+    [daysState, windowedDays, mountNowSec]);
   const toTs   = useMemo(() => {
     const nowTs = Math.floor(Date.now() / 1000) + 3600;
     return Math.min(stableToTs, nowTs); // never request bars dated in the future
   }, [stableToTs]);
 
-  const fetchInterval = interval === "60m" ? "60m" : interval === "1m" ? "1m" : interval === "15m" ? "15m" : "5m";
+  // CANDLE WINDOW (2026-09-24): per-interval fetch caps REGARDLESS of the scrubber — 1m ≤ 14 d,
+  // 5m ≤ 90 d, 15m ≤ 400 d, 60m unlimited (a 90-day 1m window is ~10 MB; ALL was 248 MB). Each
+  // resolution has ONE `from`, so every consumer of the same URL shares ONE query key (C2) —
+  // windowQueryPlan (client/src/lib/candle-window.ts, unit-tested in
+  // scripts/cached-continuous-cap.test.ts) builds every key + enabled flag on this page.
+  const wq = useMemo(
+    () => windowQueryPlan({ symbol: selectedSymbol, viewInterval: interval, showVector, fromTs, toTs }),
+    [selectedSymbol, interval, showVector, fromTs, toTs]);
+  const fetchInterval = wq.fetchInterval;
+  const windowCapNote = windowCapHint(fromTs, toTs, fetchInterval);
 
+  // WINDOW_QUERY_OPTIONS on EVERY window observer (C2, 2026-09-25): observers of one key share
+  // one Query and query-core applies each observer's options to it, so the bg 5m observer's
+  // default retry used to override this query's fail-fast on the 5m view. staleTime Infinity =
+  // never auto-refetch (only handleRefresh / data_updated invalidations change chart data);
+  // window focus / reconnect must not silently revert the chart; retry off = candleError at once.
   const { data: rawCandleData, isLoading: candlesLoading, error: candleError } = useQuery<{
     symbol: string; interval: string; candles: CandleBar[]; source: string; resolution?: string;
   }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, fetchInterval, fromTs, toTs],
+    queryKey: wq.main.key,
+    queryFn: ({ signal }) => fetchContinuousWindow(selectedSymbol, fetchInterval, wq.main.from, toTs, signal),
+    enabled: wq.main.enabled,
+    ...WINDOW_QUERY_OPTIONS,
+  });
+
+  // YELLOW-BOX: fetch every trading day's walk-forward Yellow Box for the loaded range. Keyed by
+  // [symbol, fromTs, toTs] so it refetches when the window extends. Completed days are served from the
+  // server's immutable cache; today's box recomputes on request. Interval-independent (boxes are per-day).
+  const { data: dayZonesData } = useQuery<{ days: YbDayZone[] }>({
+    queryKey: ["/api/yellowbox/day-zones", selectedSymbol, fromTs, toTs],
     queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/${fetchInterval}?from=${fromTs}&to=${toTs}`);
+      const r = await fetch(`/api/yellowbox/day-zones?symbol=${selectedSymbol}&fromTs=${fromTs}&toTs=${toTs}`);
       if (!r.ok) throw new Error("Failed");
       const d = await r.json();
       if (d.error) throw new Error(d.error);
       return d;
     },
     enabled: fromTs > 0 && toTs > 0,
-    staleTime: Infinity,         // never auto-refetch — only handleRefresh (invalidateQueries) changes chart data
-    refetchOnWindowFocus: false, // window focus must not silently revert the chart
-    refetchOnReconnect: false,   // network reconnect must not silently revert the chart
+    staleTime: 60_000,           // today's box is provisional — allow a light refresh window
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     retry: false,
   });
+  // PML/TML (LIVE-ONLY money lines from the options chain — /api/pml-tml, 3-min server cache).
+  // Feeds runFactEngine's liveLevels: corroborator facts marked backtestable:false that only
+  // enumerate on the live edge. No historical options data exists — never in any backtest.
+  const { data: pmlTmlData } = useQuery<{ skipped: string | null; pml?: number; tml?: number }>({
+    queryKey: ["/api/pml-tml", selectedSymbol],
+    queryFn: async () => {
+      const r = await fetch(`/api/pml-tml?symbol=${selectedSymbol}`);
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    },
+    staleTime: 3 * 60_000,
+    refetchInterval: 3 * 60_000, // levels move with the chain — keep the live edge current
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    retry: false,
+  });
+
+  // RISK DISPLAY (2026-07-30): the dead-tape baseline (median session-day range) from
+  // GET /api/risk/combo-stats — computed server-side by the SAME shared implementation the
+  // backtest harness uses (parity-asserted). RETRY UNTIL IT LANDS (2026-08-07): the old
+  // fetch-once shape left the median null for the tab's whole lifetime after one failed
+  // fetch (server mid-boot), and the engine then fired UNGATED all session — the exact
+  // [same-day-drift] mechanism behind 2026-08-06's three unluck-gated fires. The engine
+  // side now fails CLOSED without the median (deadTapeFailClosed), so this retry is what
+  // restores signal emission after a transient fetch failure.
+  const [riskMedianDayRange, setRiskMedianDayRange] = useState<number | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const attempt = (): void => {
+      void fetchRiskComboStats().then(s => {
+        if (cancelled) return;
+        if (s && Number.isFinite(s.medianDayRange) && s.medianDayRange > 0) {
+          setRiskMedianDayRange(s.medianDayRange);
+        } else {
+          console.warn("[risk] dead-tape median unavailable — engine fails CLOSED; retrying in 30s");
+          timer = setTimeout(attempt, 30_000);
+        }
+      }).catch(() => {
+        if (cancelled) return;
+        console.warn("[risk] combo-stats fetch failed — engine fails CLOSED; retrying in 30s");
+        timer = setTimeout(attempt, 30_000);
+      });
+    };
+    attempt();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, []);
+
+  // Engine inputs (plain data — the framework-agnostic fact engine consumes these directly).
+  const feDayZones = useMemo<YellowboxDayZone[]>(() => (dayZonesData?.days ?? []).map(d => ({
+    dayKeyET: d.dayKeyET, sessionStartTs: d.sessionStartTs, sessionEndTs: d.sessionEndTs,
+    boxTop: d.boxTop, boxBottom: d.boxBottom, initRes: d.initRes, initSup: d.initSup,
+  })), [dayZonesData]);
+  // Chart layer: gold boxes spanning each session + thin dashed init-res / init-sup lines.
+  const activeYellowBoxes = useMemo<YellowBox[]>(() => (dayZonesData?.days ?? []).map(d => ({
+    topPrice: d.boxTop, bottomPrice: d.boxBottom, fromTime: d.sessionStartTs, toTime: d.sessionEndTs,
+    initRes: d.initRes, initSup: d.initSup,
+  })), [dayZonesData]);
 
   // Track latest timestamp from rawCandleData so fetchGapCandles knows which bars to skip when locked
   useEffect(() => {
@@ -1786,123 +2191,71 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   const candleData = useMemo(() => {
     if (!rawCandleData?.candles?.length) return rawCandleData;
     if (interval === "15m") {
-      // The server serves NATIVE 15m bars (resolution "15") when available and only
-      // falls back to 5m aggregation when no 15m bars exist. Aggregating already-15m
-      // data with agg5mTo15m re-buckets it AND merges live forming bars (which arrive at
-      // non-15m-aligned timestamps with volume 0) into adjacent real bars — corrupting the
-      // most recent candles. So: if the data is already 15m, pass it through (cleaned +
-      // aligned); only aggregate when the server fell back to 5m.
-      const isNative15m = rawCandleData.resolution === "15";
-      // Pre-filter bad bars (doji-wick spikes / corrupt wicks) before use/aggregation.
-      const clean = rawCandleData.candles.filter(c => {
-        if (!isFinite(c.open) || !isFinite(c.high) || !isFinite(c.low) || !isFinite(c.close)) return false;
-        if (c.high <= c.low) return false; // drops flat zero-range forming "dot" bars
-        const range = c.high - c.low;
-        if (range / c.close > 0.015 && Math.abs(c.open - c.close) / range < 0.10) return false;
-        const bL = Math.min(c.open, c.close), bH = Math.max(c.open, c.close);
-        if ((bL - c.low) / c.close > 0.015 || (c.high - bH) / c.close > 0.015) return false;
-        return true;
-      });
-      if (isNative15m) {
-        // Keep only true 15m-aligned bars — removes the live forming bars that the relay
-        // persists at raw (non-900-aligned) timestamps and that would otherwise appear as
-        // stray candles at the right edge.
-        const aligned = clean.filter(c => c.time % 900 === 0);
-        return { ...rawCandleData, candles: aligned };
-      }
-      return { ...rawCandleData, candles: agg5mTo15m(clean) };
+      // The server serves NATIVE 15m bars (resolution "15") when available and only falls
+      // back to 5m aggregation. LIVE-ADAPTER PARITY (2026-07-17): the clean/align/aggregate
+      // logic lives VERBATIM in @shared/live-adapter normalizeServed15m.
+      return { ...rawCandleData, candles: normalizeServed15m(rawCandleData.candles, rawCandleData.resolution) };
     }
     return rawCandleData;
   }, [rawCandleData, interval]);
 
-  // Secondary 1m fetch — needed to compute the 1m vector on 5m/15m/60m charts.
-  // When the user is already on the 1m chart, rawCandleData IS 1m data so this is disabled.
-  const { data: raw1mData } = useQuery<{
+  // ── Secondary + background candle windows (CANDLE WINDOW C2, 2026-09-24) ──────────────
+  // ONE react-query entry per URL. Before, the vector secondaries (raw1m / raw60m) and the
+  // background-signal fetches (bg1m / bg5m / bg15m / bg60m) used DIFFERENT keys ("bg" suffix)
+  // for the SAME URL, so react-query could not dedupe: every 1m / 5m / 60m window was fetched
+  // (and serialized by the single-threaded server) twice per page load. Now:
+  //   • q1m / q60m serve both the vector secondary and the background pass; each consumer view
+  //     is gated by ITS OWN former `enabled` condition (a disabled observer would otherwise still
+  //     read the shared cache entry — raw1mData must stay undefined when showVector is off, the
+  //     engine slices read it);
+  //   • q5m (bg5m) shares the main query's key on the 5m view;
+  //   • bg15m is DERIVED from q5m (agg5mTo15m) instead of a second /5m fetch — it never shares
+  //     the native-15m main key (that would mix two derivations; see refreshRangedFrom).
+  // Secondary 1m — needed to compute the 1m vector on 5m/15m/60m charts (rawCandleData IS 1m on
+  // the 1m chart, so the secondary view is off there).
+  const { data: q1mData } = useQuery<{
     symbol: string; interval: string; candles: CandleBar[]; source: string;
   }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "1m", fromTs, toTs],
-    queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/1m?from=${fromTs}&to=${toTs}`);
-      if (!r.ok) throw new Error("Failed");
-      return r.json();
-    },
-    enabled: showVector && fetchInterval !== "1m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
+    queryKey: wq.q1m.key,
+    queryFn: ({ signal }) => fetchContinuousWindow(selectedSymbol, "1m", wq.q1m.from, toTs, signal),
+    enabled: wq.q1m.enabled,
+    ...WINDOW_QUERY_OPTIONS,
   });
+  const raw1mData = wq.q1m.rawEnabled ? q1mData : undefined;
+  const bg1mData  = wq.q1m.bgEnabled ? q1mData : undefined;
 
-  // Secondary 60m fetch — needed to compute the 60m vector on 1m/5m/15m charts.
+  // Secondary 60m — needed to compute the 60m vector on 1m/5m/15m charts.
   // Polygon stores 60m bars starting at 09:30 ET (13:30 UTC), not epoch-aligned to 13:00 UTC.
   // Aggregating 5m→60m with Math.floor(t/3600)*3600 produces wrong OHLC buckets for stocks,
   // causing the 60m vector to look completely different from the 60m chart's main vector.
   // Using the actual DB 60m data ensures the same bar alignment as the 60m chart.
-  const { data: raw60mData } = useQuery<{
+  const { data: q60mData } = useQuery<{
     symbol: string; interval: string; candles: CandleBar[]; source: string;
   }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "60m", fromTs, toTs],
-    queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/60m?from=${fromTs}&to=${toTs}`);
-      if (!r.ok) throw new Error("Failed");
-      return r.json();
-    },
-    enabled: showVector && fetchInterval !== "60m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
+    queryKey: wq.q60m.key,
+    queryFn: ({ signal }) => fetchContinuousWindow(selectedSymbol, "60m", wq.q60m.from, toTs, signal),
+    enabled: wq.q60m.enabled,
+    ...WINDOW_QUERY_OPTIONS,
   });
+  const raw60mData = wq.q60m.rawEnabled ? q60mData : undefined;
+  const bg60mData  = wq.q60m.bgEnabled ? q60mData : undefined;
 
   // ── Background candle fetches for background signal monitoring ───────────
   // These run regardless of which interval is being viewed so signals fire
   // from all intervals in real-time, not just the currently displayed one.
   // No auto-refetch — data only updates when handleRefresh explicitly invalidates queries.
-  const { data: bg1mData } = useQuery<{ candles: CandleBar[] }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "1m", fromTs, toTs, "bg"],
-    queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/1m?from=${fromTs}&to=${toTs}`);
-      if (!r.ok) throw new Error("Failed"); return r.json();
-    },
-    enabled: interval !== "1m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
-  });
+  // 5m feeds bg5m (interval ≠ 5m) AND the derived bg15m (interval ≠ 15m) — i.e. always; on the
+  // 5m view it is the main query's own entry (same key), so nothing extra is fetched.
   const { data: bg5mData } = useQuery<{ candles: CandleBar[] }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "5m", fromTs, toTs, "bg"],
-    queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/5m?from=${fromTs}&to=${toTs}`);
-      if (!r.ok) throw new Error("Failed"); return r.json();
-    },
-    enabled: interval !== "5m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
+    queryKey: wq.q5m.key,
+    queryFn: ({ signal }) => fetchContinuousWindow(selectedSymbol, "5m", wq.q5m.from, toTs, signal),
+    enabled: wq.q5m.enabled,
+    ...WINDOW_QUERY_OPTIONS,
   });
-  const { data: bg15mData } = useQuery<{ candles: CandleBar[] }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "15m", fromTs, toTs, "bg"],
-    queryFn: async () => {
-      // 15m is aggregated from 5m
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/5m?from=${fromTs}&to=${toTs}`);
-      if (!r.ok) throw new Error("Failed");
-      const d = await r.json();
-      return { ...d, candles: agg5mTo15m(d.candles ?? []) };
-    },
-    enabled: interval !== "15m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
-  });
-  const { data: bg60mData } = useQuery<{ candles: CandleBar[] }>({
-    queryKey: ["/api/data/cached-continuous", selectedSymbol, "60m", fromTs, toTs, "bg"],
-    queryFn: async () => {
-      const r = await fetch(`/api/data/cached-continuous/${selectedSymbol}/60m?from=${fromTs}&to=${toTs}`);
-      if (!r.ok) throw new Error("Failed"); return r.json();
-    },
-    enabled: interval !== "60m" && fromTs > 0 && toTs > 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
-  });
+  // 15m background bars are aggregated from the 5m window (unchanged derivation, one fetch fewer).
+  const bg15mData = useMemo<{ candles: CandleBar[] } | undefined>(
+    () => bg15mFrom5mData(interval, bg5mData),
+    [bg5mData, interval]);
 
   // raw5mForZones removed — zones now come from ML pipeline, not client-side heuristic
 
@@ -1948,6 +2301,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         if (!r.ok) return;
         const { bar } = await r.json();
         if (!bar) return;
+        // PROVISIONAL (2026-09-18): while MotiveWave is off-contract this route serves its
+        // in-memory bar TRANSLATED onto the front month ({provisional:true}; or {bar:null,
+        // stale:true} when no trusted offset exists) — display-only, same rule as the WS bar
+        // handler: it must never become engine input via liveCandles.
+        if (bar.provisional === true) return;
         // Align timestamp to the same bucket the WS handler uses, so HTTP and WS bars have identical keys.
         // 15m and 60m both receive a 5m forming bar from the server — bucket it to the visible interval.
         const bucketSec = iv === "15m" ? Math.floor(bar.timeSec / 900)  * 900
@@ -2073,77 +2431,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Base candles: historical data sorted+filtered (only reruns when DB data changes)
-  const baseCandles = useMemo(() => {
-    const MAX_PRICE = 9e13;
-    // MIN_PRICE rejects corrupt near-zero values (e.g. 2e-19) that pass "> 0" but destroy Y-scale
-    const MIN_PRICE = 1;
-    const MAX_TS = Math.floor(Date.now() / 1000) + 36 * 3600; // reject future-dated corrupt bars
-    const sorted = (candleData?.candles ?? [])
-      .filter(c => {
-        if (c.time <= 1262304000 || c.time > MAX_TS) return false; // corrupt timestamp
-        if (!isFinite(c.open) || !isFinite(c.high) || !isFinite(c.low) || !isFinite(c.close)) return false;
-        if (c.open < MIN_PRICE || c.high < MIN_PRICE || c.low < MIN_PRICE || c.close < MIN_PRICE) return false;
-        if (c.open >= MAX_PRICE || c.high >= MAX_PRICE || c.low >= MAX_PRICE || c.close >= MAX_PRICE) return false;
-        if (c.high <= c.low) return false; // strict — removes flat dot bars (open=close=high=low)
-        if (!showETH && c.rth === false) return false;
-        // Reject doji-wick spikes: body <10% of range on a bar with >1.5% spread.
-        // These are corrupt MW binary reads — a bad float32 creates an extreme wick while
-        // open/close stay near the real price. Slips through the 5% DB filter but renders
-        // as a huge teal/red column with a hair-thin body on the chart.
-        const range = c.high - c.low;
-        if (range / c.close > 0.015 && Math.abs(c.open - c.close) / range < 0.10) return false;
-        // Reject bars where any wick exceeds 1.5% of price — spike survives doji check when body is large
-        const bL = Math.min(c.open, c.close), bH = Math.max(c.open, c.close);
-        if ((bL - c.low) / c.close > 0.015 || (c.high - bH) / c.close > 0.015) return false;
-        return true;
-      })
-      .sort((a, b) => a.time - b.time);
-    // Neighbor-based outlier filter: reject bars where ANY OHLC value deviates >20%
-    // from the previous bar's close. Catches corrupt tick/bar records that slipped
-    // through server-side validation (e.g. readLastTickRecord returning a wrong float32).
-    const result: CandleBar[] = [];
-    for (const c of sorted) {
-      if (result.length > 0) {
-        const ref = result[result.length - 1].close;
-        if (ref > 0 && (c.low / ref < 0.80 || c.high / ref > 1.20)) continue;
-      }
-      result.push(c);
-    }
-    // Second pass: phantom-bar detection.
-    // Catches corrupt bars where body is large (doji filter misses) but the bar's midpoint
-    // is inconsistent with surrounding price context. Two phantom types:
-    // - Close-type: close is way off; next bar snaps back to prev level (dEnd > 0.5%)
-    // - Open-type: bar opens against a large apparent gap but body fully reverses that gap
-    const final: CandleBar[] = [];
-    for (let i = 0; i < result.length; i++) {
-      if (i > 0 && i < result.length - 1) {
-        const pc = result[i - 1].close, no = result[i + 1].open;
-        const surrounding = (pc + no) / 2;
-        const mid = (result[i].open + result[i].close) / 2;
-        if (surrounding > 0 && Math.abs(mid - surrounding) / surrounding > 0.015) {
-          const dEnd = Math.abs(no - result[i].close) / result[i].close;
-          const isClosePhantom = dEnd > 0.005;
-          const gapDir = result[i].open - pc;
-          const barDir = result[i].close - result[i].open;
-          const isOpenPhantom = Math.abs(gapDir) / pc > 0.01 && Math.sign(barDir) !== Math.sign(gapDir);
-          if (isClosePhantom || isOpenPhantom) continue;
-        }
-      }
-      final.push(result[i]);
-    }
-    // Third pass: isolation filter — a bar must have [low,high] price overlap with at least 7
-    // of its nearest 50 neighbours. Phantom bars at abnormal price levels connect to nobody.
-    const MIN_CONN = 7, CONN_WIN = 25;
-    return final.filter((c, i, arr) => {
-      let conn = 0;
-      for (let j = Math.max(0, i - CONN_WIN); j <= Math.min(arr.length - 1, i + CONN_WIN); j++) {
-        if (j === i) continue;
-        if (arr[j].low <= c.high && arr[j].high >= c.low && ++conn >= MIN_CONN) break;
-      }
-      return conn >= MIN_CONN;
-    });
-  }, [candleData, showETH]);
+  // Base candles: historical data sorted+filtered (only reruns when DB data changes).
+  // LIVE-ADAPTER PARITY (2026-07-17): the full filter chain (timestamp sanity, validity,
+  // showETH gate, >20%-from-prev outlier, phantom-bar midpoint, isolation) lives VERBATIM
+  // in @shared/live-adapter buildBaseCandles so the parity test runs the same code.
+  const baseCandles = useMemo(() => buildBaseCandles(candleData?.candles ?? [], showETH), [candleData, showETH]);
 
   // Merge live bars on top — runs on every tick but is O(liveCandles) not O(all candles)
   const windowedCandles = useMemo(() => {
@@ -2211,15 +2503,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return chartTimes.length ? forwardFillVector(raw, chartTimes) : raw;
   }, [allBarsForVector, windowedCandles]);
 
-  const vectorSignals = useMemo(() =>
-    showVector ? computeVectorSignals(windowedCandles, vectorLine) : [],
-    [showVector, windowedCandles, vectorLine]);
-
-  const vectorOverlays = useMemo(() =>
-    // Limit to last 15 signals — historical bands accumulate alpha and create an opaque shape
-    showVector ? computeVectorTradeOverlays(vectorSignals.slice(-15), windowedCandles, vectorLine)
-               : { bands: [], segments: [] as TradeSegment[] },
-    [showVector, vectorSignals, windowedCandles, vectorLine]);
+  // (vectorSignals + vectorOverlays memos DELETED 2026-07-14 — SIGNAL-INTEGRITY A2.)
 
   // Extra vector lines — all 4 intervals (1m/5m/15m/60m) shown simultaneously.
   // Each vector must be computed from its own native-resolution data so the values
@@ -2274,44 +2558,14 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     return result;
   }, [showVector, rawCandleData, raw1mData, raw60mData, interval, fetchInterval, windowedCandles]);
 
-  // Secondary vector maps used by allConfluenceSignals for tier bonus computation.
-  // extraVectorLines.data is already forward-filled to windowedCandle times, so
-  // building the Map directly from it gives O(1) lookup per candle timestamp.
-  const extraVecSignalLines = useMemo(() => {
-    return extraVectorLines.map(ev => {
-      const map = new Map(ev.data.map(v => [v.time, v.value] as [number, number]));
-      const flatMap     = new Map<number, boolean>();
-      const declineMap  = new Map<number, boolean>();
-      let declining     = false;
-      let lastKnownVal: number | null = null;
-      for (let i = 0; i < ev.data.length; i++) {
-        const curr  = ev.data[i].value;
-        const prev2 = i >= 2 ? ev.data[i - 2].value : null;
-        // flat = vector barely moved over last 2 steps → side-entry environment on that interval
-        flatMap.set(ev.data[i].time, prev2 !== null && Math.abs(curr - prev2) <= 1.0);
-        // decline = vector is in a falling phase (reset on any upward tick)
-        if (lastKnownVal !== null && curr !== lastKnownVal) {
-          declining    = curr < lastKnownVal;
-          lastKnownVal = curr;
-        } else if (lastKnownVal === null) {
-          lastKnownVal = curr;
-        }
-        declineMap.set(ev.data[i].time, declining);
-      }
-      return { label: ev.label, color: ev.color, map, flatMap, declineMap };
-    });
-  }, [extraVectorLines]);
+  // (extraVecSignalLines memo DELETED 2026-07-13 — the retired points model's tier-bonus input;
+  //  the fact engine computes secondary vectors itself inside runFactEngine.)
 
-  const { zoneOverlays: _zoneOverlaysPlaceholder, bandOverlayData: _bandPlaceholder, tradeSegments } = useMemo(() => ({
-    zoneOverlays:    [] as ZoneOverlay[],
-    bandOverlayData: [...vectorOverlays.bands, ...uploadedZones],
-    tradeSegments:   vectorOverlays.segments,
-  }), [vectorOverlays, uploadedZones]);
-
-
+  // (tradeSegments / vector band overlays DELETED 2026-07-14 — SIGNAL-INTEGRITY A2. Only the
+  //  uploaded zone bands remain as band overlays.)
   const zoneOverlays: ZoneOverlay[] = [];
 
-  const bandOverlayData = [...(_bandPlaceholder)];
+  const bandOverlayData = [...uploadedZones];
 
   // Two aggregate footprint ladders: one RTH, one ETH.
   // buildProxyFootprintCandle now returns whole-number levels so no Math.floor needed. // FOOTPRINT-SIZE-FIX:
@@ -2399,7 +2653,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         high: prices[prices.length - 1], low: prices[0], // FOOTPRINT-SIZE-FIX:
         totalBidVol: prices.reduce((s, p) => s + combined.get(p)!.bid, 0), // FOOTPRINT-SIZE-FIX:
         totalAskVol: prices.reduce((s, p) => s + combined.get(p)!.ask, 0), // FOOTPRINT-SIZE-FIX:
-        candleDelta: 0, absorption: null, unfinishedAuction: null, complete: true, imbalances, // FOOTPRINT-SIZE-FIX:
+        absorption: null, unfinishedAuction: null, complete: true, imbalances, // FOOTPRINT-SIZE-FIX:
       }; // FOOTPRINT-SIZE-FIX:
     }; // FOOTPRINT-SIZE-FIX:
 
@@ -2498,7 +2752,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // When a signal fires, its entry/TP/SL are frozen here and never change again.
   // Key: `${time}_${direction}` — unique per bar+direction.
   // This prevents live tick updates from shifting TP/SL levels after signal fires.
-  type LockVal = { price: number; tp1: number; tp2: number; sl: number };
+  type LockVal = { price: number; tp1: number; tp2: number | null; sl: number };
   const lockedSignalLevelsRef = useRef<Map<string, LockVal>>(new Map());
   // Signals verified for 3+ seconds — their TP/SL are frozen forever and survive exit strategy changes
   const permanentSignalLevelsRef = useRef<Map<string, LockVal>>(new Map());
@@ -2518,20 +2772,32 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     footprintReading?: string;
     confidence?: number;
   };
-  const lockedSignalTierRef = useRef<Map<string, LockTier>>(new Map());
-  // Break-even tracking: once price reaches entry ± 3pts, SL moves to entry (once per signal)
-  const beTriggeredRef   = useRef<Set<string>>(new Set());
-  const [beVersion, setBeVersion] = useState(0); // increments to force allConfluenceSignals recompute
+  // (lockedSignalTierRef and all break-even tracking state DELETED 2026-07-13 —
+  //  BE removed per spec rule 12; the tier ref was write-only dead code.)
   // Ref mirror of allConfluenceSignals so the WS tick handler always sees latest signals
   const confluenceSignalsRef = useRef<typeof allConfluenceSignals>([] as any);
 
+  // ── SIGNAL-INTEGRITY B1/B2: intra-candle (forming-bar) signal tracking ──────
+  //  • lastIntraFireTimeRef — time of the most recent intra-candle fire, so evaluateFormingBar's
+  //    cooldown considers previously fired INTRA signals too, not just engine bar-close fires.
+  //  • intraPersistedRef — intra signals persisted to the DB, keyed `${time}_${direction}`.
+  //    When one VANISHES from the next recompute (the reaction cancelled before the bar closed,
+  //    or the bar closed without the engine re-firing it), the retraction effect DELETEs its DB
+  //    row via DELETE /api/signals/history and the server broadcasts `signal_removed` — the
+  //    terminal can never keep showing a signal the market chart retracted.
+  const lastIntraFireTimeRef = useRef<number>(-Infinity);
+  // B5 (2026-09-25): the latest intra-candle fire per direction AS A BRACKET — mirrors
+  // lastIntraFireTimeRef for evaluateFormingBar's `openTrades` (ONE_OPEN_PER_DIRECTION).
+  const lastIntraBracketRef = useRef<Array<{ time: number; direction: string; entry: number; tp1: number; sl: number }>>([]);
+  const intraPersistedRef = useRef<Map<string, { symbol: string; interval: string; timestamp: number; direction: string }>>(new Map());
+
   type CSig = {
     time: number; price: number; high: number; low: number; direction: "Long" | "Short";
-    tp1: number; tp2: number; sl: number; toTime: number;
+    tp1: number; tp2: number | null; sl: number; toTime: number;
     riskLevel: "safeplus" | "safe" | "risky" | "riskiest";
     confirmations: { milkOk: boolean; milkPts?: number; vecOk: boolean; secondaryVecOk: boolean; secondaryVecCount?: number };
     reclassifyReason?: string;
-    outcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
+    outcome?: "win_tp1" | "win_tp2" | "loss" | "open";
     /** True when dated milk zones (fromTime > 0) were loaded at signal compute time */
     zonesLoaded?: boolean;
     /** FOOTPRINT-TIER: JSON-serialized FootprintReading, null when footprint data unavailable */
@@ -2540,573 +2806,438 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     confidence?: number;
     /** FIX: interval at signal creation — used to filter SignalsPanel by current interval */
     interval?: string;
-    /** Signal source — "vector-side-entry" marks the take-every-side-entry-as-Long feature (auto-trade eligible). */
+    /** Signal source — "vector-side-entry" (ETH solo vector), "zone-reaction" (solo strong zone), or "fact-engine". */
     signalType?: string;
+    /** FACT-ENGINE: composite label listing every strategy/fact used, e.g.
+     *  "Vector(5m SE↑ + 15m tabletop) + Zone(support @6512)". Never just "confluence". */
+    label?: string;
+    /** SIGNAL-INTEGRITY B2: true for a forming-bar (intra-candle) fire — tracked so a cancelled
+     *  reaction retracts its persisted DB row via DELETE /api/signals/history. */
+    intraCandle?: boolean;
+    /** BACKTEST-GRADE EXIT DETAIL (2026-07-29) — from the engine's walk-forward; null while open.
+     *  Persisted so live-fired rows carry the same per-trade detail as --persist regen rows. */
+    exitPrice?: number | null;
+    exitTs?: number | null;
+    pointsResult?: number | null;
+    mae?: number | null;
+    mfe?: number | null;
+    barsToExit?: number | null;
+    /** Session-end force-close (engine outcome stays "loss"; persisted DB outcome becomes "eod"). */
+    eodClose?: boolean;
+    /** RISK DISPLAY (2026-07-30): fire-time canonical fact-combo key + situational risk flags
+     *  (display-only — persisted so the Signals tab/detail can show the setup's track record). */
+    comboKey?: string | null;
+    riskFlags?: string[] | null;
+    /** POSITION SIZING (2026-08-02): engine's combo-tier suggested contract count (PROVEN = 2,
+     *  else 1). Display/config-only — only sizes an order under the explicit opt-in. */
+    suggestedContracts?: number | null;
   };
 
+  // ── DAILY LOSS STOP (2026-08-02): today's realized signal P&L across ALL intervals ─────────
+  // Adapter contract (user-approved): dayPnlPts = sum of the CURRENT session day's (Globex,
+  // 18:00 ET roll) CLOSED signal points from the SERVED rows (all four intervals) + the
+  // open-trade mark against the latest price. Refreshed every 60s (a loss stop needs minute
+  // precision, not tick precision). STICKY per session day: once tripped it stays tripped for
+  // the session even if the open-trade mark later recovers — and the trip is logged ONCE.
+  const [dayPnlPts, setDayPnlPts] = useState<number | null>(null);
+  const dayLossTrippedRef = useRef<{ bucket: number; tripped: boolean }>({ bucket: -1, tripped: false });
+  const lastPriceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (windowedCandles.length) lastPriceRef.current = windowedCandles[windowedCandles.length - 1].close;
+  }, [windowedCandles]);
+  useEffect(() => {
+    let cancelled = false;
+    const CLOSED_OUTCOMES = new Set(["win_tp1", "win_tp2", "loss", "eod"]);
+    const compute = async (): Promise<void> => {
+      try {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const bucket = etSessionDayBucket(nowSec);
+        const since = nowSec - 2 * 86400; // safely covers the whole session day
+        const lists = await Promise.all((["1m", "5m", "15m", "60m"] as const).map(iv =>
+          fetch(`/api/signals/history/${selectedSymbol}/${iv}?since=${since}`)
+            .then(r => (r.ok ? r.json() : { signals: [] }))
+            .then(d => (Array.isArray(d?.signals) ? d.signals : []))
+            .catch(() => [] as Array<Record<string, unknown>>)
+        ));
+        if (cancelled) return;
+        let closedPts = 0, openMark = 0;
+        const px = lastPriceRef.current;
+        for (const rows of lists) {
+          for (const r of rows as Array<{ timestamp?: number; outcome?: string | null; pointsResult?: number | null; entry?: number; direction?: string }>) {
+            if (typeof r?.timestamp !== "number" || etSessionDayBucket(r.timestamp) !== bucket) continue;
+            const oc = (r.outcome ?? "open") as string;
+            if (CLOSED_OUTCOMES.has(oc)) {
+              if (typeof r.pointsResult === "number" && Number.isFinite(r.pointsResult)) closedPts += r.pointsResult;
+            } else if (oc === "open" && px != null && typeof r.entry === "number") {
+              openMark += (px - r.entry) * (String(r.direction ?? "").toLowerCase().startsWith("l") ? 1 : -1);
+            }
+          }
+        }
+        const total = Math.round((closedPts + openMark) * 100) / 100;
+        if (dayLossTrippedRef.current.bucket !== bucket) dayLossTrippedRef.current = { bucket, tripped: false }; // new session → reset
+        if (!dayLossTrippedRef.current.tripped && dailyLossStopEnabled && dailyLossStopPts > 0 && total <= -dailyLossStopPts) {
+          dayLossTrippedRef.current.tripped = true;
+          console.warn(`[daily-loss-stop] TRIPPED: day P&L ${total} pts <= -${dailyLossStopPts} — no new signals for the rest of this session (resumes next Globex session)`);
+        }
+        setDayPnlPts(total);
+      } catch { /* transient fetch failure — keep the last reading */ }
+    };
+    void compute();
+    const t = window.setInterval(compute, 60_000);
+    return () => { cancelled = true; window.clearInterval(t); };
+  }, [selectedSymbol, dailyLossStopEnabled, dailyLossStopPts]);
+
+  // ── CROSS-WRITER SEED (2026-09-25, B5): this tab's replays start from the STORED fires ──────
+  // The catch-up pass and the server live engine hand runFactEngine `priorFires` =
+  // loadPriorFires (last 3 days + still-open rows, per interval); this tab reads the SAME list
+  // through GET /api/signals/prior-fires and feeds it to all three of its runFactEngine call
+  // sites (viewed interval, hidden intervals, bg scanners) and to evaluateFormingBar
+  // (lastFireTime + openTrades). Without it the tab's cooldown cursor / open-trade state
+  // restarted at its window's first bar, so it replayed phase-shifted twins of fires another
+  // writer had already stored. Refreshed every 30 s and after each of this tab's persists;
+  // stablePriors keeps each interval's array identity when nothing changed (no memo churn).
+  // A server without the route (pre-restart) answers HTML/404 → no seed (pre-B5 behaviour);
+  // the persist route's admission still guards what is stored either way.
+  const [enginePriors, setEnginePriors] = useState<PriorsByInterval>({});
+  const refreshPriorsRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    let cancelled = false;
+    setEnginePriors(prev => (Object.keys(prev).length ? {} : prev)); // never seed with another symbol's fires
+    const load = async (): Promise<void> => {
+      try {
+        const r = await fetch(`/api/signals/prior-fires/${encodeURIComponent(selectedSymbol)}`);
+        if (!r.ok) return;
+        const parsed = parsePriorFiresResponse(await r.json().catch(() => null));
+        if (cancelled || !parsed) return;
+        setEnginePriors(prev => stablePriors(prev, parsed));
+      } catch { /* transient — keep the last seed */ }
+    };
+    refreshPriorsRef.current = () => { void load(); };
+    void load();
+    const t = window.setInterval(() => { void load(); }, 30_000);
+    return () => { cancelled = true; window.clearInterval(t); refreshPriorsRef.current = () => {}; };
+  }, [selectedSymbol]);
+  const primaryPriors = enginePriors[interval as FeInterval];
+
+  // ── Confluence signals — THE FACT ENGINE (logic-based, no points) ─────────────────────────
+  // The entire decision model lives in the framework-agnostic shared/fact-engine.ts so the live
+  // engine and the offline regeneration + Monte-Carlo calibration script can never diverge. This
+  // memo just marshals live component state into the engine's plain-data inputs, then maps the
+  // fired FactSignals back onto the CSig shape the rest of the UI expects.
   const allConfluenceSignals = useMemo((): CSig[] => {
     if (!windowedCandles.length) return [];
-    // PERF: windowedCandles is already sorted (baseCandles sorted from DB; live bars binary-inserted)
-    const sorted = windowedCandles;
-    const barSec = interval === "1m" ? 60 : interval === "5m" ? 300 : interval === "15m" ? 900 : 3600;
-    const vecMap = new Map(vectorLine.map(v => [v.time, v.value]));
-    // Bull zones: label text is primary (most reliable — directly from Milk's terminology);
-    // color is the fallback for zones with no label or ambiguous text.
-    const isBullZone = (z: ZoneBand): boolean => {
-      if (z.label) {
-        const l = z.label.toLowerCase();
-        // Bear keywords take priority over bull (e.g. "sellers absorb buyers" is bear)
-        if (/sell|resist|bear|supply|absorb\s*buy|cap\s*session|ceiling|non.fair|iv.wall|iv.overflow|pivot(?!.*floor)|gex.wall.short|wall.short|short.median/i.test(l)) return false;
-        if (/buy|demand|support|bull|absorb\s*sell|floor|gex.wall.long|wall.long|long.median|spy.floor|ovn.spy.floor/i.test(l)) return true;
-      }
-      // Color fallback: green/blue/teal hex OR green/blue-dominant rgba
-      const c = z.color.toLowerCase().trim();
-      if (c === "#22c55e" || c === "#3b82f6" || c === "#14b8a6") return true;
-      const m = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-      if (m) { const r = +m[1], g = +m[2], b = +m[3]; return g > r || (b > r && b > g); }
-      return false;
-    };
-    // PERF: pre-compute zone bull/bear classification once — avoids regex on every candle×zone
-    const zoneBullish = activeZones.map(z => isBullZone(z));
+    const fePrimary = interval as FeInterval;
 
-    // ── Exit strategy: tier-aware TP/SL lookup ────────────────────────────────
-    // Changing exitStrategy clears lockedSignalLevelsRef so all signals recompute cleanly.
-    // When Trailer is on, TP1 from the selected tier becomes the activation level (not a fixed exit).
-    const _ep = EXIT_STRATEGY_PROFILES[exitStrategy];
-    const tierExits = (lv: string, rth: boolean) => {
-      const side = rth ? _ep.rth : _ep.eth;
-      return (side as Record<string, { tp1: number; tp2: number; sl: number }>)[lv] ?? side.riskiest;
-    };
+    // Native per-interval candle bases — SAME derivation as extraVectorLines, but we keep the
+    // candle arrays so the engine can run the vector side-entry / tabletop rules on each
+    // interval's OWN bars. LIVE-ADAPTER PARITY (2026-07-17): the derivation (D18 native-15m
+    // spacing detection, secondary aggregation ladder, per-slice vectors) lives VERBATIM in
+    // @shared/live-adapter deriveEngineSlices so the parity test runs the same code.
+    // BAR-CLOSE LATENCY FIX (2026-08-07): overlay the live completed-bar tails so the
+    // non-primary slices track the live edge instead of freezing at page load (the HTTP
+    // secondaries refetch only on rare data_updated invalidations). completedBarVersion in
+    // the deps re-runs this memo exactly once per completed bar per interval.
+    const feTails = liveCompleteTailRef.current;
+    const { slices } = deriveEngineSlices({
+      interval: fePrimary,
+      windowedCandles,
+      raw1mCandles: mergeCompletedTail(raw1mData?.candles, feTails["1"]),
+      rawCandles: mergeCompletedTail(rawCandleData?.candles,
+        rawCandleData?.resolution === "1" || rawCandleData?.resolution === "5" || rawCandleData?.resolution === "15" || rawCandleData?.resolution === "60"
+          ? feTails[rawCandleData.resolution] : undefined),
+      raw60mCandles: mergeCompletedTail(raw60mData?.candles, feTails["60"]),
+    });
+    if (!slices.some(sl => sl.interval === fePrimary)) return [];
 
-    // FOOTPRINT-TIER: build a time-indexed lookup for footprint candles received this session
-    const fpCandlesSnap = footprintCandlesRef.current; // PERF: read from ref — not a React dep
-    const fpByTime = new Map<number, FootprintCandle>(); // FOOTPRINT-TIER:
-    for (const fc of fpCandlesSnap) fpByTime.set(fc.time, fc); // FOOTPRINT-TIER:
+    // Footprint imbalance ZONES for the primary interval — REAL MW clusters ONLY (C12).
+    // No footprint data for a candle ⇒ NO footprint fact. Proxy fabrication from OHLCV is gone.
+    // LIVE-ADAPTER PARITY: the levelCount>=2 cluster rule lives in @shared/live-adapter.
+    const fpSnap = footprintCandlesRef.current;
+    const fpReal = new Map<number, FootprintCandle>();
+    for (const fc of fpSnap) fpReal.set(fc.time, fc);
+    const footprintByTime = buildFootprintMap(windowedCandles, t => fpReal.get(t));
 
-    // FP candles arrive in chronological order and are appended in order — no sort needed
-    const sortedFpCandles = fpCandlesSnap; // PERF: already ordered by arrival time
-    let fpPtr = 0; // advances through sortedFpCandles as we scan sorted candles in order // PERF:
-
-    const raw: CSig[] = [];
-    // Vector side-entry longs collected during the scan (outcome computed via the closure
-    // `walkForward`, so they MUST be built inside the loop); merged into `raw` after the loop.
-    const sideEntryRaw: CSig[] = [];
-    const COOLDOWN_BARS   = 10;
-    const ETH_COOLDOWN    = 20;
-    const PROX_PTS        = 5.0;
-    // Separate cooldowns per direction (LEARNINGS: shared cooldown blocks opposite-direction signals)
-    let lastLongBar     = -COOLDOWN_BARS;
-    let lastLongEthBar  = -ETH_COOLDOWN;
-    let lastShortBar    = -COOLDOWN_BARS;
-    let lastShortEthBar = -ETH_COOLDOWN;
-
-    // Zones with fromTime > 0 are dated session zones (MWML/Discord milk zones).
-    // Zones with fromTime === 0 are persistent structural levels — they don't count
-    // for milk zone confirmation since they have no specific session context.
+    // Uploaded milk zones only (activeZones). Structurally compatible with FiringZone.
+    const feZones = activeZones.map(z => ({ topPrice: z.topPrice, bottomPrice: z.bottomPrice, color: z.color, label: z.label, fromTime: z.fromTime, toTime: z.toTime }));
     const hasDatedZones = activeZones.some(z => (z.fromTime ?? 0) > 0);
 
-    // ── HOD/LOD caution logic ─────────────────────────────────────────────
-    // If TP1 is close to or above HOD (for longs) / below LOD (for shorts),
-    // tighten TP1 so it can actually hit. TP2 is never clamped.
-    const HOD_PROX_PTS  = 3.0;  // within this many pts of HOD/LOD = "close to" (TP1 tightening)
-    const HOD_BUF_PTS   = 2.0;  // set TP1 to HOD − buf (or LOD + buf)
-    const MIN_TP1_PTS   = 3.0;  // never squeeze TP1 below this profit
-    const LOD_ENTRY_PROX = 3.0; // suppress shorts within this many pts above LOD (no downside room)
-    const HOD_ENTRY_PROX = 3.0; // suppress longs within this many pts below HOD (no upside room)
-    let hodDay  = -1;
-    let hodHigh = -Infinity;    // RTH high of day at current candle (including current bar)
-    let hodLow  =  Infinity;    // RTH low of day at current candle
+    // YELLOW-BOX: per-trading-day boxes enter the engine as plain data. Break-outside-box facts count
+    // toward confluence (RTH); the solo toggle lets a lone box-break fire (default off — -EV solo).
+    const feDayZonesInput = yellowBoxEnabled ? feDayZones : [];
 
-    // 60m hard veto: pre-locate the 60m secondary vector line so we can check per-candle
-    const vec60mLine = extraVecSignalLines.find(ev => ev.label === "60m") ?? null;
+    // DAILY LOSS STOP (2026-08-02): sticky-tripped day P&L for the engine. Once the trip ref is
+    // set for the current session, the value handed to the engine is pinned at/below the
+    // threshold so an open-trade-mark recovery can never un-trip mid-session.
+    const lossStopActivePts = dailyLossStopEnabled && dailyLossStopPts > 0 ? dailyLossStopPts : 0;
+    const nowBucket = etSessionDayBucket(Math.floor(Date.now() / 1000));
+    const trippedSticky = dayLossTrippedRef.current.tripped && dayLossTrippedRef.current.bucket === nowBucket;
+    const effectiveDayPnl = dayPnlPts == null ? undefined
+      : trippedSticky && lossStopActivePts > 0 ? Math.min(dayPnlPts, -lossStopActivePts) : dayPnlPts;
 
-    // Precompute rolling 14-bar ATR (O(n) sliding window) — used for vector proximity tests
-    const atrArr = new Float64Array(sorted.length);
-    {
-      let runSum = 0;
-      const buf = new Float64Array(14);
-      let bufLen = 0, bufIdx = 0;
-      for (let i = 0; i < sorted.length; i++) {
-        const b = sorted[i], p = i > 0 ? sorted[i - 1] : b;
-        const tr = Math.max(b.high - b.low, Math.abs(b.high - p.close), Math.abs(b.low - p.close));
-        if (bufLen < 14) { buf[bufIdx % 14] = tr; bufLen++; }
-        else { runSum -= buf[bufIdx % 14]; buf[bufIdx % 14] = tr; }
-        runSum += tr; bufIdx++;
-        atrArr[i] = runSum / bufLen;
-      }
+    const results = runFactEngine({
+      primary: fePrimary,
+      slices,
+      zones: feZones,
+      dayZones: feDayZonesInput,
+      footprintByTime,
+      settings: { ZONE_REACTION_PTS: zoneReactionPts, YELLOWBOX_SOLO: yellowBoxSolo },
+      nowSec: Math.floor(Date.now() / 1000),
+      qualityGateEnabled, // data-driven quality gate (default ON; persisted escape hatch, no UI yet)
+      // ICT + FRACTAL CONFIRMATIONS (2026-07-15): corroborator-only facts (never drivers).
+      // Session liquidity levels are derived INSIDE the engine (deriveSessionLevels on the
+      // primary slice), so this adapter and the backtest harness feed identical inputs.
+      ictEnabled: ictConfirmEnabled,
+      fractalEnabled: fractalConfirmEnabled,
+      // FRACTAL GEOMETRY CONFIRMATIONS (2026-07-15 guide-study mission) — same contract.
+      fractalGeoEnabled: fractalGeoConfirmEnabled,
+      // LIVE-ONLY PML/TML money lines (options chain) — facts marked backtestable:false,
+      // live-edge bars only; the backtest harness never supplies liveLevels.
+      liveLevels: pmlTmlData && !pmlTmlData.skipped ? { pml: pmlTmlData.pml ?? null, tml: pmlTmlData.tml ?? null } : undefined,
+      // RISK BASELINE (2026-07-30 display; 2026-08-02 dead-tape ENFORCEMENT baseline) from
+      // GET /api/risk/combo-stats — the SAME shared computation the harness uses (parity-asserted).
+      dayRangeMedian: riskMedianDayRange ?? undefined,
+      // DEAD-TAPE SUPPRESSION (2026-08-02, default ON — settings escape hatch).
+      deadTapeSuppressEnabled,
+      // FAIL-CLOSED (2026-08-07, journal [same-day-drift]): if the median hasn't landed the
+      // engine emits NOTHING rather than firing ungated (2026-08-06's fires bypassed dead-tape
+      // exactly this way). The fetch below retries until the baseline arrives.
+      deadTapeFailClosed: true,
+      // DAILY LOSS STOP (2026-08-02): 0 = disabled; sticky-tripped value pins the trip.
+      dayPnlPts: effectiveDayPnl,
+      dailyLossStopPts: lossStopActivePts,
+      // CROSS-WRITER SEED (2026-09-25, B5): stored fires = this replay's own earlier fires.
+      ...(primaryPriors?.length ? { priorFires: primaryPriors } : {}),
+    });
+
+    // ── C8: INTRA-CANDLE milk-zone reaction on the FORMING primary bar (live path only) ──
+    // B1 (2026-07-14): the evaluation lives IN the engine — evaluateFormingBar shares the exact
+    // gate/decide/HOD-LOD/exit/label/type/confidence code paths with the bar-close loop (all
+    // session gates evaluated at the forming bar's SCHEDULED close). This memo is a THIN caller
+    // that marshals live state. Cancel semantics stay architectural: the memo recomputes on every
+    // live bar update, so a failed reaction VANISHES from the next recompute — and the B2
+    // retraction effect below DELETEs its persisted DB row (server broadcasts signal_removed).
+    // When the bar closes still qualifying, the engine re-fires the same `${time}_${direction}`
+    // key, so locks transition seamlessly.
+    let intraSignal: (typeof results)[number] | null = null;
+    const formingBar = windowedCandles.length ? windowedCandles[windowedCandles.length - 1] : undefined;
+    if (formingBar && (formingBar as any).complete === false && feZones.length) {
+      const closedBars = windowedCandles.filter(c => (c as any).complete !== false);
+      // Forming bar's REAL footprint zones (C12) — same levelCount≥2 cluster rule as the map above
+      // (the closed-bar map skips the forming bar, so read fpReal directly).
+      const ffc = fpReal.get(formingBar.time);
+      const formingFpZones: FpImbalanceZone[] = ffc
+        ? ffc.imbalances.filter(im => im.levelCount >= 2).map(im => ({ startPrice: im.startPrice, endPrice: im.endPrice, direction: im.direction, levelCount: im.levelCount }))
+        : [];
+      // Cooldown considers engine bar-close fires AND previously fired intra signals (B1) —
+      // but only fires strictly BEFORE this forming bar (the current bar's own fire must not
+      // suppress itself across recomputes).
+      const lastEngineFire = results.length ? results[results.length - 1].time : -Infinity;
+      const priorIntraFire = lastIntraFireTimeRef.current < formingBar.time ? lastIntraFireTimeRef.current : -Infinity;
+      // B5 (2026-09-25): stored fires from the other writers count too (strictly before this bar).
+      const lastStoredFire = latestFireTimeBefore([primaryPriors], formingBar.time);
+      const lastFire = Math.max(lastEngineFire, priorIntraFire, lastStoredFire);
+      // ONE_OPEN_PER_DIRECTION (2026-09-25, B5 — the engine support existed, nothing fed it): the
+      // latest bracket per direction before this bar across this run's bar-close fires, the
+      // stored fires and prior intra fires; the engine resolves each itself.
+      const openTrades = openTradesBefore([
+        results.map(r => ({ time: r.time, direction: r.direction, entry: r.price, tp1: r.tp1, sl: r.sl })),
+        primaryPriors,
+        lastIntraBracketRef.current,
+      ], formingBar.time);
+      intraSignal = evaluateFormingBar({
+        interval: fePrimary,
+        formingBar: formingBar as any,
+        closedCandles: closedBars as any,
+        zones: feZones,
+        footprintZones: formingFpZones,
+        lastFireTime: Number.isFinite(lastFire) ? lastFire : undefined,
+        openTrades,
+        settings: { ZONE_REACTION_PTS: zoneReactionPts },
+        qualityGateEnabled, // same gate as the bar-close loop
+        // RISK DISPLAY (2026-07-30): same display-only inputs as the bar-close loop.
+        dayZones: feDayZonesInput,
+        dayRangeMedian: riskMedianDayRange ?? undefined,
+        // DEAD-TAPE + DAILY LOSS STOP (2026-08-02): identical enforcement to the bar-close loop.
+        deadTapeSuppressEnabled,
+        deadTapeFailClosed: true, // 2026-08-07 — same fail-closed contract as the bar-close loop
+        dayPnlPts: effectiveDayPnl,
+        dailyLossStopPts: lossStopActivePts,
+      });
     }
-    // How many bars back to look for a vector test (price heading towards the vector)
-    const VEC_TEST_BARS = 5;
+    const allResults = intraSignal ? [...results, intraSignal] : results;
 
-    for (let i = 0; i < sorted.length; i++) {
-      const c      = sorted[i];
-
-      // Never fire a signal on the current forming bar (complete === false).
-      // Forming bars have a live close that oscillates each second — signals
-      // computed here would appear, disappear, and re-appear within the same candle.
-      // Signals on completed bars (complete === true or undefined for historical) are permanent.
-      if ((c as any).complete === false) continue;
-
-      // ── Update HOD/LOD before any early-exit so all RTH bars are counted ──
-      const utcH    = (c.time / 3600 | 0) % 24;
-      const minsUtc = utcH * 60 + ((c.time / 60 | 0) % 60);
-      const rthC    = c.rth ?? isRTH(c.time);
-      const cDay    = Math.floor(c.time / 86400);
-      if (cDay !== hodDay) { hodDay = cDay; hodHigh = -Infinity; hodLow = Infinity; }
-      // Capture HOD/LOD BEFORE the current bar (prevents suppressing valid breakout/breakdown bars).
-      const prevDayHodHigh = hodHigh;
-      const prevDayHodLow  = hodLow;
-      if (rthC) { if (c.high > hodHigh) hodHigh = c.high; if (c.low < hodLow) hodLow = c.low; }
-      // Suppress short entries approaching LOD from above (selling into a floor, no downside room).
-      const nearLodShort = rthC && prevDayHodLow < Infinity
-        && c.close > prevDayHodLow && c.close <= prevDayHodLow + LOD_ENTRY_PROX;
-      // Suppress long entries approaching HOD from below (buying into a ceiling, no upside room).
-      const nearHodLong = rthC && prevDayHodHigh > -Infinity
-        && c.close >= prevDayHodHigh - HOD_ENTRY_PROX && c.close < prevDayHodHigh;
-
-      const lb     = vecMap.get(c.time);
-      const prevLb = i >= 3 ? vecMap.get(sorted[i - 3].time) : undefined;
-
-      if (isMarketBreak(c.time)) continue;
-      if (lb == null) continue;
-      // USER RULE: no signals (confluence OR side-entry) in the RTH-close window 3:15–5:00 PM ET —
-      // too risky into the close. ETH side-entries (outside RTH) are unaffected.
-      if (rthC && isAfter315ET(c.time)) continue;
-
-      // Compute milk-zone bonuses for both directions in a single pass.
-      // Scoring:
-      //   close currently INSIDE the zone → 4 pts (best — price is in the zone right now)
-      //   close within 0.5 pts of zone bottom/top → 3 pts
-      //   close between 0.5 and 1.5 pts outside zone → 1 pt (partial touch)
-      //   close more than 1.5 pts outside zone → 0 pts
-      const isRthForMilk = rthC && minsUtc >= 13 * 60 + 30 && minsUtc < 20 * 60 + 30;
-      let milkPtsL = 0, milkPtsS = 0;
-      let milkBullOk = false, milkBearOk = false;
-      if (isRthForMilk) {
-        for (let zi = 0; zi < activeZones.length; zi++) {
-          const z = activeZones[zi];
-          // Only dated zones (fromTime > 0) count for milk confirmation — static structural
-          // zones (fromTime=0) have no session context and would bleed into all history.
-          if (!(z.fromTime ?? 0) || c.time < z.fromTime! || (z.toTime != null && c.time > z.toTime)) continue;
-          const bull = zoneBullish[zi];
-          if (bull) {
-            if (c.low <= z.topPrice + 0.5) {
-              const inZone = c.close >= z.bottomPrice && c.close <= z.topPrice;
-              const below = z.bottomPrice - c.close; // positive = close is below zone bottom
-              const pts = inZone ? 4 : below <= 0.5 ? 3 : below <= 1.5 ? 1 : 0;
-              if (pts > milkPtsL) { milkPtsL = pts; if (pts > 0) milkBullOk = true; }
-            }
-          } else {
-            if (c.high >= z.bottomPrice - 0.5) {
-              const above = c.close - z.topPrice; // positive = close is above zone top
-              const inZone = c.close >= z.bottomPrice && c.close <= z.topPrice;
-              const pts = inZone ? 4 : above <= 0.5 ? 3 : above <= 1.5 ? 1 : 0;
-              if (pts > milkPtsS) { milkPtsS = pts; if (pts > 0) milkBearOk = true; }
-            }
-          }
-          if (milkBullOk && milkPtsL === 4 && milkBearOk && milkPtsS === 4) break; // PERF
-        }
-      }
-
-      // Secondary vector confluence: only counts when that interval's vector is flat
-      // (flat = ≤1pt change over 2 steps → consolidation/side-entry on that interval per strategy)
-      // PERF: single pass replaces 4 separate some()/filter() calls
-      let secLongOk = false, secShortOk = false, secLongCount = 0, secShortCount = 0;
-      for (const ev of extraVecSignalLines) {
-        const v = ev.map.get(c.time);
-        if (v == null || ev.flatMap.get(c.time) !== true) continue;
-        if (c.close > v) { secLongCount++;  secLongOk  = true; }
-        else if (c.close < v) { secShortCount++; secShortOk = true; }
-      }
-
-      // ── Helper: walk-forward outcome for a given set of exit prices ──────
-      const walkForward = (tp1: number, tp2: number, sl: number, isLong: boolean): { outcome: CSig["outcome"]; toTime: number } => {
-        // For ETH signals after today's RTH close (e.g. 22:00 UTC), rthSettleOfDay returns a
-        // time already in the past — advance to the next session's close to keep exits forward.
-        let settleTs = rthSettleOfDay(c.time);
-        if (c.time >= settleTs) {
-          for (let d = 1; d <= 4; d++) {
-            settleTs = rthSettleOfDay(c.time + d * 86400);
-            if (settleTs > c.time) break;
-          }
-        }
-        const pastSessionEnd = Math.floor(Date.now() / 1000) > settleTs;
-
-        // ── Trailer mode: TP1 is the activation level, not a fixed exit ──────
-        // Phase 1: wait for price to reach TP1 (activation). SL is a hard stop.
-        // Phase 2 (armed): trail the peak; exit when price retreats trailerOffset pts.
-        // TP1 level comes from whichever risk tier (safe/risky/riskiest) is selected.
-        if (useTrailer) {
-          let activationIdx = -1;
-          for (let j = i + 1; j < sorted.length; j++) {
-            const f = sorted[j];
-            if (f.time > settleTs) break;
-            if (isLong) {
-              if (f.low <= sl)   return { outcome: "loss",    toTime: f.time };
-              if (f.high >= tp1) { activationIdx = j; break; }
-            } else {
-              if (f.high >= sl)  return { outcome: "loss",    toTime: f.time };
-              if (f.low  <= tp1) { activationIdx = j; break; }
-            }
-          }
-          if (activationIdx === -1) {
-            // TP1 never reached — position ends at session close
-            return { outcome: pastSessionEnd ? "loss" : "open", toTime: settleTs };
-          }
-          // Phase 2: trail from peak after TP1 activation
-          let trailPeak = isLong ? sorted[activationIdx].high : sorted[activationIdx].low;
-          for (let j = activationIdx + 1; j < sorted.length; j++) {
-            const f = sorted[j];
-            if (f.time > settleTs) break;
-            if (isLong) {
-              if (f.high > trailPeak) trailPeak = f.high;
-              if (f.low <= trailPeak - trailerOffset) return { outcome: "win_trailer", toTime: f.time };
-            } else {
-              if (f.low < trailPeak) trailPeak = f.low;
-              if (f.high >= trailPeak + trailerOffset) return { outcome: "win_trailer", toTime: f.time };
-            }
-          }
-          // Session ended while still trailing — count as a win (trade was in profit)
-          return { outcome: pastSessionEnd ? "win_trailer" : "open", toTime: settleTs };
-        }
-
-        // ── Standard TP1/TP2 fixed-exit mode ─────────────────────────────────
-        let toTime = settleTs;
-        let outcome: CSig["outcome"] = "open";
-        for (let j = i + 1; j < sorted.length; j++) {
-          const f = sorted[j];
-          if (f.time > settleTs) break; // never exit past session close
-          if (isLong) {
-            if (f.high >= tp2) { outcome = "win_tp2"; toTime = f.time; break; }
-            if (f.high >= tp1) { outcome = "win_tp1"; toTime = f.time; break; }
-            if (f.low  <= sl)  { outcome = "loss";    toTime = f.time; break; }
-          } else {
-            if (f.low  <= tp2) { outcome = "win_tp2"; toTime = f.time; break; }
-            if (f.low  <= tp1) { outcome = "win_tp1"; toTime = f.time; break; }
-            if (f.high >= sl)  { outcome = "loss";    toTime = f.time; break; }
-          }
-        }
-        // Day trading: all positions close at session end.
-        // If the session is over and no TP/SL was hit (incomplete bar data), mark as loss.
-        if (outcome === "open" && pastSessionEnd) {
-          outcome = "loss";
-        }
-        return { outcome, toTime };
+    // Map FactSignal → CSig. riskLevel is retired (always "safe" for back-compat); the composite
+    // `label` carries the real strategy breakdown. confirmations are derived from the fact list so
+    // the legacy chip UI still lights up (Zone / Vector / 2nd-Vector).
+    const isSecFrag = (label: string) => /^(1m|5m|15m|60m)\s/.test(label);
+    return allResults.map((fs): CSig => {
+      const vecFacts = fs.facts.filter(f => f.strategy === "vector");
+      const secVec = vecFacts.filter(f => isSecFrag(f.label));
+      const milkFact = fs.facts.some(f => f.strategy === "zone");
+      return {
+        time: fs.time, price: fs.price, high: fs.high, low: fs.low, direction: fs.direction,
+        tp1: fs.tp1, tp2: fs.tp2, sl: fs.sl, toTime: fs.toTime,
+        riskLevel: "safe",
+        confirmations: {
+          milkOk: milkFact,
+          milkPts: milkFact ? 4 : 0,
+          vecOk: vecFacts.length > 0,
+          secondaryVecOk: secVec.length > 0,
+          secondaryVecCount: secVec.length,
+        },
+        outcome: fs.outcome,
+        zonesLoaded: hasDatedZones,
+        footprintReading: undefined,
+        confidence: fs.confidence,
+        interval,
+        signalType: fs.signalType,
+        label: fs.label,
+        intraCandle: intraSignal != null && fs === intraSignal ? true : undefined,
+        // BACKTEST-GRADE EXIT DETAIL (2026-07-29): carried straight from the engine walk-forward.
+        exitPrice: fs.exitPrice ?? null,
+        exitTs: fs.exitTs ?? null,
+        pointsResult: fs.pointsResult ?? null,
+        mae: fs.mae ?? null,
+        mfe: fs.mfe ?? null,
+        barsToExit: fs.barsToExit ?? null,
+        eodClose: fs.eodClose ?? false,
+        // RISK DISPLAY (2026-07-30): carried straight from the engine (display-only).
+        comboKey: fs.comboKey ?? null,
+        riskFlags: fs.riskFlags ?? null,
+        // POSITION SIZING (2026-08-02): tier-derived suggested size (display/config-only).
+        suggestedContracts: fs.suggestedContracts ?? null,
       };
-
-      // Advance footprint pointer past current candle time (amortised O(1) across the loop)
-      while (fpPtr < sortedFpCandles.length && sortedFpCandles[fpPtr].time < c.time) fpPtr++;
-
-      // ── Vector side-entry longs (feature: take EVERY side entry as a Long) ───
-      // Side entry = price closed below the vector last bar and back above it this bar, on a
-      // flat/declining vector (same definition as computeVectorSignals). The bracket IS the
-      // vector's exit strategy: stop = vector − VEC_STOP_BELOW (capped at VEC_MAX_STOP risk),
-      // targets entry + VEC_TP1 / VEC_TP2. Outcome via the shared walk-forward (honours the
-      // trailer toggle exactly like confluence signals). Levels are locked on first fire so the
-      // live forming bar can't drift them. Persisted + auto-trade eligible via signalType.
-      if (takeSideEntries) {
-        const sePrev   = i > 0 ? sorted[i - 1] : undefined;
-        const sePrevLb = sePrev ? vecMap.get(sePrev.time) : undefined;
-        if (sePrev && sePrevLb != null && sePrev.close < sePrevLb && c.close > lb && (lb - sePrevLb) < 0) {
-          const seKey = `${c.time}_Long_SE`;
-          let seLock = lockedSignalLevelsRef.current.get(seKey);
-          if (!seLock) {
-            const seEntry = c.close;
-            const seSl    = Math.max(lb - VEC_STOP_BELOW, seEntry - VEC_MAX_STOP);
-            seLock = { price: seEntry, tp1: seEntry + VEC_TP1, tp2: seEntry + VEC_TP2, sl: seSl };
-            lockedSignalLevelsRef.current.set(seKey, seLock);
-          }
-          const { outcome: seOutcome, toTime: seToTime } = walkForward(seLock.tp1, seLock.tp2, seLock.sl, true);
-          sideEntryRaw.push({
-            time: c.time, price: seLock.price, high: c.high, low: c.low, direction: "Long",
-            tp1: seLock.tp1, tp2: seLock.tp2, sl: seLock.sl, toTime: seToTime,
-            riskLevel: "risky",
-            confirmations: { milkOk: false, milkPts: 0, vecOk: true, secondaryVecOk: false, secondaryVecCount: 0 },
-            outcome: seOutcome, interval, signalType: "vector-side-entry", confidence: 50,
-          });
-        }
-      }
-
-      // USER RULE: confluence signals (milk/vector/footprint) are RTH-only. During ETH only the
-      // vector side-entry above may fire — skip the rest of this bar's evaluation when not RTH.
-      if (!rthC) continue;
-
-      // ── LONG signal evaluation ──────────────────────────────────────────────
-      if (c.close > lb) {
-        const fpCandleL: FootprintCandle = fpByTime.get(c.time) ?? buildProxyFootprintCandle(c);
-        const priorFpL = sortedFpCandles.length > 0
-          ? sortedFpCandles.slice(Math.max(0, fpPtr - 3), fpPtr)
-          : sorted.slice(Math.max(0, i - 4), i).map((b: CandleBar) => buildProxyFootprintCandle(b));
-        const fpReadingL: FootprintReading | null = analyzeFootprint(fpCandleL, "Long", priorFpL, c.close);
-
-        if (!fpReadingL?.vetoed) {
-          const fpFullL    = fpReadingL?.confirmed ?? false;
-          const fpPartialL = fpReadingL?.partial   ?? false;
-
-          // Vector side-entry + tabletop momentum detection:
-          // Side entry: previous bar closed at/below vector, current bar closed above (crossed from below).
-          // Tabletop test: vector flat over last 2 bars — price tested the level and closed above (bullish momentum).
-          const prevBarLb  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
-          const prevBarLb2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
-          const sideEntryL = prevBarLb != null && sorted[i - 1].close <= prevBarLb && c.close > lb;
-          const tabletopTestL = prevBarLb != null && prevBarLb2 != null
-            && Math.abs(lb - prevBarLb) < 0.5 && Math.abs(prevBarLb - prevBarLb2) < 0.5
-            && c.close > lb && c.close >= c.open;
-          const vecTestedL = sideEntryL || tabletopTestL;
-
-          // Weighted scoring: FP strong=4, FP weak=2 | MilkZone=3 | Vector=2 | Pattern=1
-          // SAFE+=8+ or strong-FP-on-zone | SAFE=4–7 or partial-FP-on-zone | RISKY=3 | RISKIEST=1–2
-          const fpFiresL = fpFullL || fpPartialL;
-          let fpStrongL = false, fpOnMilkZoneL = false, fpPartialOnZoneL = false;
-          if (fpFiresL) {
-            // Condition 1: 2+ consecutive imbalance levels in buy direction
-            if (fpCandleL.imbalances.some(cl => cl.direction === "buy" && cl.levelCount >= 2)) fpStrongL = true;
-            // Condition 2: candle delta >= 2x average of prior candles
-            if (!fpStrongL && priorFpL.length > 0) {
-              const avgAbsDelta = priorFpL.reduce((s, pc) => s + Math.abs(pc.candleDelta), 0) / priorFpL.length;
-              if (avgAbsDelta > 0 && Math.abs(fpCandleL.candleDelta) >= 2 * avgAbsDelta) fpStrongL = true;
-            }
-            // Condition 3: imbalance cluster overlaps active Milk zone
-            // Strong FP on zone → SAFE+ override; partial FP on zone → SAFE floor (not SAFE+)
-            outer: for (const cl of fpCandleL.imbalances) {
-              for (const z of activeZones) {
-                if (!(z.fromTime ?? 0) || c.time < z.fromTime! || (z.toTime != null && c.time > z.toTime)) continue;
-                if (cl.startPrice <= z.topPrice && cl.endPrice >= z.bottomPrice) {
-                  if (fpStrongL) { fpOnMilkZoneL = true; } else { fpPartialOnZoneL = true; }
-                  break outer;
-                }
-              }
-            }
-          }
-          // FIX 4: proxy data cannot be "strong" — cannot claim safeplus via FP-on-zone
-          if (fpReadingL?.isProxyData) { fpStrongL = false; fpOnMilkZoneL = false; }
-          const fpPtsL   = fpFiresL ? 4 : 0;
-          const vecPtsL  = vecTestedL ? 2 : 0;
-          const totalPtsL = fpPtsL + milkPtsL + vecPtsL;
-
-          // SINGLE-TIER: a signal only fires when the setup clears the SAFE quality bar — the
-          // same conditions that used to produce "safe"/"safeplus": ≥4 confluence pts, or a
-          // footprint on/at a milk zone. Weaker setups (the old "risky"/"riskiest", 1–3 pts) are
-          // no longer signals at all. Every signal that fires is labeled "safe" — no categories.
-          const lockKey = `${c.time}_Long`;
-          const existingTierL = lockedSignalTierRef.current.get(lockKey);
-          const safeQualityL = totalPtsL >= 4 || fpOnMilkZoneL || fpPartialOnZoneL;
-          const cdL = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
-          // FIRE-LOCK: a NEW signal fires only if it clears the safe bar + HOD/cooldown gates.
-          // An ALREADY-FIRED signal (existingTierL is set) re-emits UNCONDITIONALLY on every
-          // recompute, so once a dot is on the chart it can NEVER disappear — even if late-arriving
-          // footprint/milk/vector data would no longer qualify it. Fired = locked, permanently.
-          const newFireL = safeQualityL && !nearHodLong && (i - (rthC ? lastLongBar : lastLongEthBar) >= cdL);
-          if (existingTierL || newFireL) {
-            const level = "safe" as const;
-            const _wrL = signalWinRates[`safe:Long`];
-            const confL = (_wrL && _wrL.sampleCount >= 5) ? Math.round(_wrL.winRate * 100) : 75;
-            // Advance the cooldown anchor on every emit (locked re-emit too) so new signals stay spaced.
-            if (rthC) lastLongBar = i; else lastLongEthBar = i;
-
-            // First fire → lock the risk factor + the exact footprint/milk/vector reading.
-            let tierL = existingTierL;
-            if (!tierL) {
-              tierL = {
-                riskLevel: level,
-                confirmations: { milkOk: milkBullOk, milkPts: milkPtsL, vecOk: vecTestedL, secondaryVecOk: secLongOk, secondaryVecCount: secLongCount },
-                footprintReading: fpReadingL ? JSON.stringify(fpReadingL) : undefined,
-                confidence: confL,
-              };
-              lockedSignalTierRef.current.set(lockKey, tierL);
-            }
-            // Tier is always "safe" now → exits use the safe profile; the lock only freezes
-            // the confirmation breakdown so the chips don't flicker as data loads.
-            const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
-                const dbLock = dbSignalHistory.get(lockKey);
-                if (dbLock) { lockedSignalLevelsRef.current.set(lockKey, dbLock); }
-                else if (!lockedSignalLevelsRef.current.has(lockKey)) {
-                  if (useZoneTargets) {
-                    const zonesNow = activeZones.filter(z => c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity));
-                    const above = zonesNow.filter(z => z.bottomPrice > c.close + 0.5).sort((a, b) => a.bottomPrice - b.bottomPrice);
-                    const below = zonesNow.filter(z => z.topPrice   < c.close - 0.5).sort((a, b) => b.topPrice - a.topPrice);
-                    if (above.length >= 1 && above[0].bottomPrice - c.close >= MIN_TP1_PTS) {
-                      const ztTp1 = above[0].bottomPrice;
-                      const ztTp2 = above[1] ? above[1].bottomPrice : above[0].topPrice;
-                      const ztSl  = below.length > 0 ? below[0].bottomPrice - 0.5 : c.close - slF;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: ztTp1, tp2: ztTp2, sl: ztSl });
-                    } else {
-                      const rawTp1L = c.close + tp1F;
-                      const adjTp1L = (rthC && isFinite(hodHigh) && rawTp1L >= hodHigh - HOD_PROX_PTS)
-                        ? Math.max(c.close + MIN_TP1_PTS, hodHigh - HOD_BUF_PTS) : rawTp1L;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1L, tp2: c.close + tp2F, sl: c.close - slF });
-                    }
-                  } else {
-                    const rawTp1L = c.close + tp1F;
-                    const adjTp1L = (rthC && isFinite(hodHigh) && rawTp1L >= hodHigh - HOD_PROX_PTS)
-                      ? Math.max(c.close + MIN_TP1_PTS, hodHigh - HOD_BUF_PTS) : rawTp1L;
-                    lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1L, tp2: c.close + tp2F, sl: c.close - slF });
-                  }
-                }
-                const locked = lockedSignalLevelsRef.current.get(lockKey)!;
-                const entryClose = locked.price;
-                const tp1 = locked.tp1, tp2 = locked.tp2, sl = entryClose - slF;
-
-                const { outcome, toTime } = walkForward(tp1, tp2, sl, true);
-                // Always "safe" — confirmations/footprint frozen on first fire (lock) so the chips
-                // don't flicker; confidence falls back to the freshly computed safe win-rate.
-                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Long", tp1, tp2, sl, toTime, riskLevel: level, confirmations: tierL.confirmations, zonesLoaded: hasDatedZones, outcome, footprintReading: tierL.footprintReading, interval, confidence: tierL.confidence ?? confL });
-          }
-        }
-      }
-
-      // ── SHORT signal evaluation ─────────────────────────────────────────────
-      if (c.close < lb) {
-        const fpCandleS: FootprintCandle = fpByTime.get(c.time) ?? buildProxyFootprintCandle(c);
-        const priorFpS = sortedFpCandles.length > 0
-          ? sortedFpCandles.slice(Math.max(0, fpPtr - 3), fpPtr)
-          : sorted.slice(Math.max(0, i - 4), i).map((b: CandleBar) => buildProxyFootprintCandle(b));
-        const fpReadingS: FootprintReading | null = analyzeFootprint(fpCandleS, "Short", priorFpS, c.close);
-
-        if (!fpReadingS?.vetoed) {
-          const fpFullS    = fpReadingS?.confirmed ?? false;
-          const fpPartialS = fpReadingS?.partial   ?? false;
-
-          // Vector side-entry + tabletop momentum detection (Short):
-          // Side entry: previous bar closed at/above vector, current bar closed below (crossed from above).
-          // Tabletop test: vector flat over last 2 bars — price tested the level and closed below (bearish momentum).
-          const prevBarLbS  = i > 0 ? vecMap.get(sorted[i - 1].time) : undefined;
-          const prevBarLbS2 = i > 1 ? vecMap.get(sorted[i - 2].time) : undefined;
-          const sideEntryS = prevBarLbS != null && sorted[i - 1].close >= prevBarLbS && c.close < lb;
-          const tabletopTestS = prevBarLbS != null && prevBarLbS2 != null
-            && Math.abs(lb - prevBarLbS) < 0.5 && Math.abs(prevBarLbS - prevBarLbS2) < 0.5
-            && c.close < lb && c.close <= c.open;
-          const vecTestedS = sideEntryS || tabletopTestS;
-
-          // Weighted scoring: FP strong=4, FP weak=2 | MilkZone=3 | Vector=2 | Pattern=1
-          // SAFE+=8+ or FP-on-zone | SAFE=4–7 | RISKY=3 | RISKIEST=1–2
-          const fpFiresS = fpFullS || fpPartialS;
-          let fpStrongS = false, fpOnMilkZoneS = false, fpPartialOnZoneS = false;
-          if (fpFiresS) {
-            // Condition 1: 2+ consecutive imbalance levels in sell direction
-            if (fpCandleS.imbalances.some(cl => cl.direction === "sell" && cl.levelCount >= 2)) fpStrongS = true;
-            // Condition 2: candle delta >= 2x average of prior candles (negative delta for shorts)
-            if (!fpStrongS && priorFpS.length > 0) {
-              const avgAbsDelta = priorFpS.reduce((s, pc) => s + Math.abs(pc.candleDelta), 0) / priorFpS.length;
-              if (avgAbsDelta > 0 && Math.abs(fpCandleS.candleDelta) >= 2 * avgAbsDelta) fpStrongS = true;
-            }
-            // Condition 3: FIX 3 — strong FP on zone → SAFE+; partial FP on zone → SAFE floor only
-            outer: for (const cl of fpCandleS.imbalances) {
-              for (const z of activeZones) {
-                if (!(z.fromTime ?? 0) || c.time < z.fromTime! || (z.toTime != null && c.time > z.toTime)) continue;
-                if (cl.startPrice <= z.topPrice && cl.endPrice >= z.bottomPrice) {
-                  if (fpStrongS) { fpOnMilkZoneS = true; } else { fpPartialOnZoneS = true; }
-                  break outer;
-                }
-              }
-            }
-          }
-          // FIX 4: proxy data cannot be "strong" — cannot claim safeplus via FP-on-zone
-          if (fpReadingS?.isProxyData) { fpStrongS = false; fpOnMilkZoneS = false; }
-          const fpPtsS   = fpFiresS ? 4 : 0;
-          const vecPtsS  = vecTestedS ? 2 : 0;
-          const totalPtsS = fpPtsS + milkPtsS + vecPtsS;
-
-          // SINGLE-TIER (Short): fire only when the setup clears the SAFE quality bar (≥4 pts or
-          // footprint on/at a milk zone). Weaker setups are no longer signals. Every signal = "safe".
-          const lockKey = `${c.time}_Short`;
-          const existingTierS = lockedSignalTierRef.current.get(lockKey);
-          const safeQualityS = totalPtsS >= 4 || fpOnMilkZoneS || fpPartialOnZoneS;
-          const cdS = rthC ? COOLDOWN_BARS : ETH_COOLDOWN;
-          // FIRE-LOCK: a NEW short fires only if it clears the safe bar + LOD/cooldown gates. An
-          // ALREADY-FIRED short (existingTierS) re-emits unconditionally so it never disappears.
-          const newFireS = safeQualityS && !nearLodShort && (i - (rthC ? lastShortBar : lastShortEthBar) >= cdS);
-          if (existingTierS || newFireS) {
-            const level = "safe" as const;
-            const _wrS = signalWinRates[`safe:Short`];
-            const confS = (_wrS && _wrS.sampleCount >= 5) ? Math.round(_wrS.winRate * 100) : 75;
-            if (rthC) lastShortBar = i; else lastShortEthBar = i; // spacing anchor on every emit
-
-            // First fire → lock the risk factor + the exact footprint/milk/vector reading.
-            let tierS = existingTierS;
-            if (!tierS) {
-              tierS = {
-                riskLevel: level,
-                confirmations: { milkOk: milkBearOk, milkPts: milkPtsS, vecOk: vecTestedS, secondaryVecOk: secShortOk, secondaryVecCount: secShortCount },
-                footprintReading: fpReadingS ? JSON.stringify(fpReadingS) : undefined,
-                confidence: confS,
-              };
-              lockedSignalTierRef.current.set(lockKey, tierS);
-            }
-            // Tier is always "safe" → exits use the safe profile; lock only freezes the chips.
-            const { tp1: tp1F, tp2: tp2F, sl: slF } = tierExits(level, rthC);
-                const dbLock = dbSignalHistory.get(lockKey);
-                if (dbLock) { lockedSignalLevelsRef.current.set(lockKey, dbLock); }
-                else if (!lockedSignalLevelsRef.current.has(lockKey)) {
-                  if (useZoneTargets) {
-                    const zonesNow = activeZones.filter(z => c.time >= (z.fromTime ?? 0) && c.time <= (z.toTime ?? Infinity));
-                    const above = zonesNow.filter(z => z.bottomPrice > c.close + 0.5).sort((a, b) => a.bottomPrice - b.bottomPrice);
-                    const below = zonesNow.filter(z => z.topPrice   < c.close - 0.5).sort((a, b) => b.topPrice - a.topPrice);
-                    if (below.length >= 1 && c.close - below[0].topPrice >= MIN_TP1_PTS) {
-                      const ztTp1 = below[0].topPrice;
-                      const ztTp2 = below[1] ? below[1].topPrice : below[0].bottomPrice;
-                      const ztSl  = above.length > 0 ? above[0].topPrice + 0.5 : c.close + slF;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: ztTp1, tp2: ztTp2, sl: ztSl });
-                    } else {
-                      const rawTp1S = c.close - tp1F;
-                      const adjTp1S = (rthC && isFinite(hodLow) && hodLow < Infinity && rawTp1S <= hodLow + HOD_PROX_PTS)
-                        ? Math.min(c.close - MIN_TP1_PTS, hodLow + HOD_BUF_PTS) : rawTp1S;
-                      lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1S, tp2: c.close - tp2F, sl: c.close + slF });
-                    }
-                  } else {
-                    const rawTp1S = c.close - tp1F;
-                    const adjTp1S = (rthC && isFinite(hodLow) && hodLow < Infinity && rawTp1S <= hodLow + HOD_PROX_PTS)
-                      ? Math.min(c.close - MIN_TP1_PTS, hodLow + HOD_BUF_PTS) : rawTp1S;
-                    lockedSignalLevelsRef.current.set(lockKey, { price: c.close, tp1: adjTp1S, tp2: c.close - tp2F, sl: c.close + slF });
-                  }
-                }
-                const locked = lockedSignalLevelsRef.current.get(lockKey)!;
-                const entryClose = locked.price;
-                const tp1 = locked.tp1, tp2 = locked.tp2, sl = entryClose + slF;
-
-                const { outcome, toTime } = walkForward(tp1, tp2, sl, false);
-                // Always "safe" — confirmations/footprint frozen on first fire; confidence falls
-                // back to the freshly computed safe win-rate.
-                raw.push({ time: c.time, price: locked.price, high: c.high, low: c.low, direction: "Short", tp1, tp2, sl, toTime, riskLevel: level, confirmations: tierS.confirmations, zonesLoaded: hasDatedZones, outcome, footprintReading: tierS.footprintReading, interval, confidence: tierS.confidence ?? confS });
-          }
-        }
-      }
-
-    }
-
-    // Merge vector side-entry longs, skipping bars where a confluence Long already fired
-    // (a confluence Long takes priority and avoids the (symbol,interval,time,direction) DB
-    // unique-key collision since both persist as direction "Long").
-    if (sideEntryRaw.length) {
-      const longTimes = new Set(raw.filter(s => s.direction === "Long").map(s => s.time));
-      for (const se of sideEntryRaw) if (!longTimes.has(se.time)) raw.push(se);
-    }
-
-    // Sort by time so the panel shows signals in chronological order
-    return raw.sort((a, b) => a.time - b.time);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowedCandles, vectorLine, interval, extraVecSignalLines, activeZones, dbSignalHistory, exitStrategy, useTrailer, trailerOffset, beVersion, fpCompletedVersion, useZoneTargets, signalWinRates, takeSideEntries]); // PERF: fpCompletedVersion replaces latestFootprintCandle+footprintCandles — increments only on new complete bar
+    }).sort((a, b) => a.time - b.time);
+  }, [windowedCandles, interval, raw1mData, rawCandleData, raw60mData, activeZones, fpCompletedVersion, completedBarVersion, zoneReactionPts, feDayZones, yellowBoxEnabled, yellowBoxSolo, qualityGateEnabled, ictConfirmEnabled, fractalConfirmEnabled, fractalGeoConfirmEnabled, pmlTmlData, riskMedianDayRange, deadTapeSuppressEnabled, dayPnlPts, dailyLossStopEnabled, dailyLossStopPts, primaryPriors]);
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
-  // PERF: pre-filter to open signals only — BE loop iterates this instead of full list
-  const openSignalsRef = useRef<CSig[]>([]);
-  useEffect(() => {
-    openSignalsRef.current = allConfluenceSignals.filter(s => !s.outcome || s.outcome === "open");
-  }, [allConfluenceSignals]);
+  // (openSignalsRef + its sync effect DELETED 2026-07-13 — it existed only for the break-even loop.)
 
   // Show signals at or above the selected quality threshold, keeping all visible levels
   // Every signal is a single "safe" tier now — no risk categories, so no tier filtering.
   const confluenceSignals = useMemo(() => allConfluenceSignals, [allConfluenceSignals]);
+
+  // ── BAR-CLOSE LATENCY FIX (2026-08-07): live engine passes for the NON-viewed intervals ──
+  // runFactEngine walks only the PRIMARY slice, so this hidden engine only ever FIRED the
+  // interval being viewed — every other interval's signals arrived up to 30 min late via the
+  // scheduler catch-up pass (measured: all live rows since Jul-28 were 15m; every 1m/5m/60m
+  // row was source='catchup'). This memo runs the SAME engine + SAME multi-slice construction
+  // with each non-viewed interval as primary. Pass-count discipline (do NOT reintroduce the
+  // pre-2026-07-30 4Hz storm): deps deliberately EXCLUDE windowedCandles — recompute happens
+  // ONLY on completed-bar arrival (completedBarVersion ≈ 1-3 bumps/min), one evaluation per
+  // completed bar per interval; forming-bar ticks never re-run it. Slices are capped to the
+  // last 3 Globex sessions: every firing input (cooldown bars, HOD/LOD, session ranges, day
+  // P&L, dead-tape range) is day/session-scoped, so today's decisions are identical while the
+  // 1m walk stays cheap. No real footprint data exists for non-viewed intervals (C12: absent
+  // data ⇒ no footprint fact — same as the catch-up replay's non-5m intervals).
+  // AUTO-TRADE: these signals are persisted + notified but NOT auto-trade eligible (see the
+  // notify effect below) — introducing hidden-interval auto-execution is a separate user call.
+  const hiddenIntervalSignals = useMemo((): CSig[] => {
+    if (!windowedCandles.length) return [];
+    const fePrimary = interval as FeInterval;
+    const feTails = liveCompleteTailRef.current;
+    const { slices } = deriveEngineSlices({
+      interval: fePrimary,
+      windowedCandles,
+      raw1mCandles: mergeCompletedTail(raw1mData?.candles, feTails["1"]),
+      rawCandles: mergeCompletedTail(rawCandleData?.candles,
+        rawCandleData?.resolution === "1" || rawCandleData?.resolution === "5" || rawCandleData?.resolution === "15" || rawCandleData?.resolution === "60"
+          ? feTails[rawCandleData.resolution] : undefined),
+      raw60mCandles: mergeCompletedTail(raw60mData?.candles, feTails["60"]),
+    });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cutoff = nowSec - 3 * 86400; // 3 sessions — all firing state is day-scoped (see above)
+    const capped = slices
+      .map(sl => ({
+        interval: sl.interval,
+        candles: sl.candles.filter(c => c.time >= cutoff),
+        // Vector values stay derived from the FULL history (exact warmup) — just windowed.
+        vector: sl.vector?.filter(v => v.time >= cutoff),
+      }))
+      .filter(sl => sl.candles.length > 0);
+    if (!capped.length) return [];
+
+    const feZones = activeZones.map(z => ({ topPrice: z.topPrice, bottomPrice: z.bottomPrice, color: z.color, label: z.label, fromTime: z.fromTime, toTime: z.toTime }));
+    const hasDatedZones = activeZones.some(z => (z.fromTime ?? 0) > 0);
+    const feDayZonesInput = yellowBoxEnabled ? feDayZones : [];
+    const lossStopActivePts = dailyLossStopEnabled && dailyLossStopPts > 0 ? dailyLossStopPts : 0;
+    const nowBucket = etSessionDayBucket(nowSec);
+    const trippedSticky = dayLossTrippedRef.current.tripped && dayLossTrippedRef.current.bucket === nowBucket;
+    const effectiveDayPnl = dayPnlPts == null ? undefined
+      : trippedSticky && lossStopActivePts > 0 ? Math.min(dayPnlPts, -lossStopActivePts) : dayPnlPts;
+
+    const out: CSig[] = [];
+    for (const iv of ["1m", "5m", "15m", "60m"] as FeInterval[]) {
+      if (iv === fePrimary) continue;
+      if (!capped.some(sl => sl.interval === iv)) continue;
+      const results = runFactEngine({
+        primary: iv,
+        slices: capped,
+        zones: feZones,
+        dayZones: feDayZonesInput,
+        footprintByTime: new Map(), // C12: no real footprint for non-viewed intervals ⇒ no fact
+        settings: { ZONE_REACTION_PTS: zoneReactionPts, YELLOWBOX_SOLO: yellowBoxSolo },
+        nowSec,
+        qualityGateEnabled,
+        ictEnabled: ictConfirmEnabled,
+        fractalEnabled: fractalConfirmEnabled,
+        fractalGeoEnabled: fractalGeoConfirmEnabled,
+        liveLevels: pmlTmlData && !pmlTmlData.skipped ? { pml: pmlTmlData.pml ?? null, tml: pmlTmlData.tml ?? null } : undefined,
+        dayRangeMedian: riskMedianDayRange ?? undefined,
+        deadTapeSuppressEnabled,
+        deadTapeFailClosed: true, // 2026-08-07 — hidden-interval fires obey the same fail-closed contract
+        dayPnlPts: effectiveDayPnl,
+        dailyLossStopPts: lossStopActivePts,
+        // CROSS-WRITER SEED (2026-09-25, B5): this interval's stored fires.
+        ...(enginePriors[iv]?.length ? { priorFires: enginePriors[iv] } : {}),
+      });
+      const isSecFrag = (label: string) => /^(1m|5m|15m|60m)\s/.test(label);
+      for (const fs of results) {
+        const vecFacts = fs.facts.filter(f => f.strategy === "vector");
+        const secVec = vecFacts.filter(f => isSecFrag(f.label));
+        const milkFact = fs.facts.some(f => f.strategy === "zone");
+        out.push({
+          time: fs.time, price: fs.price, high: fs.high, low: fs.low, direction: fs.direction,
+          tp1: fs.tp1, tp2: fs.tp2, sl: fs.sl, toTime: fs.toTime,
+          riskLevel: "safe",
+          confirmations: {
+            milkOk: milkFact, milkPts: milkFact ? 4 : 0,
+            vecOk: vecFacts.length > 0,
+            secondaryVecOk: secVec.length > 0, secondaryVecCount: secVec.length,
+          },
+          outcome: fs.outcome,
+          zonesLoaded: hasDatedZones,
+          footprintReading: undefined,
+          confidence: fs.confidence,
+          interval: iv,
+          signalType: fs.signalType,
+          label: fs.label,
+          intraCandle: undefined, // bar-close fires only — no forming-bar path off-interval
+          exitPrice: fs.exitPrice ?? null, exitTs: fs.exitTs ?? null,
+          pointsResult: fs.pointsResult ?? null, mae: fs.mae ?? null, mfe: fs.mfe ?? null,
+          barsToExit: fs.barsToExit ?? null, eodClose: fs.eodClose ?? false,
+          comboKey: fs.comboKey ?? null, riskFlags: fs.riskFlags ?? null,
+          suggestedContracts: fs.suggestedContracts ?? null,
+        });
+      }
+    }
+    return out.sort((a, b) => a.time - b.time);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- windowedCandles deliberately
+    // excluded: recompute ONLY on completed bars, never on forming-bar ticks (pass discipline).
+  }, [completedBarVersion, interval, raw1mData, rawCandleData, raw60mData, activeZones, zoneReactionPts, feDayZones, yellowBoxEnabled, yellowBoxSolo, qualityGateEnabled, ictConfirmEnabled, fractalConfirmEnabled, fractalGeoConfirmEnabled, pmlTmlData, riskMedianDayRange, deadTapeSuppressEnabled, dayPnlPts, dailyLossStopEnabled, dailyLossStopPts, enginePriors]);
 
   // ── Signal persistence: load from DB into state so allConfluenceSignals can depend on it ──
   // DB values are the permanent truth — they always win over freshly computed c.close locks.
   useEffect(() => {
     // Clear stale locks from the previous symbol/interval immediately
     lockedSignalLevelsRef.current.clear();
-    lockedSignalTierRef.current.clear(); // TIER LOCK: reset frozen risk factors on symbol/interval switch
-    beTriggeredRef.current.clear();
     setDbSignalHistory(new Map());
+    // B2: drop intra-candle tracking from the previous symbol/interval (no retraction across
+    // a switch — we can't know the other symbol's forming bar state from here).
+    intraPersistedRef.current.clear();
+    lastIntraFireTimeRef.current = -Infinity;
+    lastIntraBracketRef.current = [];
     fetch(`/api/signals/history/${encodeURIComponent(selectedSymbol)}/${interval}`)
       .then(r => r.json())
       .then((data: { signals?: Array<{ timestamp: number; direction: string; entry: number; tp1: number; tp2: number; sl: number; riskLevel?: string; confirmations?: string; footprintReading?: string }> }) => {
@@ -3118,15 +3249,6 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           newMap.set(`${s.timestamp}_${s.direction}`, val);
           newMap.set(`${s.timestamp}_Pure${s.direction}`, val);
           newMap.set(`${s.timestamp}_Side${s.direction}`, val);
-          // TIER LOCK: restore the risk factor the PC locked when the signal first fired, so a
-          // reload re-uses the SAME tier instead of re-deriving (and possibly flickering) it.
-          if (s.riskLevel === "safeplus" || s.riskLevel === "safe" || s.riskLevel === "risky" || s.riskLevel === "riskiest") {
-            let conf: LockTier["confirmations"] = { milkOk: false, vecOk: false, secondaryVecOk: false };
-            try { if (s.confirmations) conf = { ...conf, ...JSON.parse(s.confirmations) }; } catch { /* keep default */ }
-            lockedSignalTierRef.current.set(`${s.timestamp}_${s.direction}`, {
-              riskLevel: s.riskLevel, confirmations: conf, footprintReading: s.footprintReading,
-            });
-          }
         }
         // Also sync into lockedSignalLevelsRef so in-session locking stays consistent
         newMap.forEach((val, key) => lockedSignalLevelsRef.current.set(key, val));
@@ -3144,23 +3266,42 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // Previously this skipped outcome="open", meaning live signals never appeared in the
   // terminal until they had already closed — which is too late.
   const persistedSignalKeysRef = useRef<Set<string>>(new Set());
+  // ORDER ADMISSION (2026-09-25, B5): per posted fire (admissionKey), the persist route's verdict
+  // — "stored" | "refused" (fire admission: cooldown / open trade) | "failed". attemptAutoTrade
+  // awaits it before POST /api/trade/execute. Once "stored", a key never downgrades.
+  const persistVerdictRef = useRef<Map<string, Promise<PersistVerdict>>>(new Map());
   useEffect(() => {
-    if (!allConfluenceSignals.length) return;
-    const toSave = allConfluenceSignals.filter(s => {
+    // BAR-CLOSE LATENCY FIX (2026-08-07): persist the UNION of the viewed interval's signals
+    // and the hidden-interval engine's fires — interval rides per-signal (s.interval).
+    const engineSignals = hiddenIntervalSignals.length
+      ? allConfluenceSignals.concat(hiddenIntervalSignals)
+      : allConfluenceSignals;
+    if (!engineSignals.length) return;
+    // DB outcome vocabulary: a session-end force-close persists as "eod" (the engine outcome
+    // stays "loss") so the UI can say "CLOSED AT SESSION END" — same mapping as --persist.
+    const dbOutcome = (s: CSig): string | undefined => (s.eodClose ? "eod" : s.outcome);
+    // PERSIST FLOOR (2026-07-29; TIGHTENED 2026-08-12 after the tab-vs-book contradiction):
+    // tabs persist ONLY live-edge fires (last 2 days). Historical recomputes are display-only —
+    // every tab load was re-posting its 30-day recompute and re-adding live-construction
+    // asymmetry rows the standing book doesn't contain (8 strays re-appeared at the exact
+    // second of a reload, measured 2026-08-12). Catch-up + regen own ALL history now.
+    const persistFloorSec = Math.floor(Date.now() / 1000) - 2 * 86400;
+    const toSave = engineSignals.filter(s => {
+      if (s.time < persistFloorSec) return false; // historical recompute — display-only
       // Key includes outcome so a signal is persisted both when first open AND when it closes.
-      const key = `${selectedSymbol}_${interval}_${s.time}_${s.direction}_${s.outcome ?? "open"}`;
+      const key = `${selectedSymbol}_${s.interval ?? interval}_${s.time}_${s.direction}_${dbOutcome(s) ?? "open"}`;
       if (persistedSignalKeysRef.current.has(key)) return false;
       persistedSignalKeysRef.current.add(key);
       return true;
     });
     if (!toSave.length) return;
-    fetch("/api/signals/history", {
+    const post = fetch("/api/signals/history", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         signals: toSave.map(s => ({
           symbol: selectedSymbol,
-          interval,
+          interval: s.interval ?? interval, // hidden-interval fires carry their own interval
           timestamp: s.time,
           direction: s.direction,
           riskLevel: s.riskLevel,
@@ -3168,13 +3309,89 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
           tp1: s.tp1,
           tp2: s.tp2,
           sl: s.sl,
-          outcome: s.outcome,
+          outcome: dbOutcome(s),
           signalType: s.signalType, // e.g. "vector-side-entry" — keeps the source visible on iPhone
           footprintReading: s.footprintReading, // FOOTPRINT-TIER:
           confirmations: JSON.stringify(s.confirmations), // PARITY: iPhone chip breakdown
+          label: s.label, // FACT-ENGINE: composite fact-list label (replaces the tier badge)
+          // BACKTEST-GRADE EXIT DETAIL (2026-07-29): null while open; COALESCE-guarded server-side.
+          exitPrice: s.exitPrice,
+          exitTs: s.exitTs,
+          pointsResult: s.pointsResult,
+          mae: s.mae,
+          mfe: s.mfe,
+          barsToExit: s.barsToExit,
+          // RISK DISPLAY (2026-07-30): the server serializes riskFlags to the JSON column;
+          // null values are COALESCE-guarded so they never clobber stored/backfilled info.
+          comboKey: s.comboKey,
+          riskFlags: s.riskFlags,
+          // POSITION SIZING (2026-08-02): additive column, COALESCE-guarded like comboKey.
+          suggestedContracts: s.suggestedContracts,
+          // SOURCE PROVENANCE (2026-07-31 "live-fired records are permanent"; SCOPED 2026-08-12):
+          // permanence is ONLY for fires at the live edge (last 2 days). Older recomputes inside
+          // the 30-day persist window flow as 'regen'-class — yielding, wiped by re-derivations.
+          // WHY (measured 2026-08-12): a week of engine changes let open tabs stamp each
+          // intermediate config's 30-day recompute as permanent — 272 of 286 recent 15m rows
+          // were stale-config 'live' rows and the tab contradicted the standing book.
+          source: s.time >= Math.floor(Date.now() / 1000) - 2 * 86400 ? "live" : "regen",
         })),
       }),
-    }).catch(() => {});
+    })
+      // B5 (2026-09-25): the answer is READ now — `admissionKeys` = new fires the route refused.
+      .then(async r => ({ ok: r.ok, body: await r.json().catch(() => null) as unknown }), () => ({ ok: false, body: null as unknown }));
+    const verdicts = persistVerdictRef.current;
+    for (const s of toSave) {
+      const k = admissionKey(s.interval ?? interval, s.time, s.direction);
+      const prior = verdicts.get(k);
+      const next = post.then(({ ok, body }) => persistVerdictFor(k, ok, body));
+      verdicts.set(k, prior ? Promise.all([prior, next]).then(([p, n]) => (p === "stored" ? p : n)) : next);
+    }
+    if (verdicts.size > 2000) { // bound memory — oldest keys first (Map keeps insertion order)
+      for (const k of [...verdicts.keys()].slice(0, verdicts.size - 1500)) verdicts.delete(k);
+    }
+    // Newly stored fires are the next replay's seed — refresh now instead of waiting for the poll.
+    void post.then(() => refreshPriorsRef.current());
+  }, [allConfluenceSignals, hiddenIntervalSignals, selectedSymbol, interval]);
+
+  // ── SIGNAL-INTEGRITY B2: retract cancelled intra-candle signals ──────────────
+  // A forming-bar signal persists to the DB on first fire (effect above). If the reaction
+  // cancels before the bar closes — or the bar closes WITHOUT the engine re-firing the same
+  // `${time}_${direction}` key — the persisted row must not survive: DELETE it so the terminal
+  // never shows a signal the market chart retracted. The server broadcasts `signal_removed`
+  // and useTerminalData refetches. Confirmed signals (re-fired by the bar-close engine, no
+  // longer intraCandle) simply leave the tracking map.
+  useEffect(() => {
+    const byKey = new Map(allConfluenceSignals.map(s => [`${s.time}_${s.direction}`, s]));
+    for (const s of allConfluenceSignals) {
+      if (!s.intraCandle) continue;
+      if (s.time > lastIntraFireTimeRef.current) lastIntraFireTimeRef.current = s.time; // cooldown memory (B1)
+      // open-trade memory (B5 2026-09-25): the latest intra bracket per direction
+      if (!lastIntraBracketRef.current.some(b => b.direction === s.direction && b.time >= s.time)) {
+        lastIntraBracketRef.current = [
+          ...lastIntraBracketRef.current.filter(b => b.direction !== s.direction),
+          { time: s.time, direction: s.direction, entry: s.price, tp1: s.tp1, sl: s.sl },
+        ];
+      }
+      const key = `${s.time}_${s.direction}`;
+      if (!intraPersistedRef.current.has(key)) {
+        intraPersistedRef.current.set(key, { symbol: selectedSymbol, interval, timestamp: s.time, direction: s.direction });
+      }
+    }
+    for (const [key, row] of [...intraPersistedRef.current]) {
+      if (row.symbol !== selectedSymbol || row.interval !== interval) continue; // handled by the clear effect
+      const cur = byKey.get(key);
+      if (cur) {
+        if (!cur.intraCandle) intraPersistedRef.current.delete(key); // bar closed + engine confirmed → done tracking
+        continue;
+      }
+      // Vanished — reaction cancelled (or bar closed unconfirmed): retract the DB row.
+      intraPersistedRef.current.delete(key);
+      fetch("/api/signals/history", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(row),
+      }).catch(() => {});
+    }
   }, [allConfluenceSignals, selectedSymbol, interval]);
 
   // ── Today's panel signals (bottom slide-up) ──────────────────────────────
@@ -3192,39 +3409,53 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
   // ── Background signals for all intervals ─────────────────────────────────
   // Each interval always sources from its own data — background fetch or current view.
+  // PERF (2026-07-30): each pass keys on ITS OWN candle source. The old dep arrays included
+  // `windowedCandles` unconditionally, so all four full runFactEngine passes re-ran on EVERY
+  // live forming-bar update (~2s cadence) even though the three non-viewed intervals consume
+  // the STABLE bgXmData arrays — measured multi-second main-thread stalls in the hidden engine.
+  // The viewed interval's pass still keys on windowedCandles (its real input) — behavior
+  // unchanged, identical inputs produce identical outputs, just no longer recomputed for free.
+  const bg1mCandles  = interval === "1m"  ? windowedCandles : (bg1mData?.candles ?? EMPTY_BG_CANDLES);
+  const bg5mCandles  = interval === "5m"  ? windowedCandles : (bg5mData?.candles ?? EMPTY_BG_CANDLES);
+  const bg15mCandles = interval === "15m" ? windowedCandles : (bg15mData?.candles ?? EMPTY_BG_CANDLES);
+  const bg60mCandles = interval === "60m" ? windowedCandles : (bg60mData?.candles ?? EMPTY_BG_CANDLES);
+
+  // B5 (2026-09-25): each pass is seeded with its interval's stored fires (identity-stable per
+  // interval — a new 1m fire does not re-run the 5m/15m/60m scanners).
+  const priors1m = enginePriors["1m"], priors5m = enginePriors["5m"], priors15m = enginePriors["15m"], priors60m = enginePriors["60m"];
   const bgSignals1m  = useMemo(() => {
-    const candles = interval === "1m" ? windowedCandles : (bg1mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg1mData, interval, activeZones]);
+    if (!bg1mCandles.length) return [];
+    return computeBgSignals(bg1mCandles, activeZones, "1m", zoneReactionPts, priors1m);
+  }, [bg1mCandles, activeZones, zoneReactionPts, priors1m]);
 
   const bgSignals5m  = useMemo(() => {
-    const candles = interval === "5m" ? windowedCandles : (bg5mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg5mData, interval, activeZones]);
+    if (!bg5mCandles.length) return [];
+    return computeBgSignals(bg5mCandles, activeZones, "5m", zoneReactionPts, priors5m);
+  }, [bg5mCandles, activeZones, zoneReactionPts, priors5m]);
 
   const bgSignals15m = useMemo(() => {
-    const candles = interval === "15m" ? windowedCandles : (bg15mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg15mData, interval, activeZones]);
+    if (!bg15mCandles.length) return [];
+    return computeBgSignals(bg15mCandles, activeZones, "15m", zoneReactionPts, priors15m);
+  }, [bg15mCandles, activeZones, zoneReactionPts, priors15m]);
 
   const bgSignals60m = useMemo(() => {
-    const candles = interval === "60m" ? windowedCandles : (bg60mData?.candles ?? []);
-    if (!candles.length) return [];
-    return computeBgSignals(candles, computeVectorLine(candles), activeZones);
-  }, [windowedCandles, bg60mData, interval, activeZones]);
+    if (!bg60mCandles.length) return [];
+    return computeBgSignals(bg60mCandles, activeZones, "60m", zoneReactionPts, priors60m);
+  }, [bg60mCandles, activeZones, zoneReactionPts, priors60m]);
 
   // Keep latestSignalsRef in sync so the 3s auto-trade confirmation callback
   // can verify a signal is still live before sending an order.
+  // ALL-INTERVAL AUTO-TRADE FIX 2 (2026-08-13): hiddenIntervalSignals MUST be in this set —
+  // without them, every hidden-interval ENGINE fire passed the filters, started its 3s
+  // confirm, then was cancelled as "invalidated" because its key was never tracked here
+  // (the exact "signals arrive live but never reach the auto-trader" symptom).
   useEffect(() => {
     const keys = new Set<string>();
-    for (const s of [...bgSignals1m, ...bgSignals5m, ...bgSignals15m, ...bgSignals60m, ...allConfluenceSignals]) {
+    for (const s of [...bgSignals1m, ...bgSignals5m, ...bgSignals15m, ...bgSignals60m, ...allConfluenceSignals, ...hiddenIntervalSignals]) {
       keys.add(`${s.time}_${s.direction}`);
     }
     latestSignalsRef.current = keys;
-  }, [bgSignals1m, bgSignals5m, bgSignals15m, bgSignals60m, allConfluenceSignals]);
+  }, [bgSignals1m, bgSignals5m, bgSignals15m, bgSignals60m, allConfluenceSignals, hiddenIntervalSignals]);
 
   // ── Multi-interval live confluence signal detection ───────────────────────
   // Fires for all intervals regardless of which one is currently viewed.
@@ -3232,10 +3463,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   // so history doesn't trigger notifications — only NEW signals fire.
   const fireSignalNotification = (
     sig: {
-      direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; time: number;
+      direction: "Long" | "Short"; price: number; tp1: number; tp2: number | null; sl: number; time: number;
       riskLevel?: string; confidence?: number;
       confirmations?: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
       footprintReading?: string; signalType?: string;
+      label?: string; // FACT-ENGINE (D5): composite fact-list label — every alert says WHY it fired
+      suggestedContracts?: number | null; // POSITION SIZING (2026-08-02): combo-tier suggested size
     },
     ivLabel: string,
     autoTradeEligible = true,
@@ -3270,11 +3503,20 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       lockedSignalLevelsRef.current.set(vSigKey, frozen);
     }, 3000);
 
+    // MUTE OVERNIGHT ALERTS (2026-10-01 R2a): a fire whose bar CLOSES in ETH (America/New_York,
+    // the engine's own isRTH(close) rule) is record-only unless ethAlertsEnabled — no Discord,
+    // no desktop notification, no sound. The on-screen card, persistence and the order path
+    // (which has its own RTH-only order window) are untouched. News-blackout muting is decided
+    // server-side by /api/discord/send (it owns the calendar) and reported as {muted:"news"}.
+    const ethMuted = !ethAlertsEnabledRef.current
+      && !isRTHClose(sig.time + (SIGNAL_INTERVAL_SEC[ivLabel] ?? 0));
+    if (ethMuted) console.log(`[alerts] overnight fire muted (record only): ${sig.direction} ${ivLabel} @ ${sig.price}`);
+
     // Discord alert — fire ONLY after the signal survives 3s (a REAL fired signal). Firing
     // immediately spammed Discord for forming-bar signals that vanish as the bar updates. Uses a
     // standalone per-signal timer (NOT the shared verify ref) so concurrent Long+Short both alert,
     // and a one-shot guard so a tier upgrade on the same bar doesn't double-send.
-    if (discordWebhookRef.current && !discordSentRef.current.has(vSigKey)) {
+    if (!ethMuted && discordWebhookRef.current && !discordSentRef.current.has(vSigKey)) {
       setTimeout(() => {
         if (!latestSignalsRef.current.has(vSigKey)) return;     // vanished — transient noise, no alert
         if (discordSentRef.current.has(vSigKey)) return;        // already alerted this bar+direction
@@ -3290,28 +3532,32 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             symbol: selectedSymbol,
             direction: sig.direction,
             interval: ivLabel,
+            time: sig.time, // 2026-10-01: fire-bar open (unix sec) — the route's ETH/news mute classifies at its close
             riskLevel: sig.riskLevel ?? "unknown",
             confidence: sig.confidence ?? 0,
             scoreLabel,
+            label: sig.label ?? "", // FACT-ENGINE (D5): fact list rides along to Discord
+            suggestedContracts: sig.suggestedContracts ?? null, // POSITION SIZING (2026-08-02): size line in the alert
             price: lv.price, tp1: lv.tp1, tp2: lv.tp2, sl: lv.sl,
           }),
         }).then(r => {
-          if (!r.ok) r.json().then(d => console.warn("[Discord] Send failed:", d.error)).catch(() => {});
+          if (!r.ok) { r.json().then(d => console.warn("[Discord] Send failed:", d.error)).catch(() => {}); return; }
+          r.json().then((d: { muted?: string }) => { if (d?.muted) console.log(`[Discord] alert muted by server (${d.muted === "news" ? "news blackout" : "overnight · record only"})`); }).catch(() => {});
         }).catch(e => console.warn("[Discord] Network error:", e));
       }, 3000);
     }
 
     const tierLabel = sig.riskLevel === "safeplus" ? "SAFE+" : (sig.riskLevel ?? "").toUpperCase();
-    if (typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
+    if (!ethMuted && typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
       try {
         new Notification(
           `${tierLabel} — ${selectedSymbol} ${ivLabel} ${sig.direction === "Long" ? "▲ LONG" : "▼ SHORT"}`,
-          { body: `${scoreLabel}${sig.confidence != null ? ` (${sig.confidence}%)` : ""}  Entry ${sig.price.toFixed(2)}  TP1 ${sig.tp1.toFixed(2)}  SL ${sig.sl.toFixed(2)}` }
+          { body: `${sig.label ? sig.label + "\n" : ""}${scoreLabel}${sig.confidence != null ? ` (${sig.confidence}%)` : ""}  Entry ${sig.price.toFixed(2)}  TP1 ${sig.tp1.toFixed(2)}  SL ${sig.sl.toFixed(2)}` }
         );
       } catch {}
     }
 
-    try {
+    if (!ethMuted) try {
       const ac = new AudioContext();
       const isSafePlus = sig.riskLevel === "safeplus";
       if (isSafePlus) {
@@ -3350,7 +3596,28 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     if (!autoTradeEnabledRef.current) {
       console.log(`[auto-trade] DISABLED — signal missed: ${sig.direction} ${ivLabel} @ ${sig.price}`);
     }
-    if (autoTradeEligible && autoTradeEnabledRef.current) {
+    // ALL-INTERVAL AUTO-TRADE (2026-08-13): execution extracted to attemptAutoTrade so the
+    // hidden-interval ENGINE stream can attempt an order even when this notification path
+    // already ran for the bar (see checkIntervalSignals' rescue branch).
+    if (autoTradeEligible) attemptAutoTrade(sig, ivLabel);
+  };
+
+  /** The order-execution half of a signal fire: filters → 3s confirm → POST /api/trade/execute.
+   *  Deduped per interval+direction+bar via orderAttemptRef; each interval+direction owns its
+   *  own pending slot (pendingAutoTradeMapRef) so cross-interval signals never cancel each
+   *  other's confirm windows. */
+  const attemptAutoTrade = (
+    sig: {
+      direction: "Long" | "Short"; price: number; tp1: number; tp2: number | null; sl: number; time: number;
+      riskLevel?: string; signalType?: string; suggestedContracts?: number | null;
+    },
+    ivLabel: string,
+  ) => {
+    if (!autoTradeEnabledRef.current) return;
+    const pendKey = `${ivLabel}_${sig.direction}`;
+    if ((orderAttemptRef.current[pendKey] ?? 0) >= sig.time) return; // this bar already attempted
+    orderAttemptRef.current[pendKey] = sig.time;
+    {
       // Vector side-entry longs are an explicit, opt-in auto-trade type: they bypass the
       // safe/safe+ tier gate (per user config) but still honour interval + direction filters.
       const isSideEntry = sig.signalType === 'vector-side-entry';
@@ -3372,73 +3639,103 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         showToast(false, `Filtered: ${reason}`);
       } else {
         const sigKey = `${sig.time}_${sig.direction}`;
-        // Cancel any prior pending order — new signal supersedes it
-        if (pendingAutoTradeRef.current) {
-          clearTimeout(pendingAutoTradeRef.current.timer);
-          pendingAutoTradeRef.current = null;
+        // Cancel any prior pending order FOR THIS interval+direction — a newer signal on the
+        // same stream supersedes it; other intervals' pending orders are untouched.
+        const prior = pendingAutoTradeMapRef.current.get(pendKey);
+        if (prior) {
+          clearTimeout(prior.timer);
+          pendingAutoTradeMapRef.current.delete(pendKey);
         }
         showToast(true, `Signal detected — confirming in 3s (${sig.direction} @ ${sig.price.toFixed(2)})`);
         const timer = setTimeout(() => {
-          pendingAutoTradeRef.current = null;
+          pendingAutoTradeMapRef.current.delete(pendKey);
           // Abort if signal is no longer present — it was transient tick noise
           if (!latestSignalsRef.current.has(sigKey)) {
             showToast(false, `Auto-trade cancelled — signal at ${sig.price.toFixed(2)} invalidated before confirmation`);
             return;
           }
-          // Signal confirmed stable — compute levels and send order
-          const _ep = EXIT_STRATEGY_PROFILES[exitStrategy];
-          const _sigRth = isRTH(sig.time);
-          const _te = (_sigRth ? _ep.rth : _ep.eth)[sig.riskLevel as keyof typeof _ep.rth] ?? (_sigRth ? _ep.rth : _ep.eth).riskiest;
-          const _slFixed  = _te.sl;
-          const _tp1Fixed = _te.tp1;
-          const _tp2Fixed = _te.tp2;
-          // Prefer the signal's actual SL (may be FP/zone-target adjusted); fallback to tier profile
-          const _sl  = (sig.sl  != null && sig.sl  !== sig.price) ? sig.sl  : (sig.direction === "Long" ? sig.price - _slFixed  : sig.price + _slFixed);
-          const _tp1 = (sig.tp1 != null && sig.tp1 !== sig.price) ? sig.tp1 : (sig.direction === "Long" ? sig.price + _tp1Fixed : sig.price - _tp1Fixed);
-          const _tp2 = (sig.tp2 != null && sig.tp2 !== sig.price) ? sig.tp2 : (sig.direction === "Long" ? sig.price + _tp2Fixed : sig.price - _tp2Fixed);
-          // Validate bracket: SL must be on the correct side of entry
-          const _slValid = sig.direction === "Long" ? _sl < sig.price : _sl > sig.price;
-          const _slSafe  = _slValid ? _sl : (sig.direction === "Long" ? sig.price - _slFixed : sig.price + _slFixed);
-          fetch("/api/trade/execute", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              symbol: autoTradeContractTypeRef.current,
-              direction: sig.direction,
-              interval: ivLabel,
-              riskLevel: sig.riskLevel,
-              price: sig.price,
-              tp1: _tp1,
-              tp2: _tp2,
-              sl: _slSafe,
-              contracts: autoTradeContractsRef.current,
-              tp1Only: autoTradeTp1OnlyRef.current,
-              useTrailer: useTrailerRef.current,
-              trailingOffset: trailerOffsetRef.current,
-            }),
-          }).then(async r => {
-            if (r.ok) {
-              showToast(true, `Order sent to MotiveWave: ${autoTradeContractsRef.current}x ${autoTradeContractTypeRef.current} ${sig.direction} @ ${sig.price.toFixed(2)}`);
-            } else {
-              const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-              showToast(false, d.error ?? `HTTP ${r.status}`);
+          // ORDER ADMISSION (2026-09-25, B5): this fire was POSTed to /api/signals/history when it
+          // appeared (the persist effect runs before this 3 s timer); the route may have REFUSED it
+          // (cross-writer cooldown / open trade — server/fire-admission.ts). A refused or unstored
+          // fire is not a signal of record and is never ordered. No verdict = this tab never posted
+          // the key; the server gates (incl. its own stored-signal check) decide.
+          const verdictP = persistVerdictRef.current.get(admissionKey(ivLabel, sig.time, sig.direction));
+          void (verdictP ?? Promise.resolve(undefined)).then(verdict => {
+            const withheld = orderAdmissionBlockReason(verdict);
+            if (withheld) {
+              console.warn(`[auto-trade] WITHHELD — ${sig.direction} ${ivLabel} @ ${sig.price}: ${withheld}`);
+              showToast(false, `Auto-trade withheld — ${withheld}`);
+              return;
             }
-          }).catch(e => showToast(false, `Network error: ${e.message}`));
+            // Signal confirmed stable — compute levels and send order
+            const _ep = EXIT_STRATEGY_PROFILES[exitStrategy];
+            const _sigRth = isRTH(sig.time);
+            const _te = (_sigRth ? _ep.rth : _ep.eth)[sig.riskLevel as keyof typeof _ep.rth] ?? (_sigRth ? _ep.rth : _ep.eth).riskiest;
+            const _slFixed  = _te.sl;
+            const _tp1Fixed = _te.tp1;
+            const _tp2Fixed = _te.tp2;
+            // Prefer the signal's actual SL (may be FP/zone-target adjusted); fallback to tier profile
+            const _sl  = (sig.sl  != null && sig.sl  !== sig.price) ? sig.sl  : (sig.direction === "Long" ? sig.price - _slFixed  : sig.price + _slFixed);
+            const _tp1 = (sig.tp1 != null && sig.tp1 !== sig.price) ? sig.tp1 : (sig.direction === "Long" ? sig.price + _tp1Fixed : sig.price - _tp1Fixed);
+            const _tp2 = (sig.tp2 != null && sig.tp2 !== sig.price) ? sig.tp2 : (sig.direction === "Long" ? sig.price + _tp2Fixed : sig.price - _tp2Fixed);
+            // Validate bracket: SL must be on the correct side of entry
+            const _slValid = sig.direction === "Long" ? _sl < sig.price : _sl > sig.price;
+            const _slSafe  = _slValid ? _sl : (sig.direction === "Long" ? sig.price - _slFixed : sig.price + _slFixed);
+            // POSITION SIZING (2026-08-02 — EXPLICIT OPT-IN, default OFF): with "Size by combo
+            // tier" ON, this order uses the engine's suggestedContracts (PROVEN combo = 2, else 1)
+            // and tells the server so (sizeByComboTier:true — the stored contracts setting stays
+            // authoritative otherwise). OFF = exactly the previous behavior.
+            const _useTierSize = sizeByComboTierRef.current && Number.isFinite(sig.suggestedContracts as number) && (sig.suggestedContracts as number) >= 1;
+            const _orderContracts = _useTierSize ? Math.floor(sig.suggestedContracts as number) : autoTradeContractsRef.current;
+            fetch("/api/trade/execute", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                symbol: autoTradeContractTypeRef.current,
+                direction: sig.direction,
+                interval: ivLabel,
+                riskLevel: sig.riskLevel,
+                // ONE ORDER AUTHORITY (2026-08-13): fire-bar time — the server dedups this order
+                // against the server live engine's claim for the same signal.
+                fireTs: sig.time,
+                price: sig.price,
+                tp1: _tp1,
+                // TP1-ONLY (2026-08-14): never bake a synthetic tier-profile TP2 into the order —
+                // under TP1-only the position record must carry tp2:null (the bracket's TP2 leg
+                // mirrors TP1 server-side; a synthetic tp2 polluted the position-gate record).
+                tp2: autoTradeTp1OnlyRef.current ? (sig.tp2 ?? null) : _tp2,
+                sl: _slSafe,
+                contracts: _orderContracts,
+                sizeByComboTier: _useTierSize ? true : undefined,
+                tp1Only: autoTradeTp1OnlyRef.current,
+              }),
+            }).then(async r => {
+              if (r.ok) {
+                showToast(true, `Order sent to MotiveWave: ${_orderContracts}x ${autoTradeContractTypeRef.current} ${sig.direction} @ ${sig.price.toFixed(2)}${_useTierSize ? " (combo-tier size)" : ""}`);
+              } else {
+                const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+                showToast(false, d.error ?? `HTTP ${r.status}`);
+              }
+            }).catch(e => showToast(false, `Network error: ${e.message}`));
+          });
         }, 3000);
-        pendingAutoTradeRef.current = { timer, key: sigKey };
+        pendingAutoTradeMapRef.current.set(pendKey, { timer, key: sigKey });
       }
     }
-    // (Discord alert moved into the 3s-verify callback above — only fires for confirmed signals.)
   };
 
   // Risk level rank — higher number = better confirmation. Used to detect zone upgrades.
   const RISK_RANK: Record<string, number> = { riskiest: 0, risky: 1, safe: 2, safeplus: 3 };
 
   const checkIntervalSignals = (
-    signals: Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number; sl: number; riskLevel: string }>,
+    signals: Array<{ time: number; direction: "Long" | "Short"; price: number; tp1: number; tp2: number | null; sl: number; riskLevel: string; signalType?: string; suggestedContracts?: number | null }>,
     ivKey: string,
     ivLabel: string,
     ivSec: number,
+    // ALL-INTERVAL AUTO-TRADE (2026-08-13, user directive): the parity-grade hidden-interval
+    // ENGINE stream passes true — its fires are persisted and now auto-execute like the viewed
+    // interval's. The degraded bg scanners keep the default false (not persisted, display-only).
+    eligible = false,
   ) => {
     const nowSec = Math.floor(Date.now() / 1000);
     // Check Long and Short independently — a recent Long must not block a Short (and vice-versa)
@@ -3460,7 +3757,13 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       const isNewBar  = latest.time > lastTime;
       const isUpgrade = latest.time === lastTime &&
         (RISK_RANK[latest.riskLevel ?? "riskiest"] ?? 0) > (RISK_RANK[lastRisk] ?? 0);
-      if (!isNewBar && !isUpgrade) continue;
+      if (!isNewBar && !isUpgrade) {
+        // ENGINE-STREAM RESCUE: the bg scanner may have consumed this bar's notification key
+        // with eligible=false — the ORDER must still be attempted exactly once (orderAttemptRef
+        // dedups), else notification dedup silently starves auto-execution.
+        if (eligible && nowSec - latest.time <= ivSec * 2) attemptAutoTrade(latest, ivLabel);
+        continue;
+      }
       // Only fire if signal is fresh (within last 2 bar intervals of now)
       if (nowSec - latest.time > ivSec * 2) {
         lastNotifiedRef.current[notifyKey] = latest.time;
@@ -3469,9 +3772,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       }
       lastNotifiedRef.current[notifyKey] = latest.time;
       lastNotifiedRiskRef.current[notifyKey] = latest.riskLevel ?? "riskiest";
-      // Background signals: notifications/Discord only — NOT auto-trade eligible
-      // (they are not saved to DB and would produce trades with no chart signal dot).
-      fireSignalNotification(latest, ivLabel, false);
+      fireSignalNotification(latest, ivLabel, eligible);
     }
   };
 
@@ -3539,6 +3840,22 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     if (interval === "60m") return;
     checkIntervalSignals(bgSignals60m, "60m", "60m", 3600);
   }, [bgSignals60m, interval]);
+
+  // BAR-CLOSE LATENCY FIX (2026-08-07) + ALL-INTERVAL AUTO-TRADE (2026-08-13, user directive:
+  // "auto trade all intervals — no missed signals"): the hidden-interval ENGINE fires are
+  // persisted, parity-grade signals — they now pass eligible=true and AUTO-EXECUTE exactly
+  // like the viewed interval (the user made the eligibility call the old comment deferred).
+  // The user's interval checkboxes (autoTradeIntervalRef) remain the filter of record.
+  useEffect(() => {
+    if (!hiddenIntervalSignals.length) return;
+    for (const iv of ["1m", "5m", "15m", "60m"] as const) {
+      if (iv === interval) continue;
+      const sigs = hiddenIntervalSignals.filter(s => s.interval === iv);
+      if (!sigs.length) continue;
+      checkIntervalSignals(sigs as Parameters<typeof checkIntervalSignals>[0], iv, iv,
+        iv === "1m" ? 60 : iv === "5m" ? 300 : iv === "15m" ? 900 : 3600, true);
+    }
+  }, [hiddenIntervalSignals, interval]);
 
   // Request browser notification permission once
   useEffect(() => {
@@ -3654,9 +3971,10 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   }, [refreshing, isFutures, queryClient, selectedSymbol]);
 
   // Signals refresh: invalidate candle data so allConfluenceSignals recomputes, then persist to DB.
+  // (The /api/learn/backfill call is GONE — SIGNAL-INTEGRITY A1: it regenerated retired-model
+  //  signals server-side. The fact engine recompute IS the refresh.)
   const handleRefreshSignals = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: ["/api/data/cached-continuous"] });
-    await fetch("/api/learn/backfill", { method: "POST" }).catch(() => {});
   }, [queryClient]);
 
   // ── Zone file upload ──────────────────────────────────────────────────────
@@ -4129,6 +4447,14 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
             <SelectItem value="9999">ALL</SelectItem>
           </SelectContent>
         </Select>
+        {/* CANDLE WINDOW (2026-09-24): the per-interval fetch cap trimmed this window */}
+        {windowCapNote && (
+          <span
+            data-testid="text-window-capped"
+            title="Candle fetches are capped per interval (1m 14 d, 5m 90 d, 15m 400 d) so a wide window cannot stall the server"
+            style={{ fontSize: 10, color: MW.muted, whiteSpace: "nowrap" }}
+          >{windowCapNote}</span>
+        )}
 
         {/* Spacer */}
         <div className="flex-1" />
@@ -4200,7 +4526,6 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
               externalSignals={allConfluenceSignals as ExternalSignal[]}
               milkZones={activeZones}
               allCandles={candleData?.candles}
-              footprintAlerts={footprintAlerts}
               frozenImbalances={frozenImbalanceZones}
               onClose={() => setShowSignalsPanel(false)}
               onViewOnChart={() => { /* handled inside panel as popup */ }}
@@ -4330,6 +4655,82 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
               </div>
             </div>
 
+            {/* Yellow Box strategy */}
+            <div className="px-3 py-3" style={{ borderBottom: `1px solid ${MW.border}` }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: MW.muted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Yellow Box Strategy</div>
+              <div className="flex flex-col gap-2">
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12, color: MW.text, cursor: "pointer" }}>
+                  Yellow Box Strategy
+                  <button onClick={() => setYellowBoxEnabled(v => !v)} style={{
+                    width: 36, height: 20, borderRadius: 10, border: "none", cursor: "pointer",
+                    background: yellowBoxEnabled ? "#f5d90a" : "#2a3a4a", position: "relative", transition: "background 0.2s",
+                  }}>
+                    <span style={{ position: "absolute", top: 2, left: yellowBoxEnabled ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+                  </button>
+                </label>
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12, color: yellowBoxEnabled ? MW.text : MW.muted, cursor: yellowBoxEnabled ? "pointer" : "not-allowed" }}>
+                  Yellow Box solo signals
+                  <button disabled={!yellowBoxEnabled} onClick={() => setYellowBoxSolo(v => !v)} style={{
+                    width: 36, height: 20, borderRadius: 10, border: "none", cursor: yellowBoxEnabled ? "pointer" : "not-allowed",
+                    background: yellowBoxSolo && yellowBoxEnabled ? "#f5d90a" : "#2a3a4a", position: "relative", transition: "background 0.2s", opacity: yellowBoxEnabled ? 1 : 0.5,
+                  }}>
+                    <span style={{ position: "absolute", top: 2, left: yellowBoxSolo ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+                  </button>
+                </label>
+                <div style={{ fontSize: 10, color: MW.muted, lineHeight: 1.4 }}>
+                  Boxes draw on every trading day. Solo box-breaks are negative-EV (backtest PF 0.80–0.89) — leave OFF; breaks still count toward confluence.
+                </div>
+              </div>
+            </div>
+
+            {/* RISK CONTROLS (2026-08-02): engine-enforced daily loss stop + dead-tape suppression */}
+            <div className="px-3 py-3" style={{ borderBottom: `1px solid ${MW.border}` }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: MW.muted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Risk Controls</div>
+              <div className="flex flex-col gap-2">
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12, color: MW.text, cursor: "pointer" }}>
+                  Daily loss stop
+                  <button onClick={() => setDailyLossStopEnabled(v => !v)} style={{
+                    width: 36, height: 20, borderRadius: 10, border: "none", cursor: "pointer",
+                    background: dailyLossStopEnabled ? "#ef5350" : "#2a3a4a", position: "relative", transition: "background 0.2s",
+                  }}>
+                    <span style={{ position: "absolute", top: 2, left: dailyLossStopEnabled ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+                  </button>
+                </label>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", opacity: dailyLossStopEnabled ? 1 : 0.5 }}>
+                  <span style={{ fontSize: 10, color: MW.muted }}>Stop after losing (points)</span>
+                  <input
+                    type="number"
+                    min={5}
+                    max={500}
+                    step={5}
+                    disabled={!dailyLossStopEnabled}
+                    value={dailyLossStopPts}
+                    onChange={e => setDailyLossStopPts(Math.max(5, Math.min(500, Math.round(Number(e.target.value) || DAILY_LOSS_STOP_DEFAULT_PTS))))}
+                    style={{
+                      width: 70, padding: "4px 8px", borderRadius: 4, fontSize: 12,
+                      background: "#0d1420", border: `1px solid ${MW.border}`, color: MW.text,
+                      outline: "none", fontFamily: "'Trebuchet MS', monospace",
+                    }}
+                  />
+                </div>
+                <div style={{ fontSize: 10, color: MW.muted, lineHeight: 1.4 }}>
+                  Once today's signal P&amp;L (closed + open mark, all intervals) reaches −{dailyLossStopPts} pts, the engine fires NOTHING for the rest of the session; it resumes next session. OFF by default since 2026-08-17 (removed for the funded accounts — their own daily limits govern). {DAILY_LOSS_STOP_DEFAULT_PTS} = the p95 losing day of the standing backtest (p50 38, p90 67, worst 116).
+                </div>
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12, color: MW.text, cursor: "pointer", marginTop: 4 }}>
+                  Dead-tape suppression
+                  <button onClick={() => setDeadTapeSuppressEnabled(v => !v)} style={{
+                    width: 36, height: 20, borderRadius: 10, border: "none", cursor: "pointer",
+                    background: deadTapeSuppressEnabled ? "#ef5350" : "#2a3a4a", position: "relative", transition: "background 0.2s",
+                  }}>
+                    <span style={{ position: "absolute", top: 2, left: deadTapeSuppressEnabled ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+                  </button>
+                </label>
+                <div style={{ fontSize: 10, color: MW.muted, lineHeight: 1.4 }}>
+                  Suppresses fires while the day's realized range is under 0.6× the typical session range — measured 5.6% win rate on dead tape (nothing exempt). OFF = warning badge only, no suppression.
+                </div>
+              </div>
+            </div>
+
             {/* Exit Strategy */}
             <div className="px-3 py-3" style={{ borderBottom: `1px solid ${MW.border}` }}>
               <div style={{ fontSize: 10, fontWeight: 700, color: MW.muted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>Exit Strategy</div>
@@ -4355,68 +4756,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 })}
               </div>
 
-              {/* Trailer toggle — simple inline switch */}
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", borderRadius: 5, background: useTrailer ? "#06b6d40d" : "rgba(255,255,255,0.02)", border: `1px solid ${useTrailer ? "#06b6d440" : MW.border}` }}>
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: useTrailer ? "#06b6d4" : MW.text }}>Trailer Stop</div>
-                  {useTrailer
-                    ? <div style={{ fontSize: 9, color: "#f59e0b", marginTop: 2 }}>⚠ Fixed TPs disabled — trails {trailerOffset} pts after TP1</div>
-                    : <div style={{ fontSize: 9, color: MW.muted, marginTop: 2 }}>Standard bracket — TP1 + TP2 fixed exits</div>
-                  }
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  {useTrailer && (
-                    <input
-                      type="number"
-                      min={0.25}
-                      step={0.25}
-                      value={trailerOffset}
-                      onChange={e => { const v = parseFloat(e.target.value); if (v > 0) setTrailerOffset(v); }}
-                      style={{ width: 48, padding: "2px 5px", borderRadius: 4, fontSize: 11, textAlign: "right", background: "#0f1923", color: "#06b6d4", border: "1px solid #06b6d488", outline: "none" }}
-                    />
-                  )}
-                  <button
-                    onClick={() => setUseTrailer(v => !v)}
-                    style={{ width: 38, height: 22, borderRadius: 11, border: "none", cursor: "pointer", background: useTrailer ? "#06b6d4" : "#2a3a4a", position: "relative", flexShrink: 0, transition: "background 0.2s" }}
-                  >
-                    <span style={{ position: "absolute", top: 3, left: useTrailer ? 18 : 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
-                  </button>
-                </div>
-              </div>
-
-              {/* Zone Targets toggle */}
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", marginTop: 6, borderRadius: 5, background: useZoneTargets ? "#a855f70d" : "rgba(255,255,255,0.02)", border: `1px solid ${useZoneTargets ? "#a855f740" : MW.border}` }}>
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: useZoneTargets ? "#a855f7" : MW.text }}>Zone Targets</div>
-                  <div style={{ fontSize: 9, color: MW.muted, marginTop: 2 }}>
-                    {useZoneTargets ? "TP/SL snap to nearest zones above/below entry" : "TP/SL at next zone boundary — bounces zone-to-zone"}
-                  </div>
-                </div>
-                <button
-                  onClick={() => setUseZoneTargets(v => !v)}
-                  style={{ width: 38, height: 22, borderRadius: 11, border: "none", cursor: "pointer", background: useZoneTargets ? "#a855f7" : "#2a3a4a", position: "relative", flexShrink: 0, transition: "background 0.2s" }}
-                >
-                  <span style={{ position: "absolute", top: 3, left: useZoneTargets ? 18 : 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
-                </button>
-              </div>
-
-              {/* Take every side entry as a Long (vector exit) toggle */}
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", marginTop: 6, borderRadius: 5, background: takeSideEntries ? "#26a69a12" : "rgba(255,255,255,0.02)", border: `1px solid ${takeSideEntries ? "#26a69a55" : MW.border}` }}>
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: takeSideEntries ? "#26a69a" : MW.text }}>Side-Entry Longs</div>
-                  <div style={{ fontSize: 9, color: MW.muted, marginTop: 2 }}>
-                    {takeSideEntries
-                      ? "Every vector side entry fires a Long (vector exit: stop −3.5, TP +7.5/+26) · auto-trade eligible"
-                      : "Take every vector side entry as a Long with the vector's exit strategy"}
-                  </div>
-                </div>
-                <button
-                  onClick={() => setTakeSideEntries(v => !v)}
-                  style={{ width: 38, height: 22, borderRadius: 11, border: "none", cursor: "pointer", background: takeSideEntries ? "#26a69a" : "#2a3a4a", position: "relative", flexShrink: 0, transition: "background 0.2s" }}
-                >
-                  <span style={{ position: "absolute", top: 3, left: takeSideEntries ? 18 : 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
-                </button>
-              </div>
+              {/* (Trailer Stop, Zone Targets, Side-Entry Longs UI DELETED 2026-07-13 — trailer
+                  removed per spec rule 12; the other two toggles controlled nothing in the fact
+                  engine, which anchors TPs to zones natively and treats side entries as core facts.) */}
             </div>
 
             {/* Theme selector */}
@@ -4580,6 +4922,9 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
               )}
             </div>
 
+            {/* Account guard + alert switches (2026-10-01) */}
+            <AccountSafetySettings ethAlertsRef={ethAlertsEnabledRef} />
+
             {/* Auto Trade */}
             <div className="px-3 py-3" style={{ borderBottom: `1px solid ${MW.border}` }}>
               <div style={{ fontSize: 10, fontWeight: 700, color: MW.muted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
@@ -4699,6 +5044,24 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                     outline: "none", fontFamily: "'Trebuchet MS', monospace",
                   }}
                 />
+              </div>
+
+              {/* POSITION SIZING (2026-08-02 — EXPLICIT OPT-IN, default OFF) */}
+              <div style={{ marginBottom: 10 }}>
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 11, color: MW.text, cursor: "pointer" }}>
+                  Size by combo tier
+                  <button onClick={() => setSizeByComboTier(v => !v)} style={{
+                    width: 36, height: 20, borderRadius: 10, border: "none", cursor: "pointer",
+                    background: sizeByComboTier ? "#f59e0b" : "#2a3a4a", position: "relative", transition: "background 0.2s",
+                  }}>
+                    <span style={{ position: "absolute", top: 2, left: sizeByComboTier ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+                  </button>
+                </label>
+                <div style={{ fontSize: 10, color: sizeByComboTier ? "#f59e0b" : MW.muted, lineHeight: 1.4, marginTop: 4 }}>
+                  {sizeByComboTier
+                    ? "ON — orders use the signal's suggested size: 2 contracts on a PROVEN setup (held-out PF ≥ 1.3, adequate sample), 1 on everything else. Overrides the fixed count above per order."
+                    : "OFF (default) — every order uses the fixed \"Contracts per trade\" count above. When ON, PROVEN setups trade 2 contracts, everything else 1."}
+                </div>
               </div>
 
               {/* Exit mode — TP1 only vs TP1 + TP2 */}
@@ -5423,9 +5786,12 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                   <div style={{ display: "grid", gridTemplateColumns: "36px 1fr", rowGap: 5, fontSize: 12 }}>
                     <span style={{ color: MW.muted }}>Entry</span>
                     <span style={{ color: "#fff", fontWeight: 600 }}>{liveAlert.price.toFixed(2)}</span>
-                    <span style={{ color: "#22d3ee" }}>TP2</span>
-                    <span style={{ color: "#22d3ee", fontWeight: 700 }}>{liveAlert.tp2.toFixed(2)}</span>
-                    <span style={{ color: "#67e8f9" }}>TP1</span>
+                    {/* TP1-ONLY (2026-08-13): tp2 is null on all new signals — single TP row */}
+                    {liveAlert.tp2 != null && (<>
+                      <span style={{ color: "#22d3ee" }}>TP2</span>
+                      <span style={{ color: "#22d3ee", fontWeight: 700 }}>{liveAlert.tp2.toFixed(2)}</span>
+                    </>)}
+                    <span style={{ color: "#67e8f9" }}>{liveAlert.tp2 != null ? "TP1" : "TP"}</span>
                     <span style={{ color: "#67e8f9", fontWeight: 600 }}>{liveAlert.tp1.toFixed(2)}</span>
                     <span style={{ color: "#ef5350" }}>SL</span>
                     <span style={{ color: "#ef5350", fontWeight: 600 }}>{liveAlert.sl.toFixed(2)}</span>
@@ -5477,8 +5843,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "44px 1fr", rowGap: 4, fontSize: 11, marginBottom: 10 }}>
                     <span style={{ color: MW.muted }}>Entry</span><span style={{ color: "#fff", fontWeight: 600 }}>{s.price.toFixed(2)}</span>
-                    <span style={{ color: "#22d3ee" }}>TP2</span><span style={{ color: "#22d3ee", fontWeight: 700 }}>{s.tp2.toFixed(2)}</span>
-                    <span style={{ color: "#67e8f9" }}>TP1</span><span style={{ color: "#67e8f9" }}>{s.tp1.toFixed(2)}</span>
+                    {/* TP1-ONLY (2026-08-13): tp2 null on all new signals — single TP row */}
+                    {s.tp2 != null && (<>
+                      <span style={{ color: "#22d3ee" }}>TP2</span><span style={{ color: "#22d3ee", fontWeight: 700 }}>{s.tp2.toFixed(2)}</span>
+                    </>)}
+                    <span style={{ color: "#67e8f9" }}>{s.tp2 != null ? "TP1" : "TP"}</span><span style={{ color: "#67e8f9" }}>{s.tp1.toFixed(2)}</span>
                     <span style={{ color: "#ef5350" }}>SL</span><span style={{ color: "#ef5350" }}>{s.sl.toFixed(2)}</span>
                   </div>
                   <div style={{ borderTop: `1px solid ${MW.border}`, paddingTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
@@ -5742,13 +6111,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 const tp2 = isLong ? entryPrice + tp2F : entryPrice - tp2F;
                 const sl  = isLong ? entryPrice - slF  : entryPrice + slF;
 
-                // Walk-forward outcome
+                // Walk-forward outcome — CARRY-OVERNIGHT (2026-08-11): no settle boundary.
                 let outcome: string | null = null;
                 if (idx >= 0 && idx < sorted.length - 1) {
-                  const settleTs = rthSettleOfDay(candle.time);
                   for (let j = idx + 1; j < sorted.length; j++) {
                     const f = sorted[j];
-                    if (f.time > settleTs) { outcome = "Open (session ended)"; break; }
                     if (isLong) {
                       if (f.high >= tp2) { outcome = `Win TP2 @ ${tp2.toFixed(2)}`; break; }
                       if (f.high >= tp1) { outcome = `Win TP1 @ ${tp1.toFixed(2)}`; break; }
@@ -5993,16 +6360,15 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
               zoneOverlays={zoneOverlays}
               bandOverlays={bandOverlayData}
               zones={showMilkZones ? parsedZones : []}
+              yellowBoxes={yellowBoxEnabled ? activeYellowBoxes : []}
               vectorData={vectorLine}
               showVector={showVector}
               extraVectors={extraVectorLines}
               showLabels={showLabels}
-              entrySignals={showVector ? vectorSignals.map(s => ({ time: s.time, price: s.entryPrice })) : []}
               confluenceSignals={allConfluenceSignals}
               activeSignalTime={selectedSignal?.time ?? undefined}
               onSignalClick={info => setSelectedSignal(info)}
               onManualSignalClick={candle => { setManualSignalState({ candle, direction: null }); setManualEditMode(false); }}
-              tradeSegments={tradeSegments}
               candleFootprints={candleFootprintMap} // FOOTPRINT-RENDER:
               perCandleFootprints={perCandleFootprintMap} // FOOTPRINT-PER-CANDLE:
               activeSessionTime={activeSessionTime} // FOOTPRINT-RENDER:

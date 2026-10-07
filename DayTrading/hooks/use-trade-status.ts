@@ -6,7 +6,7 @@ export interface CurrentTrade {
   direction: 'Long' | 'Short';
   interval: string;
   riskLevel: string;
-  entry: number; tp1: number; tp2: number; sl: number;
+  entry: number; tp1: number; tp2: number | null; sl: number; // tp2 null under TP1-only (2026-08-13)
   contracts: number; tp1Only: boolean; firedAt: number;
   status: 'open' | 'tp1_hit' | 'tp2_hit' | 'sl_hit';
 }

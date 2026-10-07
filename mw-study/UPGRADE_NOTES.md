@@ -1,3 +1,9 @@
+> **2026-10-06 — LiveBarRelay v2.1 (footprint aggressor fix).** The v2 relay below shipped with a
+> reflection-guessed Tick aggressor method, so `footprint_candles` carried askVol = 0 from 07-08 to
+> 10-06. Rebuild/reinstall steps and the verification command are in
+> `docs/footprint-feed-fix-2026-10-06.md`. `build.bat` also rebuilds AutoTrader and copies both
+> jars into Extensions — read that doc before running it.
+
 # MotiveWave Study Upgrade — Data Sync Overhaul
 
 This upgrade makes history sync **server-driven and gap-aware**. The old connect-time

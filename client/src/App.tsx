@@ -9,7 +9,8 @@ import MarketPage from "@/pages/market";
 import TradingTerminal from "@/pages/terminal";
 import DataDownloadPage from "@/pages/data-download";
 import NewsPage from "@/pages/news";
-import TimestampsPage from "@/pages/timestamps";
+// (TimestampsPage DELETED 2026-07-14 — SIGNAL-INTEGRITY A3: the page ran two legacy in-page
+//  signal generators (vector-cross confluence + candlestick patterns) that bypassed the engine.)
 import TodaySignalsPage from "@/pages/today-signals";
 import PredictionsPage from "@/pages/predictions";
 import DiscordFeedPage from "@/pages/discord-feed";
@@ -51,7 +52,6 @@ function Router() {
         <Switch>
           <Route path="/data" component={DataDownloadPage} />
           <Route path="/news" component={NewsPage} />
-          <Route path="/timestamps" component={TimestampsPage} />
           <Route path="/today" component={TodaySignalsPage} />
           <Route path="/predictions" component={PredictionsPage} />
           <Route path="/discord" component={DiscordFeedPage} />

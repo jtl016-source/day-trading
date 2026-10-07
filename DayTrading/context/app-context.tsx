@@ -132,6 +132,9 @@ const DEFAULTS = {
   strategies: { milkZones: true, vector: true, footprint: false } as Strategies,
   instrument: 'MES1!',
   timeframe: '15m' as Timeframe,
+  // 2026-08-05: trading.jacksonlems.com is BACK (re-registered at Cloudflare, served by a
+  // Cloudflare Tunnel with the X-Api-Key gate — lib/api-key.ts rides on every request).
+  // Works from anywhere. LAN fallback if ever needed: http://192.168.1.158:3000.
   apiBaseUrl: 'https://trading.jacksonlems.com',
   notificationsEnabled: true,
   exitStrategy: 'standard' as ExitStrategy,

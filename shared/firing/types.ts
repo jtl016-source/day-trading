@@ -32,7 +32,8 @@ export interface FiringZone {
 }
 
 export type SignalDirection = "Long" | "Short";
-export type SignalOutcome = "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
+// (The trailer-win outcome was DELETED 2026-07-13 — the trailer exit is gone end-to-end, rule 12.)
+export type SignalOutcome = "win_tp1" | "win_tp2" | "loss" | "open";
 export type RiskLevel = "safeplus" | "safe" | "risky" | "riskiest";
 
 /** Confirmation breakdown captured/locked at fire time (mirror of CSig.confirmations). */

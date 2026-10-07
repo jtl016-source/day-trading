@@ -44,6 +44,17 @@ export interface ZoneBand {
   toTime?: number;    // unix seconds; 0 or undefined = all bars
 }
 
+// YELLOW-BOX: one trading day's gold box spanning its Globex session, plus Milk's first-target
+// init-res / init-sup levels (drawn as thin dashed lines). Rendered on the shared canvas overlay.
+export interface YellowBox {
+  topPrice: number;
+  bottomPrice: number;
+  fromTime: number;   // sessionStartTs — prior-cal-day 18:00 ET (Globex reopen)
+  toTime: number;     // sessionEndTs   — D 17:00 ET (session close)
+  initRes?: number;   // Milk's initial resistance (dashed red tint) — first target above
+  initSup?: number;   // Milk's initial support (dashed green tint) — first target below
+}
+
 export interface ChartHandle {
   /** Scroll chart so `timestamp` is centered with `paddingCandles` on each side (default 10). */
   scrollToTime: (timestamp: number, intervalSec?: number, paddingCandles?: number) => void;
@@ -64,11 +75,8 @@ export interface RectDrawing   { id: string; type: "rectangle"; t1: number; p1: 
 export interface FibDrawing    { id: string; type: "fibonacci"; t1: number; p1: number; t2: number; p2: number; }
 export type Drawing = LineDrawing | HLineDrawing | RectDrawing | FibDrawing;
 
-/** A single vector trade: entry → exit with TP/Stop levels drawn as canvas lines */
-export interface TradeSegment {
-  fromTime: number; toTime: number;
-  entry: number; tp1: number; tp2: number; stop: number;
-}
+// (TradeSegment interface DELETED 2026-07-14 — SIGNAL-INTEGRITY A2: it existed only for the
+//  retired legacy vector-cross trade overlays; the engine's confluenceSignals carry TP/SL.)
 
 export interface ChartTheme {
   name: string;
@@ -145,7 +153,7 @@ export type SignalClickInfo = {
   type: "confluence";
   time: number;
   direction: "Long" | "Short";
-  price: number; tp1: number; tp2: number; sl: number;
+  price: number; tp1: number; tp2: number | null; sl: number;
   riskLevel?: string;
   signalType?: string;
   confirmations?: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
@@ -159,13 +167,13 @@ interface CandlestickChartProps {
   zoneOverlays?: ZoneOverlay[];
   bandOverlays?: BandOverlay[];
   zones?: ZoneBand[];
+  yellowBoxes?: YellowBox[];   // YELLOW-BOX: per-trading-day gold boxes + dashed init-res/init-sup lines
   vectorData?: Array<{ time: number; value: number }>;
   showVector?: boolean;
   extraVectors?: Array<{ label: string; color: string; data: Array<{ time: number; value: number }> }>;
-  entrySignals?: Array<{ time: number; price: number }>;
   confluenceSignals?: Array<{
     time: number; price: number; direction: "Long" | "Short";
-    tp1: number; tp2: number; sl: number; toTime: number;
+    tp1: number; tp2: number | null; sl: number; toTime: number;
     riskLevel?: "safeplus" | "safe" | "risky" | "riskiest";
     signalType?: string; // "confluence" | "trend" | "pure_tabletop" | "side_tabletop" | "vector-side-entry"
     confirmations?: { milkOk: boolean; vecOk: boolean; secondaryVecOk: boolean };
@@ -176,12 +184,11 @@ interface CandlestickChartProps {
     /** Both tabletop types: where the pattern started (for drawing the channel / flat line) */
     patternFromTime?: number;
     /** Backtest outcome — used by backtestMode to color green=win / red=loss */
-    outcome?: "win_tp1" | "win_tp2" | "win_trailer" | "loss" | "open";
+    outcome?: "win_tp1" | "win_tp2" | "loss" | "open";
   }>;
   onSignalClick?: (info: SignalClickInfo) => void;
   /** When set, TP/SL lines are only drawn for the signal with this timestamp. All others show circles only. */
   activeSignalTime?: number;
-  tradeSegments?: TradeSegment[];
   activeTool?: DrawingTool;
   onDetailClick?: (info: CrosshairData & { x: number; y: number }) => void;
   drawings?: Drawing[];
@@ -328,54 +335,12 @@ function renderDrawing(ctx: CanvasRenderingContext2D, d: Drawing, chart: IChartA
   ctx.restore();
 }
 
-// ── Trade segment renderer ────────────────────────────────────────────────────
-function renderTradeSegment(ctx: CanvasRenderingContext2D, seg: TradeSegment, chart: IChartApi, series: ISeriesApi<"Candlestick">, cw: number, showLabels = true) {
-  const ts = chart.timeScale();
-  const x1 = ts.timeToCoordinate(seg.fromTime as any);
-  const x2 = ts.timeToCoordinate(seg.toTime as any);
-  if (x1 == null || x2 == null) return;
-  const lx = Math.min(x1, x2), rx = Math.max(x1, x2);
-
-  const drawLevel = (price: number, color: string, dash: number[], width: number, label: string) => {
-    const y = series.priceToCoordinate(price);
-    if (y == null) return;
-    ctx.save();
-    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
-    ctx.beginPath(); ctx.moveTo(lx, y); ctx.lineTo(rx, y); ctx.stroke();
-    ctx.setLineDash([]);
-    if (showLabels) {
-      const lw = ctx.measureText(label).width + 8;
-      ctx.fillStyle = color + "dd";
-      ctx.fillRect(rx + 2, y - 8, lw, 15);
-      ctx.fillStyle = "#ffffff"; ctx.font = "bold 9px 'Trebuchet MS', monospace"; ctx.textAlign = "left";
-      ctx.fillText(label, rx + 6, y + 4);
-    }
-    ctx.restore();
-  };
-
-  // Entry vertical marker
-  const entryY = series.priceToCoordinate(seg.entry);
-  if (entryY != null) {
-    ctx.save();
-    ctx.strokeStyle = "#ffffff55"; ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
-    ctx.beginPath(); ctx.moveTo(lx, entryY - 30); ctx.lineTo(lx, entryY + 30); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.restore();
-  }
-
-  // TP2 — thick green long-dash
-  drawLevel(seg.tp2,  "#26c87a", [8, 4], 1.5, `TP2 ${seg.tp2.toFixed(2)}`);
-  // TP1 — thin green short-dash
-  drawLevel(seg.tp1,  "#4ade80", [5, 3], 1,   `TP1 ${seg.tp1.toFixed(2)}`);
-  // Entry — white solid
-  drawLevel(seg.entry,"#ffffffaa", [], 1, `E ${seg.entry.toFixed(2)}`);
-  // Stop — red short-dash
-  drawLevel(seg.stop, "#ef5350", [5, 3], 1,   `Stop ${seg.stop.toFixed(2)}`);
-}
+// (renderTradeSegment DELETED 2026-07-14 — SIGNAL-INTEGRITY A2: drew the retired legacy
+//  vector-cross trade overlays. Engine signals render via renderConfluenceSegment below.)
 
 function renderConfluenceSegment(
   ctx: CanvasRenderingContext2D,
-  sig: { time: number; price: number; direction: "Long" | "Short"; tp1: number; tp2: number; sl: number; toTime: number; riskLevel?: string },
+  sig: { time: number; price: number; direction: "Long" | "Short"; tp1: number; tp2: number | null; sl: number; toTime: number; riskLevel?: string },
   chart: IChartApi, series: ISeriesApi<"Candlestick">, showLabels = true, cw = 0,
   usedLabels?: Array<{ rx: number; y: number }>
 ) {
@@ -412,7 +377,8 @@ function renderConfluenceSegment(
     ctx.fillRect(lx, top, fillRx - lx, ht);
     ctx.restore();
   };
-  fillBand(sig.price, sig.tp2,    isLong ? "rgba(38,166,154,0.07)" : "rgba(239,83,80,0.07)");
+  // TP1-ONLY (2026-08-13): tp2 is null on all new signals — the profit band runs to TP1.
+  fillBand(sig.price, sig.tp2 ?? sig.tp1, isLong ? "rgba(38,166,154,0.07)" : "rgba(239,83,80,0.07)");
   fillBand(sig.price, safeSlPrice, isLong ? "rgba(239,83,80,0.07)"  : "rgba(38,166,154,0.07)");
 
   // ── Level lines — exact vector style (dashed) ──────────────────────────────
@@ -460,8 +426,13 @@ function renderConfluenceSegment(
     ctx.restore();
   }
 
-  drawLevel(sig.tp2,    dirColor,        [8, 4], 1.5, `TP2 ${sig.tp2.toFixed(2)}`);
-  drawLevel(sig.tp1,    dirColor + "bb", [5, 3], 1,   `TP1 ${sig.tp1.toFixed(2)}`);
+  // TP1-ONLY (2026-08-13): no TP2 line when tp2 is null; TP1 takes the primary weight/label.
+  if (sig.tp2 != null) {
+    drawLevel(sig.tp2,  dirColor,        [8, 4], 1.5, `TP2 ${sig.tp2.toFixed(2)}`);
+    drawLevel(sig.tp1,  dirColor + "bb", [5, 3], 1,   `TP1 ${sig.tp1.toFixed(2)}`);
+  } else {
+    drawLevel(sig.tp1,  dirColor,        [8, 4], 1.5, `TP ${sig.tp1.toFixed(2)}`);
+  }
   drawLevel(sig.price,  "#ffffffaa",     [],     1,   `E ${sig.price.toFixed(2)}`);
   drawLevel(safeSlPrice, "#ef5350",      [5, 3], 1,   `Stop ${safeSlPrice.toFixed(2)}`, true);
 }
@@ -471,9 +442,9 @@ function renderConfluenceSegment(
 export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
   function CandlestickChart({
     candles, height, showVolume = true,
-    zoneOverlays, bandOverlays, zones,
+    zoneOverlays, bandOverlays, zones, yellowBoxes,
     vectorData, showVector = false, extraVectors,
-    entrySignals, confluenceSignals, tradeSegments = [],
+    confluenceSignals,
     activeTool = "cursor",
     drawings = [], onAddDrawing, onUpdateDrawing,
     onCrosshairMove, onSignalClick, activeSignalTime,
@@ -506,6 +477,12 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const extraVectorsRef  = useRef<Array<{ label: string; color: string; data: Array<{ time: number; value: number }> }>>([]);
     const bandOverlaysRef  = useRef<BandOverlay[]>([]);
     const zonesRef         = useRef<ZoneBand[]>([]);
+    const yellowBoxesRef   = useRef<YellowBox[]>([]); // YELLOW-BOX:
+    // YELLOW-BOX: times of the EXACT array handed to candle series.setData(). The setData loop
+    // filters invalid bars, so candlesRef/sortedCandlesRef indices do NOT equal series logical
+    // indices — seriesTimesRef.current[i] is the time at logical index i. Used to snap box X
+    // edges to bar indices (the x-axis is bar-index spaced; time-linear estimates drift).
+    const seriesTimesRef   = useRef<number[]>([]);
     const candleFootprintsRef    = useRef<Map<number, FootprintCandle>>(new Map()); // FOOTPRINT-RENDER:
     const perCandleFootprintsRef = useRef<Map<number, FootprintCandle>>(new Map()); // FOOTPRINT-PER-CANDLE:
     const activeSessionTimeRef   = useRef<number | undefined>(undefined); // FOOTPRINT-RENDER:
@@ -546,9 +523,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     // Refs for canvas callbacks to always see latest values
     const drawingsRef        = useRef<Drawing[]>(drawings);
     const activeToolRef      = useRef<DrawingTool>(activeTool);
-    const entrySignalsRef       = useRef(entrySignals ?? []);
     const confluenceSignalsRef  = useRef(confluenceSignals ?? []);
-    const tradeSegmentsRef         = useRef(tradeSegments);
     const themeRef           = useRef(theme);
     const showLabelsRef      = useRef(showLabels);
     const backtestModeRef    = useRef(backtestMode ?? false);
@@ -557,9 +532,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     const livePriceRef       = useRef<{ price: number; isUp: boolean } | null>(null);
     useEffect(() => { drawingsRef.current = drawings; }, [drawings]);
     useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
-    useEffect(() => { entrySignalsRef.current = entrySignals ?? []; }, [entrySignals]);
     useEffect(() => { confluenceSignalsRef.current = confluenceSignals ?? []; }, [confluenceSignals]);
-    useEffect(() => { tradeSegmentsRef.current = tradeSegments; }, [tradeSegments]);
     useEffect(() => { themeRef.current = theme; }, [theme]);
     useEffect(() => { showLabelsRef.current = showLabels; }, [showLabels]);
     useEffect(() => { backtestModeRef.current = backtestMode; }, [backtestMode]);
@@ -648,7 +621,12 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           if (currentPriceLineRef.current) {
             try { currentPriceLineRef.current.applyOptions({ price, color: col }); } catch {}
           }
-          try { series.update({ time: bucketSec as any, open: newBar.open, high: price, low: price, close: price }); } catch {}
+          try {
+            series.update({ time: bucketSec as any, open: newBar.open, high: price, low: price, close: price });
+            // YELLOW-BOX: the series just grew by one bar — keep the logical-index map in sync
+            const st = seriesTimesRef.current;
+            if (!st.length || bucketSec > st[st.length - 1]) st.push(bucketSec);
+          } catch {}
           cancelAnimationFrame(rafIdRef.current);
           rafIdRef.current = requestAnimationFrame(drawAllRef.current);
           return;
@@ -1227,6 +1205,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         volData.push({ time: c.time as any, value: c.volume ?? 0, color: isUp ? t.up+"88" : t.down+"88" });
       }
 
+      seriesTimesRef.current = candleData.map(d => d.time as number); // YELLOW-BOX: logical index i ↔ time
       candleSeriesRef.current.setData(candleData);
       volumeSeriesRef.current?.setData(volData);
       if (structChanged) {
@@ -1535,6 +1514,86 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
               ctx.setLineDash([]);
               ctx.restore();
             }
+          }
+        }
+
+        // ── YELLOW-BOX: per-trading-day gold box + dashed init-res/init-sup first-target lines ──
+        // Same canvas mechanism as milk zones (priceToCoordinate → Y); no lightweight-charts
+        // series is added, so this layer cannot perturb the locked-in Y autoscale.
+        //
+        // X edges SNAP TO SERIES BAR INDICES (binary search + index→pixel anchor). The x-axis is
+        // BAR-INDEX spaced — overnight/weekend gaps occupy no width — so the time-linear estX
+        // fallback over-stretched off-screen sessions leftward and the off-screen guard skipped
+        // them; only the nearest 1-2 sessions got a box. seriesTimesRef mirrors the exact array
+        // given to series.setData() (its index IS the logical index); px/bar is anchored on the
+        // two rightmost visible bars, so any bar index maps to an exact X even off-screen.
+        if (yellowBoxesRef.current.length > 0) {
+          const times = seriesTimesRef.current;
+          const n = times.length;
+          // Anchor the index→pixel mapping on the two rightmost on-screen bars.
+          let pxPerBar = 0, refBarX = 0, refBarI = 0;
+          for (let i = n - 1, xPrev = 0, iPrev = -1; i >= 0; i--) {
+            const x = ts.timeToCoordinate(times[i] as any) as number | null;
+            if (x === null) continue;
+            if (iPrev < 0) { xPrev = x; iPrev = i; continue; }
+            pxPerBar = (xPrev - x) / (iPrev - i);
+            refBarX = xPrev; refBarI = iPrev;
+            break;
+          }
+          const idxToX = (i: number): number => refBarX + (i - refBarI) * pxPerBar;
+          // first series index with time >= t
+          const lbTime = (t: number): number => {
+            let lo = 0, hi = n;
+            while (lo < hi) { const m = (lo + hi) >> 1; if (times[m] < t) lo = m + 1; else hi = m; }
+            return lo;
+          };
+          for (const yb of (pxPerBar > 0 ? yellowBoxesRef.current : [])) {
+            const iFirst = lbTime(yb.fromTime);
+            const iLast  = lbTime(yb.toTime + 1) - 1;    // last index with time <= toTime
+            if (iFirst >= n || iLast < iFirst) continue; // no bars in this session (holiday / outside loaded range)
+            const rawLeft  = idxToX(iFirst - 0.5);       // half-bar pad so the edge bars sit inside the box
+            const rawRight = idxToX(iLast + 0.5);
+            // Skip boxes whose Globex session is entirely off-screen. NO full-width fallback —
+            // otherwise every off-screen historical day's box would tile the pane as a gold stripe.
+            if (rawRight < 0 || rawLeft > cw) continue;
+            const bxLeft  = Math.max(0, rawLeft);
+            const bxRight = Math.min(cw, rawRight);
+            const bxW = bxRight - bxLeft;
+            if (bxW <= 0) continue;
+
+            const rawYt = series.priceToCoordinate(yb.topPrice);
+            const rawYb = series.priceToCoordinate(yb.bottomPrice);
+            if (rawYt === null || rawYb === null) continue;
+            const by  = Math.max(0, Math.min(rawYt, rawYb));
+            const byb = Math.min(clipBottom, Math.max(rawYt, rawYb));
+            const brh = byb - by;
+
+            ctx.save();
+            // Gold box (fill + border) — matches Milk's Yellow Box color #f5d90a.
+            if (brh >= 1) {
+              ctx.fillStyle = "rgba(245,217,10,0.10)";
+              ctx.fillRect(bxLeft, by, bxW, brh);
+              ctx.strokeStyle = "rgba(245,217,10,0.85)"; ctx.lineWidth = 1;
+              ctx.strokeRect(bxLeft, by, bxW, brh);
+              if (showLabelsRef.current && brh > 12) {
+                ctx.font = "bold 10px 'Trebuchet MS', monospace";
+                ctx.textAlign = "left";
+                ctx.fillStyle = "rgba(245,217,10,0.95)";
+                ctx.fillText("YB", bxLeft + 3, by + 10);
+              }
+            }
+            // Milk's first-target levels — thin dashed lines: init-res (red tint), init-sup (green tint).
+            const drawDashLevel = (price: number | undefined, color: string) => {
+              if (price == null) return;
+              const y = series.priceToCoordinate(price);
+              if (y === null || y < 0 || y > clipBottom) return;
+              ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash([5, 3]);
+              ctx.beginPath(); ctx.moveTo(bxLeft, y); ctx.lineTo(bxRight, y); ctx.stroke();
+              ctx.setLineDash([]);
+            };
+            drawDashLevel(yb.initRes, "rgba(239,154,154,0.85)"); // #ef9a9a — init res
+            drawDashLevel(yb.initSup, "rgba(165,214,167,0.85)"); // #a5d6a7 — init sup
+            ctx.restore();
           }
         }
       }
@@ -1963,27 +2022,8 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       } // IMBALANCE-FIX: end footprint rendering block
 
 
-      // ── Vector entry arrows (upward arrow with stem, below candle) ──────
-      for (const sig of entrySignalsRef.current) {
-        const sx = ts.timeToCoordinate(sig.time as any), sy = series.priceToCoordinate(sig.price);
-        if (sx == null || sy == null) continue;
-        const base = sy + 32; // bottom of stem
-        const tip  = sy + 10; // arrowhead tip
-        ctx.save();
-        ctx.strokeStyle = themeRef.current.vectorLine;
-        ctx.fillStyle   = themeRef.current.vectorLine;
-        ctx.lineWidth   = 1.5;
-        // Stem
-        ctx.beginPath(); ctx.moveTo(sx, base); ctx.lineTo(sx, tip + 7); ctx.stroke();
-        // Arrowhead pointing up
-        ctx.beginPath();
-        ctx.moveTo(sx,      tip);
-        ctx.lineTo(sx - 5,  tip + 9);
-        ctx.lineTo(sx + 5,  tip + 9);
-        ctx.closePath();
-        ctx.fill();
-        ctx.restore();
-      }
+      // (Vector entry arrows DELETED 2026-07-14 — SIGNAL-INTEGRITY A2: they drew the retired
+      //  legacy vector-cross signals, which appeared in no panel and bypassed the fact engine.)
 
       // ── Confluence signal circles + MC TP/SL levels ───────────────────────
       // Shared label tracker prevents multiple signals' text boxes from overlapping
@@ -2100,7 +2140,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
           let ringClr: string;
           if (backtestModeRef.current) {
             const oc = (sig as any).outcome as string | undefined;
-            const isWin  = oc === "win_tp1" || oc === "win_tp2" || oc === "win_trailer";
+            const isWin  = oc === "win_tp1" || oc === "win_tp2";
             const isOpen = oc === "open";
             fillClr = isWin ? "rgba(38,200,122,0.92)" : isOpen ? "rgba(100,110,120,0.7)" : "rgba(239,83,80,0.92)";
             ringClr = isWin ? "rgba(0,60,30,0.7)"     : isOpen ? "rgba(40,50,60,0.6)"   : "rgba(80,0,0,0.7)";
@@ -2132,10 +2172,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
         markerHitsRef.current.push({ x: sx, y: cy, info: { type: "confluence", time: sig.time, direction: sig.direction, price: sig.price, tp1: sig.tp1, tp2: sig.tp2, sl: sig.sl, riskLevel: rl, signalType: st, confirmations: sig.confirmations, reclassifyReason: sig.reclassifyReason } });
       }
 
-      // ── Trade segments (TP/Stop lines with exact start/end) ───────────
-      for (const seg of tradeSegmentsRef.current) {
-        renderTradeSegment(ctx, seg, chart, series, cw, showLabelsRef.current);
-      }
+      // (Trade-segment rendering DELETED 2026-07-14 — SIGNAL-INTEGRITY A2.)
 
       // ── Completed drawings ────────────────────────────────────────────
       for (const d of drawingsRef.current) renderDrawing(ctx, d, chart, series, cw, ch, selectedIdRef.current);
@@ -2342,6 +2379,13 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
       rafIdRef.current = requestAnimationFrame(drawAll);
     }, [zones, drawAll]);
 
+    // YELLOW-BOX: sync day-zone data to ref and redraw (same idiom as zones above).
+    useEffect(() => {
+      yellowBoxesRef.current = yellowBoxes || [];
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = requestAnimationFrame(drawAll);
+    }, [yellowBoxes, drawAll]);
+
     // Redraw when showLabels changes
     useEffect(() => {
       cancelAnimationFrame(rafIdRef.current);
@@ -2432,7 +2476,7 @@ export const CandlestickChart = forwardRef<ChartHandle, CandlestickChartProps>(
     useEffect(() => {
       cancelAnimationFrame(rafIdRef.current);
       rafIdRef.current = requestAnimationFrame(drawAll);
-    }, [drawings, tradeSegments, entrySignals, confluenceSignals, candles, zoneOverlays, activeSignalTime, drawAll]);
+    }, [drawings, confluenceSignals, candles, zoneOverlays, activeSignalTime, drawAll]);
 
     // ── Drawing mouse handlers ──────────────────────────────────────────────
     const getChartCoords = useCallback((e: React.MouseEvent) => {

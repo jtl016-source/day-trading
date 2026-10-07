@@ -17,7 +17,7 @@ export interface MilkZone {
 const keyFor = (sym: string) => `baxter_milk_zones_${sym.toUpperCase()}`;
 
 /**
- * The RTH session a freshly-uploaded zone belongs to: 9:30 AM → 4:00 PM ET (DST-safe).
+ * The RTH session a freshly-uploaded zone belongs to: 9:30 AM → 5:00 PM ET (DST-safe).
  * Milk zones are valid for ONE RTH session only, so every uploaded zone is time-bounded to
  * this window — it charts at the correct time and never extends past a single session.
  * Outside a weekday session (weekend / after the close) it rolls forward to the next weekday.
@@ -33,7 +33,7 @@ export function currentRthSession(nowMs: number = Date.now()): { fromTime: numbe
       }).format(new Date(edt * 1000)));
       return wallH === h ? edt : Date.UTC(y, mo - 1, d, h + 5, min, 0) / 1000; // else EST (UTC-5)
     };
-    return { fromTime: etToUtc(9, 30), toTime: etToUtc(16, 0) };
+    return { fromTime: etToUtc(9, 30), toTime: etToUtc(17, 0) }; // 9:30 AM – 5:00 PM ET
   };
   const nowSec = Math.floor(nowMs / 1000);
   let probe = nowMs;

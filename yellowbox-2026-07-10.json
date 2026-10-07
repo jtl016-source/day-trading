@@ -1,0 +1,1667 @@
+{
+  "symbol": "MES",
+  "date": "2026-07-10",
+  "weekday": "FRI",
+  "cutoffUtc": "2026-07-10T13:30:00Z",
+  "cutoffEpoch": 1783690200,
+  "maxBarTsUsed": 1783690140,
+  "maxBarTsUsedUtc": "2026-07-10T13:29:00Z",
+  "cutoffRespected": true,
+  "anchorPriorClose": 7586.25,
+  "priorTradingDay": "2026-07-09",
+  "lastCloseBeforeCutoff": 7592.25,
+  "generatedAt": "2026-07-14T01:20:43.807Z",
+  "spreadMonster": {
+    "weekdayMatched": {
+      "analogCount": 200,
+      "apex": 7587.38,
+      "longMedian": 7615.25,
+      "shortMedian": 7560,
+      "wallLong": 7637.75,
+      "wallShort": 7533.06,
+      "cap1Up": 7711.83,
+      "cap15Up": 7700.42,
+      "cap1Dn": 7357.64,
+      "cap15Dn": 7433.1
+    },
+    "hlMatched": {
+      "analogCount": 200,
+      "apex": 7593.13,
+      "longMedian": 7616,
+      "shortMedian": 7559.38,
+      "wallLong": 7637.56,
+      "wallShort": 7538.5,
+      "cap1Up": 7731.44,
+      "cap15Up": 7700.22,
+      "cap1Dn": 7411.51,
+      "cap15Dn": 7439.08
+    },
+    "note": "JSON-only (not rendered); LongAve mapping superseded by initial_resistance"
+  },
+  "volatility": {
+    "lookbackDays": 50,
+    "anchorSettle": 7586.25,
+    "globexOpen": 7586.75,
+    "yellowBox": {
+      "formula": "settle+-mean60mExt50",
+      "driftK": 0,
+      "bottom": 7577.01,
+      "top": 7595.04,
+      "meanBarUpExt": 8.79,
+      "meanBarDnExt": 9.24,
+      "width": 18.03,
+      "solved": "WIDTH = 50-day 60m mean bar extension (EXACT); CENTER = settle + 0.35*drift50 (min-max over 8 edges = 3.25pt)",
+      "candidates": {
+        "settle+-mean60mExt50": {
+          "bottom": 7577,
+          "top": 7595
+        },
+        "settle+0.16drift50+-mean60mExt50": {
+          "bottom": 7578,
+          "top": 7596.25
+        },
+        "settle+drift50+-mean60mExt50": {
+          "bottom": 7583.75,
+          "top": 7601.75
+        },
+        "gopen+-mean60mExt50": {
+          "bottom": 7577.5,
+          "top": 7595.5
+        },
+        "settle+-mean60mC2C": {
+          "bottom": 7577,
+          "top": 7594.75
+        },
+        "settle+-0.12pct": {
+          "bottom": 7577.25,
+          "top": 7595.25
+        },
+        "settle+-thirdMeanDailyExt": {
+          "bottom": 7569.25,
+          "top": 7605.5
+        }
+      }
+    },
+    "initialResistance": 7615.72,
+    "initialSupport": 7559,
+    "irsMethod": {
+      "up": "p33",
+      "dn": "p43.5",
+      "dist": "settle",
+      "maxAbs": {
+        "initRes": 3.22,
+        "initSup": 2.24
+      }
+    },
+    "normalRangeDays": {
+      "pct": 0.755,
+      "up": 7660.99,
+      "dn": 7519.25,
+      "maxAbsDn": 2.5
+    },
+    "maxRangeDays": {
+      "pctUp": 0.855,
+      "pctDn": 0.87,
+      "up": 7671.15,
+      "dn": 7483.88,
+      "maxAbsUp": 1.22,
+      "maxAbsDn": 3.87
+    },
+    "maxTrendUp": {
+      "pct": 0.91,
+      "level": 7690.53,
+      "maxAbs": 3.14
+    },
+    "longAveShortAve": {
+      "longAve": 7650,
+      "shortAve": 7553,
+      "method": "LongAve=anchor+p68dayUp, ShortAve=anchor-p50dayDn (allDays 50d)",
+      "milk": {
+        "longAve": 7657,
+        "shortAve": 7555.5
+      },
+      "note": "NO median variant fits all 4; Milk LongAve ~p68 of up-ext (not median); Jul-13 band shifts ~16-31pt down (outlier)"
+    }
+  },
+  "vectorTest": {
+    "derivation": "2026-07-09 18:00 ET (= (D-1) 22:00 UTC, Milk's strip draw time)",
+    "variants": {
+      "lower B:HiLo(close,25) 5m": 7582.5,
+      "upper C:LoHi(high,15) 5m": 7589,
+      "A:HiLo(low,10) 5m": 7585.75,
+      "A:HiLo(low,20) 5m": 7582.25
+    },
+    "milkStrip": [
+      7586.25,
+      7591
+    ],
+    "esVectorLabels": {
+      "jul08": {
+        "E": 7550.18,
+        "S": 7556.56
+      },
+      "jul09": {
+        "E": 7515.9,
+        "S": 7531.64
+      },
+      "jul10": {
+        "E": 7591.88,
+        "S": 7584.89
+      },
+      "jul13": {
+        "E": 7627.29,
+        "S": 7620.89
+      }
+    },
+    "gridWinners": {
+      "lowerVector": "B:HiLo(close) N=25 5m (maxErr 3.75)",
+      "upperVector": "C:LoHi(high) N=15-20 5m (maxErr 2.25)"
+    },
+    "verdict": "NO-MATCH within +/-1.5pt; strip rendered from Milk's exact values on his 4 days; box stays settle-anchored"
+  },
+  "persistentBands": {
+    "knobs": {
+      "lookbackDays": 45,
+      "windowPts": 4,
+      "topPerDay": 6,
+      "effortMult": 1.8,
+      "trim": 0.45,
+      "deathParticipation": 0.8
+    },
+    "mwmlImport": {
+      "files": [
+        "ESU6_-_Milk_Yellowbox_3.mwml",
+        "ESU6_-_Milk_Yellowbox_4.mwml"
+      ],
+      "totalMappedBands": 7158,
+      "eligibleBeforeCutoff": 7150,
+      "targetDaySet": 9,
+      "latestDrawStartUtc": "2026-07-10T10:08:27Z",
+      "cutoffRule": "draw-start < 2026-07-10T13:30:00Z (2026-07-10 09:30 ET)",
+      "imported": [
+        {
+          "type": "nfv",
+          "bottom": 7620,
+          "top": 7624,
+          "drawStart": "2026-07-10T10:08:27Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "objectives",
+          "bottom": 7632,
+          "top": 7636,
+          "drawStart": "2026-07-10T10:08:27Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "nfv",
+          "bottom": 7564,
+          "top": 7572,
+          "drawStart": "2026-07-10T10:08:27Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "positioning",
+          "bottom": 7560,
+          "top": 7564,
+          "drawStart": "2026-07-10T10:08:27Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "objectives",
+          "bottom": 7600,
+          "top": 7606,
+          "drawStart": "2026-07-10T10:08:02Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "objectives",
+          "bottom": 7518,
+          "top": 7522,
+          "drawStart": "2026-07-10T10:08:02Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "pivot",
+          "bottom": 7590,
+          "top": 7594,
+          "drawStart": "2026-07-10T10:07:37Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "positioning",
+          "bottom": 7606,
+          "top": 7608,
+          "drawStart": "2026-07-10T10:07:37Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        },
+        {
+          "type": "nfv",
+          "bottom": 7540,
+          "top": 7548,
+          "drawStart": "2026-07-10T10:07:37Z",
+          "source": "milk-mwml",
+          "file": "ESU6_-_Milk_Yellowbox_3.mwml"
+        }
+      ]
+    },
+    "live": [
+      {
+        "bottom": 7333.25,
+        "top": 7337,
+        "born": "2026-06-10",
+        "effort": 106874,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7300.5,
+        "top": 7304.25,
+        "born": "2026-06-11",
+        "effort": 166070,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7290.75,
+        "top": 7294.5,
+        "born": "2026-06-11",
+        "effort": 132463,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7308.5,
+        "top": 7312.25,
+        "born": "2026-06-11",
+        "effort": 130368,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7316.5,
+        "top": 7320.25,
+        "born": "2026-06-11",
+        "effort": 83603,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7330.25,
+        "top": 7334,
+        "born": "2026-06-11",
+        "effort": 66778,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7282.75,
+        "top": 7286.5,
+        "born": "2026-06-11",
+        "effort": 60282,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7408.25,
+        "top": 7412,
+        "born": "2026-06-12",
+        "effort": 140809,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7400.25,
+        "top": 7404,
+        "born": "2026-06-12",
+        "effort": 93316,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7640,
+        "top": 7643.75,
+        "born": "2026-06-15",
+        "effort": 58258,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7613,
+        "top": 7616.75,
+        "born": "2026-06-16",
+        "effort": 163486,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7593.5,
+        "top": 7597.25,
+        "born": "2026-06-17",
+        "effort": 114984,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7420.5,
+        "top": 7424.25,
+        "born": "2026-06-26",
+        "effort": 144024,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7461.25,
+        "top": 7465,
+        "born": "2026-06-29",
+        "effort": 117900,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7565,
+        "top": 7568.75,
+        "born": "2026-07-07",
+        "effort": 130667,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7516.25,
+        "top": 7520,
+        "born": "2026-07-08",
+        "effort": 113098,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7508,
+        "top": 7511.75,
+        "born": "2026-07-08",
+        "effort": 104636,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7524.25,
+        "top": 7528,
+        "born": "2026-07-08",
+        "effort": 94627,
+        "refreshes": 0,
+        "source": "auto"
+      },
+      {
+        "bottom": 7551,
+        "top": 7554.75,
+        "born": "2026-07-09",
+        "effort": 83542,
+        "refreshes": 0,
+        "source": "auto"
+      }
+    ],
+    "dead": [
+      {
+        "bottom": 7417,
+        "top": 7420.75,
+        "born": "2026-05-08",
+        "died": "2026-05-13"
+      },
+      {
+        "bottom": 7409.25,
+        "top": 7412.75,
+        "born": "2026-05-08",
+        "died": "2026-05-11"
+      },
+      {
+        "bottom": 7396,
+        "top": 7399.75,
+        "born": "2026-05-08",
+        "died": "2026-05-18"
+      },
+      {
+        "bottom": 7431,
+        "top": 7434.75,
+        "born": "2026-05-11",
+        "died": "2026-05-13"
+      },
+      {
+        "bottom": 7439,
+        "top": 7442.75,
+        "born": "2026-05-11",
+        "died": "2026-05-15"
+      },
+      {
+        "bottom": 7447,
+        "top": 7450.5,
+        "born": "2026-05-11",
+        "died": "2026-05-15"
+      },
+      {
+        "bottom": 7410,
+        "top": 7413.75,
+        "born": "2026-05-11",
+        "died": "2026-05-12"
+      },
+      {
+        "bottom": 7404.75,
+        "top": 7408.5,
+        "born": "2026-05-12",
+        "died": "2026-05-18"
+      },
+      {
+        "bottom": 7522.25,
+        "top": 7526,
+        "born": "2026-05-14",
+        "died": "2026-05-26"
+      },
+      {
+        "bottom": 7451.5,
+        "top": 7455.25,
+        "born": "2026-05-15",
+        "died": "2026-06-08"
+      },
+      {
+        "bottom": 7441.75,
+        "top": 7445.5,
+        "born": "2026-05-15",
+        "died": "2026-05-20"
+      },
+      {
+        "bottom": 7433.75,
+        "top": 7437.5,
+        "born": "2026-05-15",
+        "died": "2026-05-20"
+      },
+      {
+        "bottom": 7459.5,
+        "top": 7463.25,
+        "born": "2026-05-15",
+        "died": "2026-05-21"
+      },
+      {
+        "bottom": 7467.5,
+        "top": 7471.25,
+        "born": "2026-05-15",
+        "died": "2026-06-05"
+      },
+      {
+        "bottom": 7406.5,
+        "top": 7410.25,
+        "born": "2026-05-18",
+        "died": "2026-05-19"
+      },
+      {
+        "bottom": 7369.75,
+        "top": 7373.5,
+        "born": "2026-05-19",
+        "died": "2026-06-09"
+      },
+      {
+        "bottom": 7437.75,
+        "top": 7441.5,
+        "born": "2026-05-20",
+        "died": "2026-05-21"
+      },
+      {
+        "bottom": 7426.75,
+        "top": 7430.5,
+        "born": "2026-05-20",
+        "died": "2026-05-21"
+      },
+      {
+        "bottom": 7420.75,
+        "top": 7424.5,
+        "born": "2026-05-21",
+        "died": "2026-06-05"
+      },
+      {
+        "bottom": 7428.75,
+        "top": 7432.5,
+        "born": "2026-05-21",
+        "died": "2026-06-05"
+      },
+      {
+        "bottom": 7505.25,
+        "top": 7509,
+        "born": "2026-05-22",
+        "died": "2026-06-30"
+      },
+      {
+        "bottom": 7490.25,
+        "top": 7494,
+        "born": "2026-05-22",
+        "died": "2026-06-05"
+      },
+      {
+        "bottom": 7558,
+        "top": 7561.75,
+        "born": "2026-05-25",
+        "died": "2026-05-28"
+      },
+      {
+        "bottom": 7540.75,
+        "top": 7544.5,
+        "born": "2026-05-25",
+        "died": "2026-05-26"
+      },
+      {
+        "bottom": 7537,
+        "top": 7540.75,
+        "born": "2026-05-26",
+        "died": "2026-05-27"
+      },
+      {
+        "bottom": 7539,
+        "top": 7542.75,
+        "born": "2026-05-27",
+        "died": "2026-06-04"
+      },
+      {
+        "bottom": 7528.25,
+        "top": 7532,
+        "born": "2026-05-27",
+        "died": "2026-05-28"
+      },
+      {
+        "bottom": 7578.25,
+        "top": 7582,
+        "born": "2026-05-28",
+        "died": "2026-06-03"
+      },
+      {
+        "bottom": 7534,
+        "top": 7537.75,
+        "born": "2026-05-28",
+        "died": "2026-06-04"
+      },
+      {
+        "bottom": 7526,
+        "top": 7529.75,
+        "born": "2026-05-28",
+        "died": "2026-06-05"
+      },
+      {
+        "bottom": 7558.25,
+        "top": 7562,
+        "born": "2026-05-28",
+        "died": "2026-06-04"
+      },
+      {
+        "bottom": 7594.5,
+        "top": 7598.25,
+        "born": "2026-05-29",
+        "died": "2026-06-01"
+      },
+      {
+        "bottom": 7586.5,
+        "top": 7590.25,
+        "born": "2026-06-01",
+        "died": "2026-06-03"
+      },
+      {
+        "bottom": 7621.5,
+        "top": 7625.25,
+        "born": "2026-06-02",
+        "died": "2026-06-03"
+      },
+      {
+        "bottom": 7601.25,
+        "top": 7605,
+        "born": "2026-06-02",
+        "died": "2026-06-17"
+      },
+      {
+        "bottom": 7577.75,
+        "top": 7581.5,
+        "born": "2026-06-03",
+        "died": "2026-06-17"
+      },
+      {
+        "bottom": 7586.25,
+        "top": 7590,
+        "born": "2026-06-03",
+        "died": "2026-06-15"
+      },
+      {
+        "bottom": 7569.75,
+        "top": 7573.5,
+        "born": "2026-06-03",
+        "died": "2026-06-17"
+      },
+      {
+        "bottom": 7540.25,
+        "top": 7544,
+        "born": "2026-06-04",
+        "died": "2026-06-17"
+      },
+      {
+        "bottom": 7518.25,
+        "top": 7522,
+        "born": "2026-06-05",
+        "died": "2026-07-08"
+      },
+      {
+        "bottom": 7463,
+        "top": 7466.75,
+        "born": "2026-06-05",
+        "died": "2026-06-09"
+      },
+      {
+        "bottom": 7409,
+        "top": 7412.75,
+        "born": "2026-06-05",
+        "died": "2026-06-08"
+      },
+      {
+        "bottom": 7558.75,
+        "top": 7562.5,
+        "born": "2026-06-05",
+        "died": "2026-06-17"
+      },
+      {
+        "bottom": 7401,
+        "top": 7404.75,
+        "born": "2026-06-05",
+        "died": "2026-06-08"
+      },
+      {
+        "bottom": 7526.25,
+        "top": 7530,
+        "born": "2026-06-05",
+        "died": "2026-06-30"
+      },
+      {
+        "bottom": 7444,
+        "top": 7447.75,
+        "born": "2026-06-08",
+        "died": "2026-06-09"
+      },
+      {
+        "bottom": 7414,
+        "top": 7417.75,
+        "born": "2026-06-08",
+        "died": "2026-06-12"
+      },
+      {
+        "bottom": 7452,
+        "top": 7455.75,
+        "born": "2026-06-08",
+        "died": "2026-06-23"
+      },
+      {
+        "bottom": 7436,
+        "top": 7439.75,
+        "born": "2026-06-08",
+        "died": "2026-06-09"
+      },
+      {
+        "bottom": 7392.5,
+        "top": 7396.25,
+        "born": "2026-06-09",
+        "died": "2026-06-11"
+      },
+      {
+        "bottom": 7383.75,
+        "top": 7387.5,
+        "born": "2026-06-09",
+        "died": "2026-06-10"
+      },
+      {
+        "bottom": 7433.5,
+        "top": 7437.25,
+        "born": "2026-06-09",
+        "died": "2026-06-12"
+      },
+      {
+        "bottom": 7325,
+        "top": 7328.75,
+        "born": "2026-06-10",
+        "died": "2026-06-11"
+      },
+      {
+        "bottom": 7432.75,
+        "top": 7436.5,
+        "born": "2026-06-12",
+        "died": "2026-06-23"
+      },
+      {
+        "bottom": 7424.75,
+        "top": 7428.5,
+        "born": "2026-06-12",
+        "died": "2026-06-23"
+      },
+      {
+        "bottom": 7416.25,
+        "top": 7420,
+        "born": "2026-06-12",
+        "died": "2026-06-24"
+      },
+      {
+        "bottom": 7627.75,
+        "top": 7631.5,
+        "born": "2026-06-15",
+        "died": "2026-06-16"
+      },
+      {
+        "bottom": 7610.75,
+        "top": 7614.5,
+        "born": "2026-06-15",
+        "died": "2026-06-16"
+      },
+      {
+        "bottom": 7589.75,
+        "top": 7593.5,
+        "born": "2026-06-15",
+        "died": "2026-06-17"
+      },
+      {
+        "bottom": 7618.75,
+        "top": 7622.5,
+        "born": "2026-06-15",
+        "died": "2026-06-16"
+      },
+      {
+        "bottom": 7585.5,
+        "top": 7589.25,
+        "born": "2026-06-17",
+        "died": "2026-06-22"
+      },
+      {
+        "bottom": 7575.25,
+        "top": 7579,
+        "born": "2026-06-17",
+        "died": "2026-07-06"
+      },
+      {
+        "bottom": 7542.25,
+        "top": 7546,
+        "born": "2026-06-17",
+        "died": "2026-06-18"
+      },
+      {
+        "bottom": 7554.5,
+        "top": 7558.25,
+        "born": "2026-06-18",
+        "died": "2026-06-19"
+      },
+      {
+        "bottom": 7562.5,
+        "top": 7566.25,
+        "born": "2026-06-18",
+        "died": "2026-06-19"
+      },
+      {
+        "bottom": 7543.25,
+        "top": 7547,
+        "born": "2026-06-18",
+        "died": "2026-06-19"
+      },
+      {
+        "bottom": 7557.5,
+        "top": 7561.25,
+        "born": "2026-06-19",
+        "died": "2026-06-30"
+      },
+      {
+        "bottom": 7539.25,
+        "top": 7543,
+        "born": "2026-06-19",
+        "died": "2026-06-22"
+      },
+      {
+        "bottom": 7541,
+        "top": 7544.75,
+        "born": "2026-06-22",
+        "died": "2026-07-02"
+      },
+      {
+        "bottom": 7533,
+        "top": 7536.75,
+        "born": "2026-06-22",
+        "died": "2026-06-30"
+      },
+      {
+        "bottom": 7441,
+        "top": 7444.75,
+        "born": "2026-06-23",
+        "died": "2026-06-24"
+      },
+      {
+        "bottom": 7465.25,
+        "top": 7469,
+        "born": "2026-06-23",
+        "died": "2026-06-25"
+      },
+      {
+        "bottom": 7433,
+        "top": 7436.75,
+        "born": "2026-06-23",
+        "died": "2026-06-25"
+      },
+      {
+        "bottom": 7449,
+        "top": 7452.75,
+        "born": "2026-06-23",
+        "died": "2026-06-24"
+      },
+      {
+        "bottom": 7473.25,
+        "top": 7477,
+        "born": "2026-06-23",
+        "died": "2026-06-29"
+      },
+      {
+        "bottom": 7457.25,
+        "top": 7461,
+        "born": "2026-06-23",
+        "died": "2026-06-24"
+      },
+      {
+        "bottom": 7447.75,
+        "top": 7451.5,
+        "born": "2026-06-24",
+        "died": "2026-06-25"
+      },
+      {
+        "bottom": 7455.75,
+        "top": 7459.5,
+        "born": "2026-06-24",
+        "died": "2026-06-25"
+      },
+      {
+        "bottom": 7438,
+        "top": 7441.75,
+        "born": "2026-06-25",
+        "died": "2026-06-26"
+      },
+      {
+        "bottom": 7421.25,
+        "top": 7425,
+        "born": "2026-06-25",
+        "died": "2026-06-26"
+      },
+      {
+        "bottom": 7435.25,
+        "top": 7439,
+        "born": "2026-06-26",
+        "died": "2026-06-29"
+      },
+      {
+        "bottom": 7493.75,
+        "top": 7497.5,
+        "born": "2026-06-29",
+        "died": "2026-06-30"
+      },
+      {
+        "bottom": 7553,
+        "top": 7556.75,
+        "born": "2026-06-30",
+        "died": "2026-07-01"
+      },
+      {
+        "bottom": 7504.25,
+        "top": 7508,
+        "born": "2026-06-30",
+        "died": "2026-07-08"
+      },
+      {
+        "bottom": 7527.5,
+        "top": 7531.25,
+        "born": "2026-07-01",
+        "died": "2026-07-02"
+      },
+      {
+        "bottom": 7549,
+        "top": 7552.75,
+        "born": "2026-07-01",
+        "died": "2026-07-02"
+      },
+      {
+        "bottom": 7551,
+        "top": 7554.75,
+        "born": "2026-07-03",
+        "died": "2026-07-07"
+      }
+    ]
+  },
+  "weeklyEnvelopes": {
+    "anchorPriorFriClose": 7557.25,
+    "priorFriKey": "2026-07-03",
+    "weeksInSample": 313,
+    "monFri": {
+      "ceilPct": 0.415,
+      "floorPct": 0.88,
+      "ceil": 7611.99,
+      "floor": 7384.67,
+      "milk": null
+    },
+    "friWeekly": {
+      "ceilPct": 0.76,
+      "floorPct": 0.94,
+      "ceil": 7674.25,
+      "floor": 7346.18,
+      "milk": null
+    },
+    "note": "single-week extension dist vs prior-Fri settle; asymmetric percentiles fit to the Jul-12-drawn envelope (market run-up compresses upside)"
+  },
+  "ovnSpy": {
+    "skipped": null,
+    "priorSPY": "2026-07-09",
+    "spyHigh": 751.969970703125,
+    "spyLow": 745.5900268554688,
+    "ceilPred": [
+      7621.25,
+      7631.25
+    ],
+    "floorPred": [
+      7492.75,
+      7502.75
+    ],
+    "note": "computed best-fit; NOT within 3pt on all 4 days (Jul-9 ceil/Jul-10 floor off ~20-29pt) -> NOT rendered; milk-ref boxes rendered instead",
+    "factors": {
+      "ceiling": 10.135,
+      "floor": 10.063
+    },
+    "milk": {
+      "ceiling": [
+        7619.25,
+        7629.25
+      ],
+      "floor": [
+        7477.25,
+        7487.25
+      ]
+    }
+  },
+  "netDealerMilkRef": 7526.5,
+  "ivWallMilkRef": {
+    "dn": 7533.62,
+    "up": 7633.16,
+    "weekly": null,
+    "derivation": "options-data-unavailable"
+  },
+  "ivWalls": {
+    "skipped": null,
+    "source": "^SPX",
+    "expiry": "2026-07-14",
+    "spx": 7515.34,
+    "factor": 1.01023,
+    "wallUp": 7677.75,
+    "wallDn": 7546.5,
+    "overflowUp": 7743.5,
+    "overflowDn": 7485.75,
+    "upBand": [
+      7677.75,
+      7743.5
+    ],
+    "dnBand": [
+      7485.75,
+      7546.5
+    ],
+    "overlapUp": false,
+    "overlapDn": false,
+    "perExpiry": [
+      {
+        "expiry": "2026-07-14",
+        "up": {
+          "lo": 7677.75,
+          "hi": 7743.5
+        },
+        "dn": {
+          "lo": 7485.75,
+          "hi": 7546.5
+        }
+      }
+    ]
+  },
+  "zones": [
+    {
+      "type": "yellow_box",
+      "label": "YELLOW BOX",
+      "top": 7595.04,
+      "bottom": 7577.01,
+      "render": "band",
+      "color": "#f5d90a",
+      "meta": {
+        "formula": "settle+-mean60mExt50",
+        "meanHO": 8.79,
+        "meanOL": 9.24,
+        "days": 50,
+        "bars60": 1139
+      }
+    },
+    {
+      "type": "initial_resistance",
+      "label": "TOP AVE RANGE (INIT RES)",
+      "top": 7615.72,
+      "bottom": 7615.72,
+      "render": "line",
+      "color": "#ef9a9a",
+      "meta": {
+        "pct": 0.33,
+        "dist": "settle"
+      }
+    },
+    {
+      "type": "initial_support",
+      "label": "BOTTOM AVE RANGE (INIT SUP)",
+      "top": 7559,
+      "bottom": 7559,
+      "render": "line",
+      "color": "#a5d6a7",
+      "meta": {
+        "pct": 0.435,
+        "dist": "settle"
+      }
+    },
+    {
+      "type": "resistance_zone",
+      "label": "RESISTANCE ZONE",
+      "top": 7671.15,
+      "bottom": 7615.72,
+      "render": "band",
+      "color": "#c62828",
+      "meta": {
+        "from": "init res",
+        "to": "max range p85.5"
+      }
+    },
+    {
+      "type": "support_zone",
+      "label": "SUPPORT ZONE",
+      "top": 7559,
+      "bottom": 7483.88,
+      "render": "band",
+      "color": "#2e7d32",
+      "meta": {
+        "from": "init sup",
+        "to": "max range p85.5"
+      }
+    },
+    {
+      "type": "normal_range_up",
+      "label": "NORMAL RANGE DAYS +",
+      "top": 7662.24,
+      "bottom": 7659.74,
+      "render": "band",
+      "color": "#b0bec5",
+      "meta": {
+        "pct": 0.755,
+        "level": 7660.99
+      }
+    },
+    {
+      "type": "normal_range_dn",
+      "label": "NORMAL RANGE DAYS -",
+      "top": 7520.5,
+      "bottom": 7518,
+      "render": "band",
+      "color": "#b0bec5",
+      "meta": {
+        "pct": 0.755,
+        "level": 7519.25
+      }
+    },
+    {
+      "type": "max_range_days_up",
+      "label": "MAX RANGE DAYS +",
+      "top": 7672.65,
+      "bottom": 7669.65,
+      "render": "band",
+      "color": "#78909c",
+      "meta": {
+        "pct": 0.855,
+        "level": 7671.15
+      }
+    },
+    {
+      "type": "max_range_days_dn",
+      "label": "MAX RANGE DAYS -",
+      "top": 7485.38,
+      "bottom": 7482.38,
+      "render": "band",
+      "color": "#78909c",
+      "meta": {
+        "pct": 0.87,
+        "level": 7483.88
+      }
+    },
+    {
+      "type": "max_trend_up",
+      "label": "MAX TREND UP",
+      "top": 7690.53,
+      "bottom": 7690.53,
+      "render": "line",
+      "color": "#e8eaf0",
+      "meta": {
+        "pct": 0.91,
+        "dist": "settle"
+      }
+    },
+    {
+      "type": "white_box",
+      "label": "NR-DN / MAX-TREND-UP BOX",
+      "top": 7690.53,
+      "bottom": 7519.25,
+      "render": "band",
+      "color": "#cfd8dc",
+      "meta": {
+        "lower": "normal range dn p75.5",
+        "upper": "max trend up p91"
+      }
+    },
+    {
+      "type": "es_vector_ref",
+      "label": "E/S VECTOR STRIP (MILK REF)",
+      "top": 7591,
+      "bottom": 7586.25,
+      "render": "band",
+      "color": "#f5d90a",
+      "meta": {
+        "source": "milk-mwml",
+        "bestFitLower": 7582.5,
+        "bestFitUpper": 7589,
+        "note": "grid NO-MATCH<1.5pt; upper C:LoHi(high,15) 5m ~2.25pt, lower B:HiLo(close,25) 5m ~3.75pt"
+      }
+    },
+    {
+      "type": "sm_long_ave",
+      "label": "LONGAVE",
+      "top": 7650,
+      "bottom": 7650,
+      "render": "line",
+      "color": "#4dd0e1",
+      "meta": {
+        "method": "anchor + p68 dayUp (allDays 50d)",
+        "milk": 7657
+      }
+    },
+    {
+      "type": "sm_short_ave",
+      "label": "SHORTAVE",
+      "top": 7553,
+      "bottom": 7553,
+      "render": "line",
+      "color": "#4dd0e1",
+      "meta": {
+        "method": "anchor - p50 dayDn (allDays 50d)",
+        "milk": 7555.5
+      }
+    },
+    {
+      "type": "poc",
+      "label": "POC",
+      "top": 6880,
+      "bottom": 6879,
+      "render": "band",
+      "color": "#ffd700",
+      "meta": {
+        "price": 6879.5,
+        "bucketVol": 205428,
+        "since": "2024-01-01"
+      }
+    },
+    {
+      "type": "vah",
+      "label": "VAH",
+      "top": 7044.5,
+      "bottom": 7044.5,
+      "render": "line",
+      "color": "#b0a000"
+    },
+    {
+      "type": "val",
+      "label": "VAL",
+      "top": 5447.75,
+      "bottom": 5447.75,
+      "render": "line",
+      "color": "#b0a000"
+    },
+    {
+      "type": "single_print",
+      "label": "SINGLE PRINTS",
+      "top": 7636.5,
+      "bottom": 7635,
+      "render": "box",
+      "color": "#ab47bc",
+      "meta": {
+        "fromDay": "2026-06-16",
+        "tpoPeriodMin": 30
+      }
+    },
+    {
+      "type": "single_print",
+      "label": "SINGLE PRINTS",
+      "top": 7612.5,
+      "bottom": 7609.5,
+      "render": "box",
+      "color": "#ab47bc",
+      "meta": {
+        "fromDay": "2026-06-17",
+        "tpoPeriodMin": 30
+      }
+    },
+    {
+      "type": "single_print",
+      "label": "SINGLE PRINTS",
+      "top": 7602.25,
+      "bottom": 7601.25,
+      "render": "box",
+      "color": "#ab47bc",
+      "meta": {
+        "fromDay": "2026-07-06",
+        "tpoPeriodMin": 30
+      }
+    },
+    {
+      "type": "single_print",
+      "label": "SINGLE PRINTS",
+      "top": 7568.25,
+      "bottom": 7566.75,
+      "render": "box",
+      "color": "#ab47bc",
+      "meta": {
+        "fromDay": "2026-07-09",
+        "tpoPeriodMin": 30
+      }
+    },
+    {
+      "type": "single_print",
+      "label": "SINGLE PRINTS",
+      "top": 7408.75,
+      "bottom": 7398,
+      "render": "box",
+      "color": "#ab47bc",
+      "meta": {
+        "fromDay": "2026-06-29",
+        "tpoPeriodMin": 30
+      }
+    },
+    {
+      "type": "single_print",
+      "label": "SINGLE PRINTS",
+      "top": 7359.75,
+      "bottom": 7357.25,
+      "render": "box",
+      "color": "#ab47bc",
+      "meta": {
+        "fromDay": "2026-06-26",
+        "tpoPeriodMin": 30
+      }
+    },
+    {
+      "type": "non_fair_value",
+      "label": "NON-FAIR VALUE",
+      "top": 7638.75,
+      "bottom": 7636.5,
+      "render": "box",
+      "color": "#607d8b",
+      "meta": {
+        "thrPctOfMedian": 15,
+        "medianBucketVol": 18549
+      }
+    },
+    {
+      "type": "pb_import_nfv",
+      "label": "NON FAIR VALUE (MILK)",
+      "top": 7624,
+      "bottom": 7620,
+      "render": "box",
+      "color": "#66bb6a",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:08:27Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_objectives",
+      "label": "BUYER OBJECTIVE (MILK)",
+      "top": 7636,
+      "bottom": 7632,
+      "render": "box",
+      "color": "#5c6bc0",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:08:27Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_nfv",
+      "label": "NON FAIR VALUE (MILK)",
+      "top": 7572,
+      "bottom": 7564,
+      "render": "box",
+      "color": "#66bb6a",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:08:27Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_positioning",
+      "label": "BUYER POSITIONING (MILK)",
+      "top": 7564,
+      "bottom": 7560,
+      "render": "box",
+      "color": "#ef5350",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:08:27Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_objectives",
+      "label": "BUYER OBJECTIVE (MILK)",
+      "top": 7606,
+      "bottom": 7600,
+      "render": "box",
+      "color": "#5c6bc0",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:08:02Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_objectives",
+      "label": "SELLER OBJECTIVE (MILK)",
+      "top": 7522,
+      "bottom": 7518,
+      "render": "box",
+      "color": "#5c6bc0",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:08:02Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_pivot",
+      "label": "PIVOT BAND (MILK)",
+      "top": 7594,
+      "bottom": 7590,
+      "render": "box",
+      "color": "#90a4ae",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:07:37Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_positioning",
+      "label": "SELLER POSITIONING (MILK)",
+      "top": 7608,
+      "bottom": 7606,
+      "render": "box",
+      "color": "#ef5350",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:07:37Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_import_nfv",
+      "label": "NON FAIR VALUE (MILK)",
+      "top": 7548,
+      "bottom": 7540,
+      "render": "box",
+      "color": "#66bb6a",
+      "meta": {
+        "source": "milk-mwml",
+        "drawStart": "2026-07-10T10:07:37Z",
+        "file": "ESU6_-_Milk_Yellowbox_3.mwml",
+        "persistent": true
+      }
+    },
+    {
+      "type": "pb_seller_positioning",
+      "label": "SELLER POSITIONING / BUYERS SOFT TGT",
+      "top": 7616.75,
+      "bottom": 7613,
+      "render": "box",
+      "color": "#ef5350",
+      "meta": {
+        "born": "2026-06-16",
+        "refreshes": 0,
+        "effort": 163486,
+        "persistent": true,
+        "source": "auto"
+      }
+    },
+    {
+      "type": "pb_buyer_objective",
+      "label": "BUYER OBJECTIVE",
+      "top": 7643.75,
+      "bottom": 7640,
+      "render": "box",
+      "color": "#66bb6a",
+      "meta": {
+        "born": "2026-06-15",
+        "refreshes": 0,
+        "effort": 58258,
+        "persistent": true,
+        "source": "auto"
+      }
+    },
+    {
+      "type": "pb_sellers_objective",
+      "label": "SELLERS OBJECTIVE / SOFT TGT",
+      "top": 7554.75,
+      "bottom": 7551,
+      "render": "box",
+      "color": "#ef5350",
+      "meta": {
+        "born": "2026-07-09",
+        "refreshes": 0,
+        "effort": 83542,
+        "persistent": true,
+        "source": "auto"
+      }
+    },
+    {
+      "type": "pb_sellers_ultimate",
+      "label": "SELLERS ULTIMATE",
+      "top": 7528,
+      "bottom": 7524.25,
+      "render": "box",
+      "color": "#ff8a65",
+      "meta": {
+        "born": "2026-07-08",
+        "refreshes": 0,
+        "effort": 94627,
+        "persistent": true,
+        "source": "auto"
+      }
+    },
+    {
+      "type": "pb_buyer_positioning",
+      "label": "BUYER POSITIONING (OUTLIER CAP)",
+      "top": 7511.75,
+      "bottom": 7508,
+      "render": "box",
+      "color": "#66bb6a",
+      "meta": {
+        "born": "2026-07-08",
+        "refreshes": 0,
+        "effort": 104636,
+        "persistent": true,
+        "source": "auto"
+      }
+    },
+    {
+      "type": "pivot",
+      "label": "PIVOT",
+      "top": 7587,
+      "bottom": 7587,
+      "render": "line",
+      "color": "#ff9800",
+      "meta": {
+        "fromDay": "2026-07-09"
+      }
+    },
+    {
+      "type": "secondary_pivot",
+      "label": "PIVOT 2",
+      "top": 7552.5,
+      "bottom": 7552.5,
+      "render": "line",
+      "color": "#ffb74d",
+      "meta": {
+        "fromDay": "2026-07-09"
+      }
+    },
+    {
+      "type": "weekly_mf_ceil",
+      "label": "MON-FRI WEEKLY CEILING",
+      "top": 7611.99,
+      "bottom": 7611.99,
+      "render": "line",
+      "color": "#9575cd",
+      "meta": {
+        "pct": 0.415,
+        "anchor": 7557.25,
+        "priorFri": "2026-07-03"
+      }
+    },
+    {
+      "type": "weekly_mf_floor",
+      "label": "MON-FRI WEEKLY FLOOR",
+      "top": 7384.67,
+      "bottom": 7384.67,
+      "render": "line",
+      "color": "#9575cd",
+      "meta": {
+        "pct": 0.88
+      }
+    },
+    {
+      "type": "weekly_fr_ceil",
+      "label": "FRI WEEKLY CEILING",
+      "top": 7674.25,
+      "bottom": 7674.25,
+      "render": "line",
+      "color": "#7e57c2",
+      "meta": {
+        "pct": 0.76
+      }
+    },
+    {
+      "type": "weekly_fr_floor",
+      "label": "FRI WEEKLY FLOOR",
+      "top": 7346.18,
+      "bottom": 7346.18,
+      "render": "line",
+      "color": "#7e57c2",
+      "meta": {
+        "pct": 0.94
+      }
+    },
+    {
+      "type": "net_dealer_ref",
+      "label": "NET DEALER (MILK REF)",
+      "top": 7526.5,
+      "bottom": 7526.5,
+      "render": "line",
+      "color": "#00e676",
+      "meta": {
+        "source": "milk-mwml",
+        "derivation": "options-data-unavailable"
+      }
+    },
+    {
+      "type": "iv_wall_ref_up",
+      "label": "IV WALL (MILK REF) +",
+      "top": 7633.16,
+      "bottom": 7633.16,
+      "render": "line",
+      "color": "#eeeeee",
+      "meta": {
+        "source": "milk-mwml",
+        "derivation": "options-data-unavailable"
+      }
+    },
+    {
+      "type": "iv_wall_ref_dn",
+      "label": "IV WALL (MILK REF) -",
+      "top": 7533.62,
+      "bottom": 7533.62,
+      "render": "line",
+      "color": "#eeeeee",
+      "meta": {
+        "source": "milk-mwml",
+        "derivation": "options-data-unavailable"
+      }
+    },
+    {
+      "type": "ovn_spy_ceil_ref",
+      "label": "OVN SPY CEILING (MILK REF)",
+      "top": 7629.25,
+      "bottom": 7619.25,
+      "render": "band",
+      "color": "#fff176",
+      "meta": {
+        "source": "milk-mwml",
+        "derivation": "prior-day SPY high x ~10.135; computed fit not within 3pt"
+      }
+    },
+    {
+      "type": "ovn_spy_floor_ref",
+      "label": "OVN SPY FLOOR (MILK REF)",
+      "top": 7487.25,
+      "bottom": 7477.25,
+      "render": "band",
+      "color": "#fff176",
+      "meta": {
+        "source": "milk-mwml",
+        "derivation": "prior-day SPY low x ~10.063; computed fit not within 3pt"
+      }
+    },
+    {
+      "type": "iv_wall_band_up",
+      "label": "IV WALL BAND +",
+      "top": 7743.5,
+      "bottom": 7677.75,
+      "render": "band",
+      "color": "#ffffff",
+      "meta": {
+        "expiries": "2026-07-14",
+        "source": "^SPX",
+        "note": "live chain (options history unavailable)"
+      }
+    },
+    {
+      "type": "iv_wall_band_dn",
+      "label": "IV WALL BAND -",
+      "top": 7546.5,
+      "bottom": 7485.75,
+      "render": "band",
+      "color": "#ffffff",
+      "meta": {
+        "expiries": "2026-07-14",
+        "source": "^SPX"
+      }
+    }
+  ]
+}

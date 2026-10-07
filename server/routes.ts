@@ -7,18 +7,40 @@ import Anthropic from "@anthropic-ai/sdk";
 import { cacheGet, cacheSet, cacheInvalidate, cacheFlushAll, TTL } from "./cache";
 import { XMLParser } from "fast-xml-parser";
 import YahooFinance from "yahoo-finance2";
-import { db } from "./db";
+import { db, sqliteRaw } from "./db";
+import { QUALITY_GATE } from "@shared/quality-gate"; // RISK DISPLAY: held-out combo verdicts for /api/risk/combo-stats
+import { medianSessionDayRangeFromDb } from "@shared/day-range-median"; // RISK DISPLAY: dead-tape baseline (shared with the harness)
+import { artifactsDir } from "@shared/artifacts-dir"; // BAXTER_ARTIFACTS_DIR (2026-08-02): standing-artifacts location
 import { cachedCandles, downloadStatus, newsArticles, appSettings, signalHistory, discordMessages, discordSignals, tradeJournal } from "@shared/schema";
 import { normalizeSymbol } from "@shared/symbol";
+import { validateBar } from "@shared/bar-time"; // WRITE-GUARD: grid/ghost/malformed candle filter
+import { isOutcomeTransitionAllowed, normalizeSignalSource, isLiveSourceCollision, type SignalSource } from "@shared/outcome-resolver"; // OUTCOME-GUARD + SOURCE-GUARD: immutability matrices (2026-07-31)
 import { eq, and, sql, gte, lte, asc, desc } from "drizzle-orm";
-import { getLatestBar, getLatestBar1m, getLastTickPrice, reloadAll, getMemBars } from "./mw-reader";
+import { getLatestBar, getLatestBar1m, getLastTickPrice, getFeedStatus, reloadAll, getMemBars } from "./mw-reader";
 import { reconnectMWStudies } from "./live-bars";
 import { broadcastOrderCommand, isOrderCommandSocketOpen, getMWSyncStatus, broadcast } from "./live-bars";
-import { getCompleteness, requestFullResync, requestReconcile } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting + full-history reconcile + targeted phantom reconcile
+import { getCompleteness, requestFullResync, requestReconcile, getAuditStaleness, isSessionOpen } from "./gap-audit"; // MW-SYNC (v2): backfill completeness / gap reporting + full-history reconcile + targeted phantom reconcile + audit staleness + session gate
 import { deriveRange } from "./derive-bars"; // 1M-DERIVE: on-demand re-derive of 5m/15m/60m from 1m
+import { startYahooLiveFallback, getYahooLiveStatus } from "./yahoo-live"; // YAHOO-FALLBACK: continuous 1m live-poll while no MW study is connected
+import { startContractGuard, contractGuardStatus, isMwOffContract, translationActive, frontMonthOffset } from "./contract-guard"; // CONTRACT GUARD (2026-09-17): MW authoritative only while it matches Yahoo's front month
+import { orderContractGateReason } from "./live-bars";
+import { repairRollMismatch } from "./roll-repair"; // CONTRACT GUARD: heal a window two contract months interleaved
+import { getYellowboxDayZones } from "./yellowbox"; // YELLOW-BOX: per-trading-day walk-forward zone endpoint
+import { resolveServeWindow, rowCapCheckNeeded, applyRowCapFloor, serveCacheKey, resolveDayZonesWindow, SERVE_ROW_CAP } from "./serve-window"; // SERVE WINDOW (2026-09-24): hard span/row caps for cached-continuous + day-zones
+import { registerPmlTml } from "./pml-tml"; // PML/TML: live options-exposure money lines (guide-study mission)
+import { registerCloseEstimate } from "./close-estimate"; // CLOSE-EST (2026-08-09 study session): EOD close-estimate zone, display-only
+import { getSchedulerStatus } from "./scheduler"; // SCHEDULER (2026-08-02): job status for /api/mw/sync-status
+import { registerLedger } from "./ledger"; // FORWARD-VALIDATION LEDGER (2026-08-02): live-vs-backtest drift endpoints + ALERT notifier
+import { registerJournal } from "./journal"; // TRADING JOURNAL (2026-08-07): daily review reports + distilled lessons, read-only
 import { parseMWML, parseScreenshot, parsePDF } from "./zone-parser";
 import { startDiscordReader, stopDiscordReader, getDiscordReaderStatus, deepBackReadAll, reparseAllZones } from "./discord-reader";
-import { tradeSettings, pushTokens, getCurrentTrade, setCurrentTrade, clearCurrentTrade } from "./trade-state";
+import { alertMuteReason, windowsForDay, allWindows, blackoutReason, calendarCovers, loadNewsCalendar, newsCalendarHealth, etDateOf, etWallToUnix } from "./news-blackout"; // 2026-10-01 R2a/R3
+import { tradeSettings, pushTokens, registerPushToken, getCurrentTrade, setCurrentTrade, clearCurrentTrade, getActiveTrades, tryClaimOrder, positionGateReason, oppositeDirectionGateReason, netContractsGateReason, apexGuardReason, apexGuardState, orderHoursGateReason, resetApexGuard , inferTradeStatus } from "./trade-state";
+import { notifyTradeEvent } from "./trade-notify"; // NOTIFY (2026-08-04): alert when an order can't be placed at all
+import { validateSignalRow } from "./signal-guard"; // SIGNAL-INTEGRITY: server-side rule backstop (C1/C2)
+import { writeSignalRows, orderSignalGateReason, type SignalWriteRow } from "./fire-admission"; // FIRE ADMISSION (2026-09-24): cross-writer cooldown/one-open choke point + guarded upsert (+ 2026-09-25 order gate)
+import { loadPriorFires } from "./catchup"; // B5 (2026-09-25): the tab's engine seed = the server writers' seed (GET /api/signals/prior-fires)
+import { getCachedDays } from "./day-cache"; // PERF (2026-07-30): incremental cached-days aggregate (replaces the 3.2s window-fn query)
 import { parseZonesFromMessage } from "./discord-zone-parser";
 import { learner } from "./discord-learner";
 
@@ -155,7 +177,7 @@ function etOffsetMin(timestampSec: number): number {
 }
 
 /**
- * Determine if a UTC timestamp is within Regular Trading Hours (RTH): Mon–Fri 9:30 AM – 4:00 PM ET.
+ * Determine if a UTC timestamp is within Regular Trading Hours (RTH): Mon–Fri 9:30 AM – 5:00 PM ET.
  * DST-correct via the memoized ET offset, ~200x cheaper than an Intl call per candle.
  */
 function isRTH(timestampSec: number): boolean {
@@ -512,14 +534,30 @@ function toYahooSymbol(sym: string): string {
 // run never clobbers live MW relay data). `overwrite=true` → ON CONFLICT DO UPDATE so Yahoo becomes
 // authoritative for its available range (60d for 5m/15m, ~720d for 60m) — used to repair corrupt /
 // wrong-contract bars. Returns total bars fetched + written.
-async function yahooBackfillSymbol(symbol: string, overwrite = false): Promise<number> {
+export async function yahooBackfillSymbol(symbol: string, overwrite = false): Promise<number> {
   const ySym  = toYahooSymbol(symbol);
   const now   = new Date();
   const nowMs = now.getTime();
   let totalInserted = 0;
-  const upsert = async (vals: any[]) => {
-    for (let i = 0; i < vals.length; i += 500) {
-      const chunk = vals.slice(i, i + 500);
+  // WRITE-GUARD (root cause of the off-grid snapshot rows): Yahoo's chart API appends the current
+  // FORMING bar as the last quote, stamped at `regularMarketTime` — the wall-clock SECOND of the
+  // fetch, not a bucket boundary — with volume 0 and O=H=L=C≈last price. Unfiltered, every server
+  // startup wrote one such row per (ES,MES)×(5,15,60). validateBar rejects off-grid timestamps,
+  // ghost (V0) bars, and malformed OHLC before anything reaches the DB; the db.ts trigger is the
+  // backstop. Dropped rows are counted + logged so a fingerprint change is visible.
+  const upsert = async (vals: any[], resSec: number) => {
+    // isSessionOpen also drops CLOSED-session bars Yahoo emits (e.g. low-volume 17:00 ET
+    // maintenance-hour 60m prints) — on-grid with V>0, so validateBar alone passes them.
+    const clean = vals.filter(v => isSessionOpen(v.timestamp) && validateBar(
+      { open: v.open, high: v.high, low: v.low, close: v.close, volume: v.volume, time: v.timestamp },
+      { resSec },
+    ));
+    if (clean.length < vals.length) {
+      console.log(`[yahoo-backfill] ${symbol} res=${resSec / 60}m dropped ${vals.length - clean.length} invalid/off-grid/forming rows (write guard)`);
+    }
+    for (let i = 0; i < clean.length; i += 500) {
+      const chunk = clean.slice(i, i + 500);
+      if (chunk.length === 0) continue;
       if (overwrite) {
         await db.insert(cachedCandles).values(chunk).onConflictDoUpdate({
           target: [cachedCandles.symbol, cachedCandles.resolution, cachedCandles.timestamp],
@@ -556,7 +594,7 @@ async function yahooBackfillSymbol(symbol: string, overwrite = false): Promise<n
         symbol, resolution: "60",
         timestamp: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0,
       }));
-      await upsert(vals);
+      await upsert(vals, 3600);
       totalInserted += bars.length;
     }
   }
@@ -570,7 +608,7 @@ async function yahooBackfillSymbol(symbol: string, overwrite = false): Promise<n
         symbol, resolution: res,
         timestamp: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0,
       }));
-      await upsert(vals);
+      await upsert(vals, parseInt(res, 10) * 60);
       totalInserted += bars.length;
     }
   }
@@ -601,9 +639,91 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  // ── PUBLIC-EDGE GATE (2026-08-04) ────────────────────────────────────────────
+  // trading.jacksonlems.com is served by a Cloudflare Tunnel terminating on this box.
+  // Tunnel-originated requests carry Cloudflare headers (cf-ray); those MUST present the
+  // API key (X-Api-Key header, or ?key= for WebView/WS clients that can't set headers).
+  // Direct LAN/localhost traffic (no cf-ray — the PC terminal, MW studies, scripts) passes
+  // untouched. The old public domain exposed the unauthenticated trade-execution API to
+  // the whole internet — that must never happen again. Key: TRADING_API_KEY in .env.
+  const PUBLIC_API_KEY = (process.env.TRADING_API_KEY ?? "").trim();
+  // Cookie unlock (2026-08-05): browsers can't send X-Api-Key — the /unlock page sets an
+  // HttpOnly cookie once per device so the WEB terminal works through the domain too.
+  const hasUnlockCookie = (cookieHeader: string | undefined): boolean =>
+    !!PUBLIC_API_KEY && !!cookieHeader && cookieHeader.split(";").some(c => c.trim() === `tk=${PUBLIC_API_KEY}`);
+  // READS OPEN / WRITES GATED (2026-08-05, USER-APPROVED in chat): the terminal "just
+  // loads" through the domain — GET/HEAD data flows without any unlock. Every MUTATION
+  // (trade execute, settings, scheduler triggers, journal writes …) still requires the
+  // key or the /unlock cookie. Trade-off accepted explicitly by the user: the URL reveals
+  // charts/signals/history read-only; it can never ACT on the account.
+  app.use("/api", (req, res, next) => {
+    if (!req.headers["cf-ray"]) { next(); return; }
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") { next(); return; }
+    if (!PUBLIC_API_KEY) { res.status(503).json({ error: "public writes disabled (TRADING_API_KEY unset)" }); return; }
+    const presented = (req.headers["x-api-key"] as string | undefined) ?? (req.query.key as string | undefined);
+    if (presented === PUBLIC_API_KEY || hasUnlockCookie(req.headers.cookie)) { next(); return; }
+    res.status(401).json({ error: "unauthorized" });
+  });
+
+  // GET /unlock — minimal key-entry page (deliberately ungated; reveals nothing).
+  // POST sets the HttpOnly cookie and bounces to the terminal. Key never appears in a URL.
+  app.get("/unlock", (_req, res) => {
+    res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0a0c12;color:#e8eaf0;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<form method="POST" action="/unlock" style="text-align:center">
+  <h2 style="font-weight:600">Trading Terminal</h2>
+  <input name="key" type="password" placeholder="access key" autofocus
+    style="padding:10px 14px;border-radius:8px;border:1px solid #2dd4bf55;background:#11141d;color:#e8eaf0;width:260px;font-size:16px">
+  <button style="padding:10px 18px;border-radius:8px;border:0;background:#2dd4bf;color:#04211c;font-weight:700;margin-left:8px;font-size:16px">Unlock</button>
+</form></body>`);
+  });
+  app.post("/unlock", (req, res) => {
+    const key = String((req.body as any)?.key ?? "").trim();
+    if (PUBLIC_API_KEY && key === PUBLIC_API_KEY) {
+      res.setHeader("Set-Cookie", `tk=${PUBLIC_API_KEY}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=31536000`);
+      res.redirect("/");
+      return;
+    }
+    res.status(401).type("html").send(`<!doctype html><body style="background:#0a0c12;color:#ef5350;font-family:system-ui;text-align:center;padding-top:40vh">Wrong key. <a href="/unlock" style="color:#2dd4bf">Try again</a></body>`);
+  });
+
   app.get("/api/market/symbols", (_req, res) => {
     res.json(POPULAR_SYMBOLS);
   });
+
+  // YELLOW-BOX: per-trading-day walk-forward Yellow Box zones whose Globex session intersects
+  // [fromTs, toTs]. Completed days are served from the immutable yellowbox_day_zones cache (sub-ms);
+  // today's box is recomputed on request. Uses the shared derivation core — identical to the renderer.
+  app.get("/api/yellowbox/day-zones", (req, res) => {
+    try {
+      const sym = normalizeSymbol(String(req.query.symbol ?? "MES"));
+      const nowSec = Math.floor(Date.now() / 1000);
+      // SERVE WINDOW (2026-09-24): the span is capped (DAY_ZONES_MAX_SPAN_DAYS) — the web page's
+      // first-render 2019 window walked 1837 days here (7.7 s of main thread). NaN / negative
+      // bounds fall back to the defaults instead of reaching the walker.
+      const w = resolveDayZonesWindow({ fromTs: req.query.fromTs, toTs: req.query.toTs }, nowSec);
+      const result = getYellowboxDayZones(db.$client as any, sym, w.fromTs, w.toTs, nowSec);
+      res.json(w.capped ? { ...result, capped: true, servedFrom: w.servedFrom } : result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // PML/TML: LIVE-ONLY Peak/Trough Money Lines from the options chain (^SPX → SPY×10),
+  // mapped to futures points. 3-min cache; no historical options data exists, so these are
+  // terminal reference lines + live-edge backtestable:false facts — never in any backtest.
+  registerPmlTml(app, db.$client as any);
+
+  // CLOSE-EST: EOD close-estimate zone (Fractal Exchange "END OF DAY CLOSE VALUES" method,
+  // 2026-08-09 study session) — est close-high = running HOD − avg green-day pullback, est
+  // close-low = running LOD + avg red-day bounce, OPEN = reversion target. Display-only:
+  // shared derivation over spike-filtered 5m bars, 60s cache, never an engine/backtest input.
+  registerCloseEstimate(app, db.$client as any);
+
+  // FORWARD-VALIDATION LEDGER: GET /api/ledger/{expectation,status,summary} + the 15-min
+  // server-side ALERT check (one Discord message per ET day, transition-only).
+  registerLedger(app);
+  registerJournal(app); // TRADING JOURNAL (2026-08-07): /api/journal/days | /report/:date | /lessons
 
   // Dump raw bytes of the last tick record so we can verify the binary format
   app.get("/api/admin/tick-debug", (_req, res) => {
@@ -696,9 +816,28 @@ export async function registerRoutes(
   app.get("/api/live/bar/:symbol", (req, res) => {
     const sym = normalizeSymbol(req.params.symbol);
     const resolution = req.query.res === "1" ? "1" : "5";
-    const bar = resolution === "1" ? getLatestBar1m(sym) : getLatestBar(sym);
-    const price = getLastTickPrice(sym);
-    res.json({ bar, price });
+    // CONTRACT GUARD (2026-09-17): mw-reader's in-memory bars / last tick stay in MotiveWave's
+    // OWN basis (raw — the basis brackets are worked in). This route feeds CHARTS (the hidden
+    // engine page's 1s poll, the iPhone's 4s last-candle pin), so while MW is on the wrong
+    // month it serves the front-month-equivalent values (raw + measured spread), or nothing
+    // at all while no trusted offset exists (roll pending) — never a raw wrong-month print.
+    const off = sym === "MES" && isMwOffContract();
+    if (off && !translationActive()) { res.json({ bar: null, price: null, stale: true }); return; }
+    // NO LIVE TICKS (2026-09-23, MotiveWave closed for good): mw-reader's last tick price is
+    // then a parked seed (the newest MW tick file — days old) and its bar-boundary timer keeps
+    // rolling EMPTY buckets at that price, so the bar carries a CURRENT timeSec with a price
+    // tens of points off the market (observed: 7711.25 vs 7765.75). Every consumer already
+    // handles {stale:true} (added for the contract guard); the phone's 4 s pin, which only
+    // checks the bucket age, would otherwise paint the parked price onto the newest candle.
+    // Live = a tick within the last 60 s (getFeedStatus); halts and weekends are stale too.
+    if (getFeedStatus(sym) !== "live") { res.json({ bar: null, price: null, stale: true, reason: "no live ticks" }); return; }
+    const o = off ? frontMonthOffset() : 0;
+    const rawBar = resolution === "1" ? getLatestBar1m(sym) : getLatestBar(sym);
+    const bar = rawBar && o
+      ? { ...rawBar, open: rawBar.open + o, high: rawBar.high + o, low: rawBar.low + o, close: rawBar.close + o, provisional: true }
+      : rawBar;
+    const rawPrice = getLastTickPrice(sym);
+    res.json({ bar, price: rawPrice != null ? rawPrice + o : null, ...(o ? { rawPrice, offsetPts: o } : {}) });
   });
 
   app.get("/api/market/quote/:symbol", async (req, res) => {
@@ -881,7 +1020,9 @@ export async function registerRoutes(
       const rows = await db.select().from(downloadStatus).where(eq(downloadStatus.symbol, symbol.toUpperCase()));
       const totalBars = await db.select({ count: sql<number>`SUM(bar_count)` }).from(downloadStatus)
         .where(and(eq(downloadStatus.symbol, symbol.toUpperCase()), eq(downloadStatus.status, "done")));
-      const totalDays = await db.select({ count: sql<number>`COUNT(DISTINCT DATE(to_timestamp(timestamp)))` })
+      // AUDIT FIX (2026-08-12): `to_timestamp()` is Postgres — this DB is SQLite (the route
+      // 500'd since the migration). SQLite spelling of the same day-count:
+      const totalDays = await db.select({ count: sql<number>`COUNT(DISTINCT DATE(timestamp, 'unixepoch'))` })
         .from(cachedCandles)
         .where(and(eq(cachedCandles.symbol, symbol.toUpperCase()), eq(cachedCandles.resolution, "5")));
       res.json({
@@ -1068,29 +1209,49 @@ export async function registerRoutes(
     const { symbol, interval } = req.params;
     const sym = normalizeSymbol(symbol);
     const resolution = interval === "60m" ? "60" : interval === "1m" ? "1" : "5";
-    let fromN = req.query.from ? Number(req.query.from) : 0;
-    // Never serve bars dated in the future (corrupt rows) — clamp the upper bound.
-    const maxTs = Math.floor(Date.now() / 1000) + 36 * 3600;
-    const toN   = Math.min(req.query.to ? Number(req.query.to) : Infinity, maxTs);
 
     // SERVING BOUND: the MW deep resync grew the store to millions of rows (MES 1m alone is
-    // ~2.4M back to 2019). An unbounded fetch (the client's deep-history load sends no `from`)
-    // would read+filter+JSON-serialize all of them — tens of seconds of blocking CPU on the
-    // single-threaded server, starving EVERY other request (observed: 8.6s for a trivial
-    // endpoint; charts "not loading"). Cap each response to the most recent N bars per
-    // resolution; the caps still cover years of history and the chart windows far less.
-    const SERVE_CAP: Record<string, number> = { "1": 250_000, "5": 500_000, "15": 200_000, "60": 60_000 };
-    const cap = SERVE_CAP[resolution] ?? 250_000;
-    if (!fromN) {
+    // ~2.4M back to 2019). An unbounded read+filter+JSON-serialize of them is tens of seconds of
+    // blocking CPU on the single-threaded server, starving EVERY other request (observed: 8.6s
+    // for a trivial endpoint; charts "not loading").
+    // SERVE WINDOW (2026-09-24 — "the chart isn't loading correctly"): the row cap used to run
+    // ONLY when the request had no `from`, so any explicit deep `from` (the web page's first
+    // render asked for from=2019-08-04: 248 MB / ~20 s, twice) or a negative one bypassed it.
+    // Now every request is clamped by server/serve-window.ts (pure + unit-tested in
+    // scripts/cached-continuous-cap.test.ts): a hard per-resolution SPAN cap (1m/5m 150 d —
+    // floored at the server engines' 90-cached-day self-fetch window —, 15m 400 d, 60m ∞;
+    // `?full=1` lifts it for 15m/60m only), the row cap on top for whatever stays open, NaN /
+    // negative from → absent, `to` clamped to now + 36 h and CEILED to the hour. The response
+    // echoes {capped, servedFrom}; `servedFloorTs` (the terminal's seam field) = servedFrom.
+    const nowSecSW = Math.floor(Date.now() / 1000);
+    let sw = resolveServeWindow({ interval, from: req.query.from, to: req.query.to, full: req.query.full }, nowSecSW);
+    if (rowCapCheckNeeded(sw)) {
       const capRow = db.$client.prepare(
         `SELECT timestamp FROM cached_candles WHERE symbol=? AND resolution=? ORDER BY timestamp DESC LIMIT 1 OFFSET ?`,
-      ).get(sym, resolution, cap - 1) as { timestamp: number } | undefined;
-      if (capRow) fromN = capRow.timestamp; // serve at most the newest `cap` rows
+      ).get(sym, sw.rowRes, SERVE_ROW_CAP[sw.rowRes] - 1) as { timestamp: number } | undefined;
+      sw = applyRowCapFloor(sw, capRow?.timestamp); // serve at most the newest `cap` rows
     }
+    // Query bounds. fromN is already floored to the hour (2026-09-18 shared-body rule: serving
+    // ≤1h more history is harmless — every consumer merges by time); toN is the hour-CEILED
+    // upper bound, a superset of the caller's own `to`.
+    const fromN = sw.fromQ;
+    const toN = sw.toQ;
+    const servedFloorTs: number | null = sw.servedFrom; // the seam the client annotates = what is actually served
+    const capped = sw.capped;
 
-    const cacheKey = `${sym}:continuous:${interval}:${fromN}:${isFinite(toN) ? Math.round(toN / 3600) : "inf"}`;
-    const cached = cacheGet<object>(cacheKey);
-    if (cached) { res.json(cached); return; }
+    // SHARED-RESPONSE CACHE (2026-09-18 — "laggy / trouble staying live"): every consumer sends
+    // from = now − N days computed to the SECOND, so the key changed on every call and the cache
+    // never hit: each tab's 15 s reconcile, each hidden engine page's four 90-day windows and the
+    // server live-engine's four 90-day windows (the 1m one is ~8.8 MB) were each a fresh SQLite
+    // read + filter chain + JSON.stringify on the single server thread — measured p90 7.6 s on a
+    // pure in-memory route while they queued. (1) `from` is floored to the hour for BOTH the
+    // query and the key, and (2) the cache stores the SERIALIZED body, so N consumers inside the
+    // TTL cost one read + one stringify instead of N. (2026-09-24) The key is built from EXACTLY
+    // the SQL bounds (fromN, toN) + the capped flag — the old key rounded `to` while the query
+    // used the exact value, so a caller could be handed a body built for an earlier `to`.
+    const cacheKey = serveCacheKey(sym, sw);
+    const cachedBody = cacheGet<string>(cacheKey);
+    if (cachedBody) { res.type("application/json").send(cachedBody); return; }
 
     // Max H-L spread (fraction of close) before a bar is treated as a corrupt spike.
     // Float32 corruptions are typically 10x+ off from real price (e.g. 512 or 8192 instead of ~5800).
@@ -1118,7 +1279,7 @@ export async function registerRoutes(
     // Helper: convert MinBar[] to the candle shape the client expects
     function memBarsToCandles(bars: { timeSec: number; open: number; high: number; low: number; close: number; volume: number }[]) {
       return dropWickSpikes(dropIsolatedSpikes(dropCompletedGhostBars(bars
-        .filter(b => (!fromN || b.timeSec >= fromN) && (!isFinite(toN) || b.timeSec <= toN))
+        .filter(b => (!fromN || b.timeSec >= fromN) && b.timeSec <= toN)
         .filter(b => !(b.high === b.low)) // flat zero-range = no-body "dash" bar
         .filter(b => !isSpikeBar(b.open, b.high, b.low, b.close))
         .filter(b => !isMarketClosed(b.timeSec))
@@ -1170,11 +1331,16 @@ export async function registerRoutes(
           eq(cachedCandles.symbol, sym),
           eq(cachedCandles.resolution, r),
           ...(fromN ? [gte(cachedCandles.timestamp, fromN)] : []),
-          ...(isFinite(toN) ? [lte(cachedCandles.timestamp, toN)] : []),
+          lte(cachedCandles.timestamp, toN),
         ];
-        rows = await db.select().from(cachedCandles)
-          .where(and(...conditions))
-          .orderBy(asc(cachedCandles.timestamp));
+        void conditions; // (drizzle conditions kept for reference — the raw read below is the same WHERE)
+        // Raw prepared read (2026-09-18): the drizzle select mapped every one of ~86k rows of a
+        // 90-day 1m window through its ORM layer; better-sqlite3's .all() returns the same
+        // columns several times faster on this hot path. Same WHERE / ORDER BY.
+        rows = db.$client.prepare(
+          `SELECT symbol, resolution, timestamp, open, high, low, close, volume FROM cached_candles
+            WHERE symbol=? AND resolution=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp ASC`,
+        ).all(sym, r, fromN || 0, toN) as typeof rows;
         if (rows.length > 0) { usedRes = r; break; }
       }
 
@@ -1217,9 +1383,12 @@ export async function registerRoutes(
           candles = [...agg.values()].sort((a, b) => a.time - b.time);
         }
 
-        const result = { symbol: sym, interval, candles, source: "cached", resolution: usedRes };
-        cacheSet(cacheKey, result, TTL.continuous);
-        res.json(result);
+        const body = JSON.stringify({ symbol: sym, interval, candles, source: "cached", resolution: usedRes, servedFloorTs, capped, servedFrom: servedFloorTs });
+        // Only share-cache the windows that ARE shared (reconciles, the engines' 90-day windows).
+        // A deep-history load (no `from`: 17–25 MB) has exactly one consumer — holding it would
+        // just pin tens of MB for nothing.
+        if (body.length <= 12_000_000) cacheSet(cacheKey, body, TTL.continuous);
+        res.type("application/json").send(body);
         return;
       }
 
@@ -1245,7 +1414,7 @@ export async function registerRoutes(
           memCandles = [...agg.values()].sort((a, b) => a.time - b.time);
         }
         if (memCandles.length > 0) {
-          res.json({ symbol: sym, interval, candles: memCandles, source: "memory", resolution: r });
+          res.json({ symbol: sym, interval, candles: memCandles, source: "memory", resolution: r, capped, servedFrom: servedFloorTs });
           return;
         }
       }
@@ -1263,7 +1432,7 @@ export async function registerRoutes(
       for (const r of memRes) {
         const memCandles = memBarsToCandles(getMemBars(sym, r));
         if (memCandles.length > 0) {
-          res.json({ symbol: sym, interval, candles: memCandles, source: "memory", resolution: r });
+          res.json({ symbol: sym, interval, candles: memCandles, source: "memory", resolution: r, capped, servedFrom: servedFloorTs });
           return;
         }
       }
@@ -1290,30 +1459,14 @@ export async function registerRoutes(
     }
 
     try {
-      const resultRows = db.$client.prepare(`
-        SELECT
-          DATE(datetime(timestamp, 'unixepoch')) as date,
-          MIN(CASE WHEN timestamp = day_min THEN open END) as open,
-          MAX(high) as high,
-          MIN(low) as low,
-          MIN(CASE WHEN timestamp = day_max THEN close END) as close,
-          SUM(volume) as volume
-        FROM (
-          SELECT *,
-            MIN(timestamp) OVER (PARTITION BY DATE(datetime(timestamp, 'unixepoch'))) as day_min,
-            MAX(timestamp) OVER (PARTITION BY DATE(datetime(timestamp, 'unixepoch'))) as day_max
-          FROM cached_candles
-          WHERE symbol = ? AND resolution IN ('5', '15', '60')
-        )
-        GROUP BY DATE(datetime(timestamp, 'unixepoch'))
-        ORDER BY date DESC
-      `).all(sym) as any[];
+      // PERF (2026-07-30): the old window-function query here (per-row DATE(datetime()) over
+      // ~700k rows) blocked the event loop for ~3.2s on EVERY call — the single biggest source
+      // of app-wide lag (ticks, signal GETs and page loads all queued behind it). Replaced by
+      // the incremental day-aggregate cache in server/day-cache.ts (~2ms steady-state, identical
+      // rows). Invalidation: broadcast("data_updated") → invalidateDayCache.
+      const days = getCachedDays(sym);
 
-      if (resultRows.length > 0) {
-        const days = resultRows.map(r => ({
-          date: typeof r.date === 'string' ? r.date.split('T')[0] : new Date(r.date).toISOString().split('T')[0],
-          open: Number(r.open), high: Number(r.high), low: Number(r.low), close: Number(r.close), volume: Number(r.volume),
-        }));
+      if (days.length > 0) {
         res.json({ symbol: sym, days });
         return;
       }
@@ -1413,11 +1566,18 @@ export async function registerRoutes(
       let candlesInserted = 0, signalsInserted = 0;
       const CHUNK = 500;
 
-      // Validate + insert candles — APPEND only (onConflictDoNothing)
-      const validCandles = body.candles.filter(c =>
-        c.symbol && c.timestamp > 0 && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0 &&
-        c.high >= c.low && Number.isFinite(c.open) && Number.isFinite(c.close)
-      );
+      // Validate + insert candles — APPEND only (onConflictDoNothing).
+      // WRITE-GUARD: also drop rows whose timestamp is off the resolution grid, in JS, so the
+      // db.ts trigger (which abandons the remainder of a multi-row INSERT) never truncates a batch.
+      const validCandles = body.candles.filter(c => {
+        if (!(c.symbol && c.timestamp > 0 && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0 &&
+              c.high >= c.low && Number.isFinite(c.open) && Number.isFinite(c.close))) return false;
+        const resNum = parseInt(String(c.resolution).replace("m", ""), 10);
+        if (Number.isFinite(resNum) && resNum > 0 && c.timestamp % (resNum * 60) !== 0) return false; // off-grid
+        return true;
+      });
+      const candlesSkipped = body.candles.length - validCandles.length;
+      if (candlesSkipped > 0) console.log(`[import-full] skipped ${candlesSkipped} invalid/off-grid candle rows`);
       for (let i = 0; i < validCandles.length; i += CHUNK) {
         const chunk = validCandles.slice(i, i + CHUNK);
         const values = chunk.map(c => ({
@@ -1434,12 +1594,22 @@ export async function registerRoutes(
         candlesInserted += chunk.length;
       }
 
-      // Validate + insert signals — onConflictDoNothing (never overwrite stored locks)
+      // Validate + insert signals — onConflictDoNothing (never overwrite stored locks).
+      // SIGNAL-INTEGRITY (C1): every imported row must pass the SAME rule backstop as
+      // POST /api/signals/history (finite prices, known interval/direction, session-legal
+      // close time, non-empty label, engine signalType). Invalid rows are skipped + counted.
+      let signalsSkipped = 0;
       if (Array.isArray(body.signals)) {
-        const validSignals = body.signals.filter(s =>
+        const basicOk = body.signals.filter(s =>
           s.symbol && s.interval && s.timestamp > 0 && s.direction &&
-          s.entry > 0 && s.tp1 > 0 && s.tp2 > 0 && s.sl > 0
+          s.entry > 0 && s.tp1 > 0 && (s.tp2 == null || s.tp2 > 0) && s.sl > 0 // TP1-ONLY: null tp2 legal
         );
+        const validSignals = basicOk.filter(s => validateSignalRow({
+          timestamp: s.timestamp, interval: s.interval, direction: s.direction,
+          entry: s.entry, tp1: s.tp1, tp2: s.tp2, sl: s.sl,
+          signalType: s.signalType ?? null, label: (s as any).label ?? null,
+        }).ok);
+        signalsSkipped = body.signals.length - validSignals.length;
         for (let i = 0; i < validSignals.length; i += CHUNK) {
           const chunk = validSignals.slice(i, i + CHUNK);
           const values = chunk.map(s => ({
@@ -1455,6 +1625,9 @@ export async function registerRoutes(
             sl:          s.sl,
             outcome:     s.outcome ?? null,
             patternBars: s.patternBars ?? null,
+            label:       (s as any).label ?? null, // FACT-ENGINE: keep the fact-list label on import
+            confirmations: (s as any).confirmations ?? null,
+            footprintReading: (s as any).footprintReading ?? null,
             updatedAt:   new Date().toISOString(),
           }));
           await db.insert(signalHistory).values(values).onConflictDoNothing();
@@ -1462,7 +1635,7 @@ export async function registerRoutes(
         }
       }
 
-      res.json({ ok: true, candlesInserted, signalsInserted });
+      res.json({ ok: true, candlesInserted, signalsInserted, signalsSkipped });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -1540,7 +1713,14 @@ export async function registerRoutes(
       if (!csv || !symbol) { res.status(400).json({ error: "csv and symbol required" }); return; }
 
       const sym = symbol.replace(/[HMUZ]\d{1,2}$/, "").toUpperCase(); // strip contract month
-      const { resolution, bars } = parseMWCsvText(csv, sym);
+      const { resolution, bars: rawBars } = parseMWCsvText(csv, sym);
+
+      // WRITE-GUARD: drop off-grid rows in JS so the DB trigger (which abandons the REMAINDER of a
+      // multi-row INSERT) never truncates a batch mid-way. Skips are counted, not silent.
+      const gridSec = parseInt(resolution, 10) * 60;
+      const bars = rawBars.filter(b => b.timestamp % gridSec === 0);
+      const offGridSkipped = rawBars.length - bars.length;
+      if (offGridSkipped > 0) console.log(`[import-csv] ${sym} res=${resolution}: skipped ${offGridSkipped} off-grid rows`);
 
       const CHUNK = 500;
       let inserted = 0;
@@ -1588,7 +1768,11 @@ export async function registerRoutes(
 
       for (const file of files) {
         const csvText = fs.readFileSync(path.join(mwExtDir, file), "utf-8");
-        const { resolution, bars } = parseMWCsvText(csvText, sym);
+        const { resolution, bars: rawBars } = parseMWCsvText(csvText, sym);
+        // WRITE-GUARD: pre-filter off-grid rows (see import-csv note — protects batch tails).
+        const gridSec = parseInt(resolution, 10) * 60;
+        const bars = rawBars.filter(b => b.timestamp % gridSec === 0);
+        if (bars.length < rawBars.length) console.log(`[import-mw-dump] ${sym} res=${resolution}: skipped ${rawBars.length - bars.length} off-grid rows`);
         const CHUNK = 500;
         for (let i = 0; i < bars.length; i += CHUNK) {
           const chunk = bars.slice(i, i + CHUNK);
@@ -2030,7 +2214,7 @@ export async function registerRoutes(
       totalSignals: number;
       decidedCount: number;
       winRate:      number | null;
-      totalPts:     number;
+      totalPnlPts:  number; // renamed 2026-07-13 (was the same P&L sum under the retired scoring name)
       bySession:    { rth: { wins: number; total: number }; eth: { wins: number; total: number } };
       byDirection:  { long: { wins: number; total: number }; short: { wins: number; total: number } };
       byConfluence: { two: { wins: number; total: number }; one: { wins: number; total: number } };
@@ -2047,7 +2231,7 @@ export async function registerRoutes(
       `STRATEGY: Signals fire when price enters a zone (FVG/Order Block/Structural) aligned with the Vector line direction. Three risk tiers: safe (body confirmation + 3 most recent zones), risky (body confirmation, up to 5 zones), riskiest (vector direction only).`,
       ``,
       `PERFORMANCE SUMMARY (${body.riskLevel} tier, ${body.symbol} ${body.interval}):`,
-      `- Total signals: ${body.totalSignals} | Decided: ${body.decidedCount} | Win rate: ${body.winRate != null ? body.winRate + "%" : "n/a"} | Total pts: ${body.totalPts.toFixed(1)}`,
+      `- Total signals: ${body.totalSignals} | Decided: ${body.decidedCount} | Win rate: ${body.winRate != null ? body.winRate + "%" : "n/a"} | Total pts: ${(body.totalPnlPts ?? 0).toFixed(1)}`,
       `- RTH session: ${wr(body.bySession.rth.wins, body.bySession.rth.total)}`,
       `- ETH session: ${wr(body.bySession.eth.wins, body.bySession.eth.total)}`,
       `- Long signals: ${wr(body.byDirection.long.wins, body.byDirection.long.total)}`,
@@ -2270,6 +2454,19 @@ export async function registerRoutes(
 
   // POST /api/discord/send — send a signal alert to Discord
   app.post("/api/discord/send", async (req, res) => {
+    // ALERT MUTES (2026-10-01, owner-approved R2a + R3): an overnight (ETH-close) fire is
+    // record-only unless tradeSettings.ethAlertsEnabled; a fire closing inside a scheduled-news
+    // blackout is muted while newsBlackoutEnabled. Classified at the bar CLOSE in
+    // America/New_York (server/news-blackout.ts alertMuteReason). `time` = the fire bar's open
+    // (unix sec); an alert without one is classified at now. Muted = 200 {ok:true, muted}.
+    {
+      const b = (req.body ?? {}) as { time?: number; interval?: string };
+      const muted = alertMuteReason(
+        { timestampSec: Number.isFinite(Number(b.time)) ? Number(b.time) : null, interval: b.interval },
+        { ethAlertsEnabled: tradeSettings.ethAlertsEnabled, newsBlackoutEnabled: tradeSettings.newsBlackoutEnabled },
+      );
+      if (muted) { res.json({ ok: true, muted }); return; }
+    }
     const webhook = memDiscordWebhook || await (async () => {
       try {
         const rows = await db.select().from(appSettings).where(eq(appSettings.key, "discord_webhook"));
@@ -2280,13 +2477,25 @@ export async function registerRoutes(
       res.status(400).json({ error: "No Discord webhook configured." });
       return;
     }
-    const { direction, interval, riskLevel, price, tp1, tp2, sl, symbol } = req.body as {
+    const { direction, interval, riskLevel, price, tp1, tp2, sl, symbol, label, suggestedContracts } = req.body as {
       direction: string; interval: string; riskLevel: string;
-      price: number; tp1: number; tp2: number; sl: number; symbol: string;
+      price: number; tp1: number; tp2: number | null; sl: number; symbol: string;
+      label?: string; // FACT-ENGINE (D5): composite fact-list label — alerts must say WHY they fired
+      suggestedContracts?: number | null; // POSITION SIZING (2026-08-02): combo-tier suggested size (display-only)
     };
     const arrow = direction === "Long" ? "▲" : "▼";
     const rl    = (riskLevel ?? "").toUpperCase();
-    const content = `${arrow} **${direction.toUpperCase()} ${symbol ?? "MES"} ${interval}** | Risk: ${rl}\nEntry: \`${Number(price).toFixed(2)}\`  TP1: \`${Number(tp1).toFixed(2)}\`  TP2: \`${Number(tp2).toFixed(2)}\`  SL: \`${Number(sl).toFixed(2)}\``;
+    const factLine = label && String(label).trim() ? `\nFacts: ${String(label).trim()}` : "";
+    // POSITION SIZING (2026-08-02): suggested size rides along on every signal alert (2 = the
+    // combo's held-out record is PROVEN, PF >= 1.3 on an adequate sample; 1 = everything else).
+    const sizeLine = Number.isFinite(suggestedContracts as number) && (suggestedContracts as number) >= 1
+      ? `\nSuggested size: ${Math.floor(suggestedContracts as number)} contract${Math.floor(suggestedContracts as number) === 1 ? "" : "s"}${Math.floor(suggestedContracts as number) >= 2 ? " (proven setup)" : ""}`
+      : "";
+    // TP1-ONLY (2026-08-13): one target on post-policy alerts — "TP" only when tp2 is null.
+    const tpPart = tp2 != null
+      ? `TP1: \`${Number(tp1).toFixed(2)}\`  TP2: \`${Number(tp2).toFixed(2)}\``
+      : `TP: \`${Number(tp1).toFixed(2)}\``;
+    const content = `${arrow} **${direction.toUpperCase()} ${symbol ?? "MES"} ${interval}** | Risk: ${rl}${factLine}${sizeLine}\nEntry: \`${Number(price).toFixed(2)}\`  ${tpPart}  SL: \`${Number(sl).toFixed(2)}\``;
     try {
       const r = await fetch(webhook, {
         method: "POST",
@@ -2332,19 +2541,16 @@ export async function registerRoutes(
     res.set("Cache-Control", "no-store"); // polled — never serve a 304 (see /status note)
     let trade = getCurrentTrade();
     if (trade && trade.status === 'open') {
-      const livePrice = getLastTickPrice(trade.symbol);
+      // NO LIVE TICKS (2026-09-23): a parked seed price must not judge an open trade's TP/SL
+      // (same rule as /api/live/bar) — the status simply stays as it is until ticks flow.
+      const livePrice = getFeedStatus(trade.symbol) === "live" ? getLastTickPrice(trade.symbol) : null;
       if (livePrice != null && livePrice > 0) {
-        const isLong = trade.direction === 'Long';
-        let newStatus: 'open' | 'tp1_hit' | 'tp2_hit' | 'sl_hit' = trade.status;
-        if (isLong) {
-          if (livePrice >= trade.tp2)      newStatus = 'tp2_hit';
-          else if (livePrice >= trade.tp1) newStatus = 'tp1_hit';
-          else if (livePrice <= trade.sl)  newStatus = 'sl_hit';
-        } else {
-          if (livePrice <= trade.tp2)      newStatus = 'tp2_hit';
-          else if (livePrice <= trade.tp1) newStatus = 'tp1_hit';
-          else if (livePrice >= trade.sl)  newStatus = 'sl_hit';
-        }
+        // ONE inference (2026-09-18): this route carried its own copy of the TP/SL touch test,
+        // which would have shown a phantom tp1_hit/sl_hit whenever the bracket and the price are
+        // in different contract bases. trade-state's inferTradeStatus is the shared rule — it
+        // is TP1-only-safe (never compares against a null tp2) AND honours the wrong-basis
+        // freeze (MW off-contract, or a trade that lived through a mismatch → stays "open").
+        const newStatus = inferTradeStatus(trade, livePrice);
         if (newStatus !== trade.status) {
           setCurrentTrade({ ...trade, status: newStatus });
           trade = getCurrentTrade();
@@ -2360,19 +2566,67 @@ export async function registerRoutes(
     res.json({ ok: true });
   });
 
+  // SERVING SEAM helper: oldest timestamp /api/data/cached-continuous will actually serve for
+  // (symbol, resolution) under its per-resolution row cap — null when the store fits under the cap.
+  function servedFloorFor(symbol: string, resolution: string): { cap: number; servedFloorTs: number | null } {
+    const SERVE_CAP: Record<string, number> = { "1": 250_000, "5": 500_000, "15": 200_000, "60": 60_000 };
+    const cap = SERVE_CAP[resolution] ?? 250_000;
+    const capRow = db.$client.prepare(
+      `SELECT timestamp FROM cached_candles WHERE symbol=? AND resolution=? ORDER BY timestamp DESC LIMIT 1 OFFSET ?`,
+    ).get(symbol, resolution, cap - 1) as { timestamp: number } | undefined;
+    return { cap, servedFloorTs: capRow?.timestamp ?? null };
+  }
+
   app.get("/api/mw/sync-status", (_req, res) => {
-    res.json(getMWSyncStatus());
+    // AUDIT-WATCHDOG: expose per-(symbol,resolution) audit staleness + recent write-guard rejects
+    // so a frozen gap-audit (last_audit_ts not advancing) is visible without reading server logs.
+    let rejects: { total: number; lastHour: number } = { total: 0, lastHour: 0 };
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      rejects = {
+        total: (db.$client.prepare(`SELECT COUNT(*) n FROM candle_write_rejects`).get() as any).n,
+        lastHour: (db.$client.prepare(`SELECT COUNT(*) n FROM candle_write_rejects WHERE seen_at >= ?`).get(nowSec - 3600) as any).n,
+      };
+    } catch { /* table missing on a pre-migration DB — non-fatal */ }
+    // YAHOO-FALLBACK: feed_status provenance — "mw-live" (MW study connected) | "yahoo-fallback"
+    // (no MW; the 1m live-poll is delivering, ~1min delayed) | "stale" (neither). yahooLive
+    // carries poller detail (cycles / lastOkAgeSec / totalInserted / lastError).
+    // SCHEDULER (2026-08-02): last catch-up / weekly-regen / digest status + flags + locks.
+    // CONTRACT GUARD (2026-09-17): contractGuard.offContract = MW chart on a different month than
+    // Yahoo's front month (MW quarantined, Yahoo driving, orders blocked) — the header badge reads it.
+    res.json({ ...getMWSyncStatus(), ...getYahooLiveStatus(), contractGuard: contractGuardStatus(), audit: getAuditStaleness(), candleWriteRejects: rejects, scheduler: getSchedulerStatus() });
   });
 
   // MW-SYNC (v2): per (symbol, resolution) backfill completeness — stored vs expected bars + gaps.
+  // Includes `servedFloorTs` (the serving-cap seam) so the client can annotate capped history.
   app.get("/api/data/gaps/:symbol/:resolution", (req, res) => {
     try {
       const symbol = String(req.params.symbol || "").toUpperCase();
       const resolution = String(req.params.resolution || "").replace("m", "");
       if (!symbol || !resolution) { res.status(400).json({ error: "symbol/resolution required" }); return; }
-      res.json(getCompleteness(symbol, resolution));
+      res.json({ ...getCompleteness(symbol, resolution), ...servedFloorFor(symbol, resolution) });
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? "gap audit failed" });
+    }
+  });
+
+  // SERVING SEAM: lightweight per-(symbol,resolution) serving-range descriptor for the client —
+  // { cap, servedFloorTs, earliestTs, latestTs, total }. servedFloorTs is null when uncapped.
+  app.get("/api/data/served-range/:symbol/:resolution", (req, res) => {
+    try {
+      const symbol = normalizeSymbol(String(req.params.symbol || ""));
+      const resolution = String(req.params.resolution || "").replace("m", "");
+      if (!symbol || !resolution) { res.status(400).json({ error: "symbol/resolution required" }); return; }
+      const bounds = db.$client.prepare(
+        `SELECT MIN(timestamp) mn, MAX(timestamp) mx, COUNT(*) n FROM cached_candles WHERE symbol=? AND resolution=?`,
+      ).get(symbol, resolution) as { mn: number | null; mx: number | null; n: number };
+      res.json({
+        symbol, resolution,
+        ...servedFloorFor(symbol, resolution),
+        earliestTs: bounds.mn, latestTs: bounds.mx, total: bounds.n,
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? "served-range failed" });
     }
   });
 
@@ -2382,7 +2636,7 @@ export async function registerRoutes(
       const symbol = String(req.params.symbol || "").toUpperCase();
       const resolution = String(req.params.resolution || "").replace("m", "");
       const info = db.$client.prepare(
-        `DELETE FROM unfillable_ranges WHERE symbol = ? AND resolution = ? AND reason = 'no_data'`
+        `DELETE FROM unfillable_ranges WHERE symbol = ? AND resolution = ? AND reason IN ('no_data','yahoo_no_data')`
       ).run(symbol, resolution);
       res.json({ ok: true, cleared: info.changes });
     } catch (e: any) {
@@ -2399,7 +2653,7 @@ export async function registerRoutes(
       const resolution = String(req.params.resolution || "").replace("m", "");
       // Clear retryable no_data so wrongly-marked holes get re-requested during the sweep.
       db.$client.prepare(
-        `DELETE FROM unfillable_ranges WHERE symbol=? AND resolution=? AND reason='no_data'`,
+        `DELETE FROM unfillable_ranges WHERE symbol=? AND resolution=? AND reason IN ('no_data','yahoo_no_data')`,
       ).run(symbol, resolution);
       const ranNow = requestFullResync(symbol, resolution);
       res.json({ ok: true, ranImmediately: ranNow, pending: !ranNow });
@@ -2523,6 +2777,58 @@ export async function registerRoutes(
     res.json(tradeSettings);
   });
 
+  // GET /api/news/blackouts?date=YYYY-MM-DD[&all=1] — SCHEDULED-NEWS BLACKOUT (2026-10-01 R3):
+  // the ET day's derived windows (default: today ET), the day's events still to print (today
+  // only), whether the calendar covers the date, and the order/alert switches. `all=1` adds
+  // every window the calendar defines (client row badging). Read-only; data/news-calendar.json.
+  app.get("/api/news/blackouts", (req, res) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const today = etDateOf(nowSec);
+    const q = String(req.query.date ?? "").trim();
+    if (q && !/^\d{4}-\d{2}-\d{2}$/.test(q)) { res.status(400).json({ error: "date must be YYYY-MM-DD" }); return; }
+    const date = q || today;
+    const cal = loadNewsCalendar();
+    const windows = windowsForDay(date);
+    const upcoming = date === today && cal
+      ? cal.events
+          .filter(e => e && e.date === today)
+          .map(e => ({ ...e, atSec: etWallToUnix(e.date, e.timeET) }))
+          .filter(e => e.atSec != null && (e.atSec as number) >= nowSec)
+          .sort((a, b) => (a.atSec as number) - (b.atSec as number))
+      : [];
+    res.set("Cache-Control", "no-store");
+    res.json({
+      date, today, covered: calendarCovers(date), calendarWindow: cal?.window ?? null,
+      partialThrough: typeof cal?.partialThrough === "string" ? cal.partialThrough : null,
+      calendarHealth: newsCalendarHealth(today, cal),
+      newsBlackoutEnabled: tradeSettings.newsBlackoutEnabled !== false,
+      ethAlertsEnabled: tradeSettings.ethAlertsEnabled === true,
+      activeNow: blackoutReason(nowSec),
+      windows, upcoming,
+      ...(String(req.query.all ?? "") === "1" ? { allWindows: allWindows() } : {}),
+    });
+  });
+
+  // MULTI-TRADE VISIBILITY + MANUAL RESET (2026-08-14, the phantom-5m-Long lesson): see every
+  // active record the gates consult, and clear them when MW reality diverges (user is flat
+  // but a record lingers). Clearing NEVER touches MW orders — it only resets our bookkeeping.
+  app.get("/api/trade/actives", (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    // 2026-08-18: expose the Apex-guard tracker so the guard's view of the day is inspectable.
+    res.json({ actives: getActiveTrades(), apexGuard: apexGuardState() });
+  });
+  app.post("/api/trade/actives/clear", (_req, res) => {
+    clearCurrentTrade();
+    res.json({ ok: true, cleared: true });
+  });
+  // GUARD RESET (2026-08-20): zero today's Apex-guard tracker — for mornings after an
+  // overnight SIM session booked losses into it (the server can't see which account MW
+  // points at). The account's REAL headroom lives in RTrader; verify there before trusting
+  // a fresh tracker.
+  app.post("/api/trade/guard/reset", (_req, res) => {
+    res.json({ ok: true, guard: resetApexGuard() });
+  });
+
   // POST /api/trade/settings — update full config (persisted in-memory until server restart)
   app.post("/api/trade/settings", (req, res) => {
     const body = req.body as Partial<typeof tradeSettings>;
@@ -2535,11 +2841,50 @@ export async function registerRoutes(
     if (Array.isArray(body.riskLevels)) tradeSettings.riskLevels = body.riskLevels;
     if (Array.isArray(body.intervals)) tradeSettings.intervals = body.intervals;
     if (['current','tight','standard','wide'].includes(body.exitStrategy as string)) tradeSettings.exitStrategy = body.exitStrategy as typeof tradeSettings.exitStrategy;
+    // SIGNAL-INTEGRITY (A4): push alerts for third-party Discord-parsed signals — default OFF.
+    if (typeof body.discordPushEnabled === "boolean") tradeSettings.discordPushEnabled = body.discordPushEnabled;
+    // ONE-POSITION GATE toggle (2026-08-14): default OFF by user decision; flip-able anytime.
+    if (typeof body.positionGate === "boolean") tradeSettings.positionGate = body.positionGate;
+    // SAME-DIRECTION-ONLY toggle (2026-08-14): default ON by user refinement.
+    if (typeof body.sameDirectionOnly === "boolean") tradeSettings.sameDirectionOnly = body.sameDirectionOnly;
+    // APEX GUARDS (2026-08-18): total-exposure cap + trailing-threshold order pause.
+    if (Number.isFinite(Number(body.maxNetContracts))) tradeSettings.maxNetContracts = Math.floor(Number(body.maxNetContracts));
+    if (typeof body.apexGuardEnabled === "boolean") tradeSettings.apexGuardEnabled = body.apexGuardEnabled;
+    if (Number.isFinite(Number(body.apexHeadroomDollars)) && Number(body.apexHeadroomDollars) > 0) tradeSettings.apexHeadroomDollars = Number(body.apexHeadroomDollars);
+    if (Number.isFinite(Number(body.apexGuardMarginDollars)) && Number(body.apexGuardMarginDollars) >= 0) tradeSettings.apexGuardMarginDollars = Number(body.apexGuardMarginDollars);
+    // APEX 25K (2026-10-01): account carry-over + daily loss pause (0 = off). The profile tag is
+    // code-owned (never accepted from a client) — every persist below stamps the current one.
+    if (typeof body.apexGuardCarryOver === "boolean") tradeSettings.apexGuardCarryOver = body.apexGuardCarryOver;
+    if (Number.isFinite(Number(body.apexDailyLossLimitDollars)) && Number(body.apexDailyLossLimitDollars) >= 0) tradeSettings.apexDailyLossLimitDollars = Number(body.apexDailyLossLimitDollars);
+    // LATE ENTRY AT LEVEL (2026-08-20): see trade-state.ts docs.
+    if (typeof body.lateEntryEnabled === "boolean") tradeSettings.lateEntryEnabled = body.lateEntryEnabled;
+    if (Number.isFinite(Number(body.lateEntryTolerancePts)) && Number(body.lateEntryTolerancePts) > 0) tradeSettings.lateEntryTolerancePts = Number(body.lateEntryTolerancePts);
+    if (Number.isFinite(Number(body.lateEntryMaxAgeMin)) && Number(body.lateEntryMaxAgeMin) > 0) tradeSettings.lateEntryMaxAgeMin = Math.floor(Number(body.lateEntryMaxAgeMin));
+    // ORDER-HOURS WINDOW (2026-08-20): validate HH:MM shape; malformed entries dropped.
+    if (typeof body.orderHoursEnabled === "boolean") tradeSettings.orderHoursEnabled = body.orderHoursEnabled;
+    if (Array.isArray(body.orderWindows)) {
+      const ok = (s: unknown): s is string => typeof s === "string" && /^\d{1,2}:\d{2}$/.test(s);
+      tradeSettings.orderWindows = body.orderWindows
+        .filter((w: { start?: unknown; end?: unknown }) => w && ok(w.start) && ok(w.end))
+        .map((w: { start: string; end: string }) => ({ start: w.start, end: w.end }));
+    }
+    // ALERT MUTE + NEWS BLACKOUT switches (2026-10-01 R2a / R3) — booleans only.
+    if (typeof body.ethAlertsEnabled === "boolean") tradeSettings.ethAlertsEnabled = body.ethAlertsEnabled;
+    if (typeof body.newsBlackoutEnabled === "boolean") tradeSettings.newsBlackoutEnabled = body.newsBlackoutEnabled;
     // Broadcast the FULL auto-trade config so the (hidden) MarketPage engine and any other
     // clients mirror it live — this is how the terminal drives which interval/tiers auto-trade
     // (the engine fires on these, not on its own stale client-side filters). Always broadcast
     // so interval/direction/tier changes propagate, not just enable/disable.
     void prevEnabled;
+    // PERSIST (2026-08-04): settings survive restarts (a reboot silently reset contracts to 1
+    // and intervals to all-four — twice in one day). The arm switch is deliberately NOT
+    // restored at boot: every restart comes back DISARMED (see trade-state.ts hydration).
+    try {
+      db.$client.prepare(
+        `INSERT INTO app_settings (key, value) VALUES ('trade_settings', ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      ).run(JSON.stringify(tradeSettings));
+    } catch (e: any) { console.error(`[trade-settings] persist failed: ${e?.message}`); }
     broadcast({
       type: "auto_trade_state",
       enabled: tradeSettings.enabled,
@@ -2553,11 +2898,12 @@ export async function registerRoutes(
     res.json({ ok: true, settings: tradeSettings });
   });
 
-  // POST /api/push-token — register an Expo push token from the mobile app
+  // POST /api/push-token — register an Expo push token from the mobile app.
+  // PERSISTED (2026-08-04): survives server restarts via the push_tokens table.
   app.post("/api/push-token", (req, res) => {
-    const { token } = req.body as { token?: string; platform?: string };
+    const { token, platform } = req.body as { token?: string; platform?: string };
     if (typeof token === "string" && token.startsWith("ExponentPushToken[")) {
-      pushTokens.add(token);
+      registerPushToken(token, platform);
       res.json({ ok: true, registered: pushTokens.size });
     } else {
       res.status(400).json({ error: "Invalid push token format" });
@@ -2576,24 +2922,101 @@ export async function registerRoutes(
 
   // POST /api/trade/execute — place an order from a fired signal
   app.post("/api/trade/execute", (req, res) => {
-    const { symbol, direction, interval, riskLevel, price, tp1, tp2, sl, contracts, tp1Only, useTrailer, trailingOffset } = req.body as {
+    // (Trailer params DELETED 2026-07-13 per spec rule 12 — no trailer fields are parsed or
+    //  forwarded. mw-study/AutoTrader.java still declares them but is a compiled jar; with no
+    //  params forwarded its trailer branch is inert.)
+    const { symbol, direction, interval, riskLevel, price, tp1, tp2, sl, contracts, tp1Only, sizeByComboTier, fireTs } = req.body as {
       symbol: string; direction: string; interval: string; riskLevel: string;
-      price: number; tp1: number; tp2: number; sl: number; contracts?: number; tp1Only?: boolean;
-      useTrailer?: boolean; trailingOffset?: number;
+      price: number; tp1: number; tp2: number | null; sl: number; contracts?: number; tp1Only?: boolean;
+      /** ONE ORDER AUTHORITY (2026-08-13): the signal's fire-bar time — claimed in trade-state's
+       *  registry so this route and the server live engine can never both order one signal. */
+      fireTs?: number;
+      // POSITION SIZING (2026-08-02, explicit OPT-IN — default OFF in the client): when true,
+      // the client's `contracts` IS the engine's combo-tier suggested size and wins over the
+      // stored tradeSettings.contracts for THIS order only. Absent/false = unchanged behavior.
+      sizeByComboTier?: boolean;
     };
     if (!direction || !price || !sl) {
       res.status(400).json({ error: "Missing required fields: direction, price, sl" });
       return;
     }
-    if (!tp1 || !tp2 || tp1 === price || tp2 === price) {
+    // TP1-ONLY policy (2026-08-13): tp2 null is legal and FORCES tp1Only — the MW bracket still
+    // needs a numeric TP2 leg, so it mirrors TP1 (inert: the study exits everything at TP1).
+    if (!tp1 || tp1 === price || (tp2 != null && tp2 === price)) {
       res.status(400).json({ error: `Invalid TP levels: tp1=${tp1} tp2=${tp2} entry=${price} — order rejected` });
       return;
+    }
+    const effTp1Only = tp1Only === true || tp2 == null;
+    const effTp2 = tp2 ?? tp1;
+    // ONE-POSITION GATE — a SETTING, default OFF (2026-08-14 user decision: "nothing
+    // blocking any trades"; netting/stacking consequences stated and accepted). Same gate
+    // as the server live engine when enabled.
+    if (tradeSettings.positionGate) {
+      const gateReason = positionGateReason(getLastTickPrice(symbol ?? "MES"));
+      if (gateReason) {
+        res.json({ ok: false, blocked: true, error: `Order withheld: ${gateReason}` });
+        return;
+      }
+    }
+    // SAME-DIRECTION-ONLY GATE — default ON (2026-08-14 user refinement: "if a long is active
+    // and a short comes dont fire and vise versa"). Same-direction signals stack freely.
+    if (tradeSettings.sameDirectionOnly) {
+      const dirGate = oppositeDirectionGateReason(direction, getLastTickPrice(symbol ?? "MES"));
+      if (dirGate) {
+        res.json({ ok: false, blocked: true, error: `Order withheld: ${dirGate}` });
+        return;
+      }
+    }
+    // ORDER-HOURS WINDOW (2026-08-20 ETH-study ship): same clock gate as the live engine.
+    {
+      const hoursGate = orderHoursGateReason(Math.floor(Date.now() / 1000));
+      if (hoursGate) { res.json({ ok: false, blocked: true, error: `Order withheld: ${hoursGate}` }); return; }
+    }
+    // CONTRACT GUARD (2026-09-17): same gate as the server live engine — never work a bracket on
+    // a chart that is 60+ pts from the series it was priced on.
+    {
+      const contractGate = orderContractGateReason();
+      if (contractGate) { res.json({ ok: false, blocked: true, error: `Order withheld: ${contractGate}` }); return; }
+    }
+    // APEX GUARDS (2026-08-18 — after the 12:22 PM Rithmic auto-liquidation): total-exposure
+    // cap + trailing-threshold order pause. Same gates as the server live engine.
+    {
+      const guardContracts = Math.max(1, Math.floor(Number(
+        (sizeByComboTier === true ? contracts : undefined) ?? tradeSettings.contracts ?? contracts ?? 1)));
+      const capGate = netContractsGateReason(guardContracts, getLastTickPrice(symbol ?? "MES"));
+      if (capGate) { res.json({ ok: false, blocked: true, error: `Order withheld: ${capGate}` }); return; }
+      const apexGate = apexGuardReason(getLastTickPrice(symbol ?? "MES"));
+      if (apexGate) { res.json({ ok: false, blocked: true, error: `Order withheld: ${apexGate}` }); return; }
+    }
+    // ORDER ADMISSION (2026-09-25, B5): a fire-identified order must be a STORED signal — a fire
+    // POST /api/signals/history refused (cross-writer cooldown / open trade) is never ordered.
+    // Checked BEFORE the claim so a refused fire cannot burn the key. Test orders (no fireTs) pass.
+    if (Number.isFinite(fireTs as number)) {
+      const admissionGate = orderSignalGateReason({ interval, fireTs: fireTs as number, direction });
+      if (admissionGate) {
+        console.warn(`[trade/execute] withheld: ${admissionGate}`);
+        res.json({ ok: false, blocked: true, error: `Order withheld: ${admissionGate}` });
+        return;
+      }
+    }
+    // ONE ORDER AUTHORITY (2026-08-13): claim before broadcasting — if the server live engine
+    // (or another tab) already ordered this signal, this call is a clean no-op success.
+    if (Number.isFinite(fireTs as number)) {
+      const claimKey = `MES|${interval}|${Math.floor(fireTs as number)}|${direction}`;
+      if (!tryClaimOrder(claimKey)) {
+        res.json({ ok: true, deduped: true, note: "order already placed for this signal (server live engine or another tab)" });
+        return;
+      }
     }
     // Contract count is the user's AUTHORITATIVE setting (tradeSettings.contracts, kept in sync
     // by both the terminal AutoTrader card and the classic page). Use it directly rather than
     // whatever the firing client sent — that eliminates any "fired the wrong amount" race where
     // the engine's in-memory value lagged a just-changed setting.
-    const orderContracts = Math.max(1, Math.floor(Number(tradeSettings.contracts ?? contracts ?? 1)));
+    // POSITION SIZING (2026-08-02): with the user's explicit "Size by combo tier" opt-in the
+    // firing client sends sizeByComboTier:true + the tier-suggested count — that count wins for
+    // this order. Otherwise (default) the stored setting stays authoritative exactly as before.
+    const orderContracts = Math.max(1, Math.floor(Number(
+      (sizeByComboTier === true ? contracts : undefined) ?? tradeSettings.contracts ?? contracts ?? 1)));
     const sent = broadcastOrderCommand({
       type: "order_command",
       symbol: symbol ?? "MES",
@@ -2602,14 +3025,15 @@ export async function registerRoutes(
       riskLevel,
       price: Number(price),
       tp1: Number(tp1),
-      tp2: Number(tp2),
+      tp2: Number(effTp2),
       sl: Number(sl),
       contracts: orderContracts,
-      tp1Only: tp1Only === true,
-      useTrailer: useTrailer === true,
-      trailingOffset: Number(trailingOffset ?? 2),
+      tp1Only: effTp1Only,
     });
     if (!sent) {
+      // NOTIFY (2026-08-04): a signal that fires with NO study connected is a silent no-trade —
+      // exactly the failure the user must hear about immediately.
+      notifyTradeEvent({ type: "order_error", error: `order NOT placed — AutoTrader study not connected (${direction} ${symbol ?? "MES"} @ ${price})` });
       res.status(503).json({ error: "AutoTrader study not connected. Load it on a chart in MotiveWave." });
       return;
     }
@@ -2620,10 +3044,10 @@ export async function registerRoutes(
       riskLevel,
       entry: Number(price),
       tp1: Number(tp1),
-      tp2: Number(tp2),
+      tp2: tp2 == null ? null : Number(tp2),
       sl: Number(sl),
       contracts: orderContracts,
-      tp1Only: tp1Only === true,
+      tp1Only: effTp1Only,
       firedAt: Math.floor(Date.now() / 1000),
       status: 'open',
     });
@@ -2884,7 +3308,127 @@ export async function registerRoutes(
     return raw.replace(/[^A-Za-z]/g, '').replace(/[HMUZ]$/i, '').toUpperCase();
   }
 
+  // RISK DISPLAY (2026-07-30): normalize the posted riskFlags into the stored JSON string —
+  // an array of strings serializes; a string must already parse to an array of strings;
+  // anything else → NULL (the upsert's COALESCE then keeps any stored value).
+  function normalizeRiskFlags(raw: unknown): string | null {
+    if (Array.isArray(raw) && raw.every(x => typeof x === "string")) return JSON.stringify(raw);
+    if (typeof raw === "string") {
+      try {
+        const p = JSON.parse(raw);
+        if (Array.isArray(p) && p.every((x: unknown) => typeof x === "string")) return JSON.stringify(p);
+      } catch { /* fall through */ }
+    }
+    return null;
+  }
+
+  // ── GET /api/risk/combo-stats — DISPLAY-ONLY risk info backing store (2026-07-30) ──────
+  // Serves everything the client needs to render a signal's "track record" + risk warnings:
+  //   heldOut    — shared/quality-gate.ts comboClasses (the walk-forward held-out verdicts;
+  //                the PRIMARY basis for the tier wording)
+  //   realized   — per combo@interval AND all-interval combo stats over the standing
+  //                fact-engine-backtest-results.json signals (SECONDARY basis; {} if the
+  //                JSON is absent — degrade gracefully, never 500)
+  //   medianDayRange — the dead-tape baseline, computed by the SAME shared implementation
+  //                the harness uses (shared/day-range-median.ts); the live adapter passes it
+  //                into the engine so live dead-tape flags match a later regen's byte-for-byte.
+  // Cheap: computed lazily on first request, cached 10 minutes.
+  interface RealizedCell { n: number; closed: number; wins: number; winPct: number | null; pf: number | null; expectancy: number | null }
+  let riskStatsCache: { at: number; payload: Record<string, unknown> } | null = null;
+  app.get("/api/risk/combo-stats", (_req, res) => {
+    try {
+      const nowMs = Date.now();
+      if (riskStatsCache && nowMs - riskStatsCache.at < 10 * 60 * 1000) {
+        return res.json(riskStatsCache.payload);
+      }
+      // Realized stats from the standing results JSON (optional — absence is not an error).
+      const realized: Record<string, RealizedCell> = {};
+      let realizedSource: Record<string, unknown> | null = null;
+      // cwd-resolved like server/db.ts DB_PATH (dev tsx + prod dist both launch from the
+      // project root; __dirname is NOT defined under tsx ESM — it 500'd this route on boot).
+      // BAXTER_ARTIFACTS_DIR (2026-08-02): the ops-owned artifacts dir wins when set; cwd stays
+      // the fallback (dev tsx + prod dist both launch from the project root).
+      const candidates = [
+        path.join(artifactsDir(process.cwd()), "fact-engine-backtest-results.json"),
+        path.join(process.cwd(), "fact-engine-backtest-results.json"),
+      ];
+      const resultsPath = candidates.find(p => fs.existsSync(p));
+      if (resultsPath) {
+        try {
+          const doc = JSON.parse(fs.readFileSync(resultsPath, "utf-8")) as {
+            meta?: { generatedAt?: string; windowFromKey?: string; windowToKey?: string };
+            signals?: Array<{ combo?: string; interval?: string; outcome?: string; pointsResult?: number | null }>;
+          };
+          const groups = new Map<string, Array<{ outcome: string; pts: number | null }>>();
+          for (const s of doc.signals ?? []) {
+            if (!s.combo || !s.interval) continue;
+            const rec = { outcome: s.outcome ?? "open", pts: typeof s.pointsResult === "number" ? s.pointsResult : null };
+            for (const k of [`${s.combo}@${s.interval}`, s.combo]) {
+              const arr = groups.get(k);
+              if (arr) arr.push(rec); else groups.set(k, [rec]);
+            }
+          }
+          const rnd = (v: number): number => Math.round(v * 100) / 100;
+          for (const [k, arr] of groups) {
+            const closedRows = arr.filter(r => r.outcome !== "open" && r.pts != null);
+            const wins = closedRows.filter(r => r.outcome === "tp1" || r.outcome === "tp2").length;
+            const pts = closedRows.map(r => r.pts as number);
+            const gw = pts.filter(v => v > 0).reduce((a, b) => a + b, 0);
+            const gl = pts.filter(v => v < 0).reduce((a, b) => a + b, 0);
+            const closed = closedRows.length;
+            realized[k] = {
+              n: arr.length, closed, wins,
+              winPct: closed ? rnd(100 * wins / closed) : null,
+              pf: gl < 0 ? rnd(gw / -gl) : (gw > 0 ? 999 : null),
+              expectancy: closed ? rnd(pts.reduce((a, b) => a + b, 0) / closed) : null,
+            };
+          }
+          realizedSource = {
+            file: path.basename(resultsPath),
+            generatedAt: doc.meta?.generatedAt ?? null,
+            windowFromKey: doc.meta?.windowFromKey ?? null,
+            windowToKey: doc.meta?.windowToKey ?? null,
+            signals: (doc.signals ?? []).length,
+          };
+        } catch (e) {
+          console.warn(`[risk] combo-stats: failed to parse ${resultsPath}: ${(e as Error).message}`);
+        }
+      }
+      // Dead-tape baseline — the SHARED implementation (harness parity; see day-range-median.ts).
+      // windowFromKey mirrors the harness's WINDOW_START_KEY; the results JSON's own key wins
+      // when present (they are the same constant unless the harness const moves first).
+      const windowFromKey = (realizedSource?.windowFromKey as string | undefined) ?? "2026-04-15";
+      const drm = medianSessionDayRangeFromDb(sqliteRaw, "MES", windowFromKey, Math.floor(nowMs / 1000));
+      const payload: Record<string, unknown> = {
+        generatedAt: new Date(nowMs).toISOString(),
+        heldOut: QUALITY_GATE.comboClasses ?? {},
+        gateGeneratedAt: QUALITY_GATE.generatedAt,
+        thresholds: { provenPF: 1.3, passingPF: 1.05, minNAtInterval: 20, minNAllInterval: 15 },
+        realized, realizedSource,
+        medianDayRange: drm.median, medianDays: drm.nDays, windowFromKey: drm.windowFromKey,
+      };
+      riskStatsCache = { at: nowMs, payload };
+      res.json(payload);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/signals/history/:symbol/:interval — load persisted signal locks
+  // GET /api/signals/prior-fires/:symbol — CROSS-WRITER SEED for the browser tab (2026-09-25, B5):
+  // exactly catchup.ts loadPriorFires (last 3 days + still-open rows within 14 days, per interval)
+  // — the same stored fires the catch-up pass and the live engine hand runFactEngine as
+  // priorFires, so the tab's replay shares their cooldown cursor / open-trade state. NULL levels
+  // serialize as null (the client maps them back to NaN = cooldown-only).
+  app.get("/api/signals/prior-fires/:symbol", (req, res) => {
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      res.json({ nowSec, priors: loadPriorFires(nowSec, normalizeSignalSymbol(req.params.symbol)) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get("/api/signals/history/:symbol/:interval", async (req, res) => {
     const sym = normalizeSignalSymbol(req.params.symbol);
     const iv  = req.params.interval;
@@ -2892,13 +3436,22 @@ export async function registerRoutes(
       // Never return FUTURE-dated rows — corrupt signals stamped days ahead (e.g. Jun 17 when
       // it's the 9th) otherwise pollute every client. Cap at now + 1h (clock-skew tolerance).
       const maxTs = Math.floor(Date.now() / 1000) + 3600;
-      const rows = await db.select().from(signalHistory)
-        .where(and(
-          eq(signalHistory.symbol, sym),
-          eq(signalHistory.interval, iv),
-          lte(signalHistory.timestamp, maxTs),
-        ));
-      res.json({ signals: rows });
+      // PERF (2026-07-30): optional `?since=<unixSec>` lower bound — clients that filter to a
+      // loaded-range cutoff anyway (useTerminalData, SignalsView date-browse) pass it so the 1m
+      // interval doesn't ship its full ~2MB history on every fetch. Absent param = full history
+      // (unchanged behavior for market.tsx locks, iPhone, scripts).
+      const sinceRaw = Number(req.query.since as string | undefined);
+      const conds = [
+        eq(signalHistory.symbol, sym),
+        eq(signalHistory.interval, iv),
+        lte(signalHistory.timestamp, maxTs),
+      ];
+      if (Number.isFinite(sinceRaw)) conds.push(gte(signalHistory.timestamp, Math.floor(sinceRaw)));
+      const rows = await db.select().from(signalHistory).where(and(...conds));
+      // SIGNAL-INTEGRITY (C2): the SAME rule filter as the write path, applied at read time so
+      // EVERY consumer (terminal chart, Signals tab, date-browse, iPhone) is covered server-side —
+      // legacy/violating rows can never reach a client even if they exist in the DB.
+      res.json({ signals: rows.filter(r => validateSignalRow(r).ok) });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -2913,14 +3466,28 @@ export async function registerRoutes(
         tp1: number; tp2: number; sl: number; outcome?: string; patternBars?: number;
         footprintReading?: string; // FOOTPRINT-STRATEGY: JSON FootprintReading
         confirmations?: string; // PARITY: JSON {milkOk, milkPts, vecOk, secondaryVecOk}
+        label?: string; // FACT-ENGINE: composite fact-list label
+        // BACKTEST-GRADE EXIT DETAIL (2026-07-29): nullable — present on resolved trades.
+        exitPrice?: number | null; exitTs?: number | null; pointsResult?: number | null;
+        mae?: number | null; mfe?: number | null; barsToExit?: number | null;
+        // RISK DISPLAY (2026-07-30): display-only — canonical combo key + risk-flag array
+        // (accepted as an array OR a pre-serialized JSON string; stored as a JSON string).
+        comboKey?: string | null; riskFlags?: string[] | string | null;
+        // POSITION SIZING (2026-08-02): engine-suggested contract count (combo tier; display/
+        // config-only — additive, COALESCE-guarded like comboKey).
+        suggestedContracts?: number | null;
+        shadowTags?: string[] | string | null; // SHADOW TAGS (2026-10-01, record-only) — normalized in writeSignalRows
+        // SOURCE PROVENANCE (2026-07-31): 'live' (market.tsx fire/outcome update — permanent)
+        // | 'regen' (harness --persist) | absent/other → NULL (legacy, treated as regen).
+        source?: string | null;
       }>;
     };
     if (!Array.isArray(signals) || !signals.length) {
-      res.json({ ok: true, inserted: 0 });
+      res.json({ ok: true, inserted: 0, skipped: 0 });
       return;
     }
     try {
-      const values = signals.map(s => ({
+      const allValues = signals.map(s => ({
         symbol:           normalizeSignalSymbol(s.symbol),
         interval:         s.interval,
         timestamp:        s.timestamp,
@@ -2935,29 +3502,130 @@ export async function registerRoutes(
         patternBars:      s.patternBars ?? null,
         footprintReading: s.footprintReading ?? null, // FOOTPRINT-STRATEGY:
         confirmations:    s.confirmations ?? null, // PARITY: confirmation breakdown for iPhone chips
+        label:            s.label ?? null, // FACT-ENGINE: composite fact-list label
+        // BACKTEST-GRADE EXIT DETAIL (2026-07-29): finite numbers only — anything else stays NULL
+        // so the COALESCE guards below can never be bypassed by NaN/string garbage.
+        exitPrice:        Number.isFinite(s.exitPrice as number) ? (s.exitPrice as number) : null,
+        exitTs:           Number.isFinite(s.exitTs as number) ? (s.exitTs as number) : null,
+        pointsResult:     Number.isFinite(s.pointsResult as number) ? (s.pointsResult as number) : null,
+        mae:              Number.isFinite(s.mae as number) ? (s.mae as number) : null,
+        mfe:              Number.isFinite(s.mfe as number) ? (s.mfe as number) : null,
+        barsToExit:       Number.isFinite(s.barsToExit as number) ? (s.barsToExit as number) : null,
+        // RISK DISPLAY (2026-07-30): combo key as a plain string; risk flags normalized to a
+        // JSON string array (array input serialized; a string input must already parse to an
+        // array of strings — anything else stays NULL so COALESCE keeps stored values).
+        comboKey:         typeof s.comboKey === "string" && s.comboKey.length ? s.comboKey : null,
+        riskFlags:        normalizeRiskFlags(s.riskFlags),
+        // POSITION SIZING (2026-08-02): positive integers only — anything else stays NULL so
+        // the COALESCE guard below keeps stored values.
+        suggestedContracts: Number.isFinite(s.suggestedContracts as number) && (s.suggestedContracts as number) >= 1
+          ? Math.floor(s.suggestedContracts as number) : null,
+        shadowTags:       s.shadowTags ?? null, // SHADOW TAGS (2026-10-01): writeSignalRows normalizes (non-array → NULL, COALESCE keeps stored)
+        // SOURCE-GUARD (2026-07-31): 'live' | 'regen' via the shared normalizer; anything else
+        // is NULL (legacy client = regen-treated) — EXCEPT 'catchup' (SCHEDULER 2026-08-02):
+        // the intraday catch-up pass stamps its back-filled rows 'catchup'. Catchup is
+        // REGEN-CLASS under every standing rule (non-live ⇒ collides whole against stored
+        // 'live' rows below; --persist's non-live window wipe replaces it) but stays
+        // distinguishable in the DB. Accepted route-side only — the shared enum is unchanged.
+        source:           s.source === "catchup" ? "catchup" : normalizeSignalSource(s.source),
         updatedAt:        new Date().toISOString(),
       }));
-      await db.insert(signalHistory).values(values).onConflictDoUpdate({
-        target: [signalHistory.symbol, signalHistory.interval, signalHistory.timestamp, signalHistory.direction],
-        set: {
-          riskLevel:        sql`excluded.risk_level`,
-          outcome:          sql`excluded.outcome`,
-          footprintReading: sql`excluded.footprint_reading`, // FOOTPRINT-STRATEGY:
-          confirmations:    sql`excluded.confirmations`, // PARITY:
-          updatedAt:        new Date().toISOString(),
-        },
-      });
-      // Push signal_new to all connected clients so iPhone refetches immediately
-      // instead of waiting for the next bar_complete (up to 15 minutes on a 15m chart).
-      const seen = new Set<string>();
-      for (const v of values) {
-        const key = `${v.symbol}|${v.interval}`;
-        if (!seen.has(key)) { seen.add(key); broadcast({ type: "signal_new", symbol: v.symbol, interval: v.interval }); }
+      // SIGNAL-INTEGRITY (C1): server-side rule backstop at WRITE time — reject non-finite prices,
+      // unknown interval/direction, session-illegal close times (break/weekend/15:15/ETH-purity),
+      // empty labels, and signalTypes outside the engine's set. Invalid rows are skipped + counted.
+      // STALE-ROW BACKSTOP (2026-07-29): also reject rows fired more than 120 days ago — a tab
+      // recomputing over deep history must never re-pollute signal_history with pre-window rows
+      // (the 3-month --persist window regen, ~105 days deep, passes with margin). NOT added to
+      // validateSignalRow: that validator also read-filters and runs on synthetic test fixtures.
+      const staleFloorTs = Math.floor(Date.now() / 1000) - 120 * 86400;
+      const values = allValues.filter(v => v.timestamp >= staleFloorTs && validateSignalRow(v).ok);
+      const skipped = allValues.length - values.length;
+      if (!values.length) {
+        res.json({ ok: true, inserted: 0, skipped });
+        return;
       }
-      res.json({ ok: true, inserted: values.length });
+      // ── GUARDED WRITE (moved to server/fire-admission.ts writeSignalRows 2026-09-24 so it is
+      // testable against a temp DB — logic verbatim) ─────────────────────────────────────
+      //   • OUTCOME IMMUTABILITY GUARD (2026-07-31): first-touch outcome matrix, pre-pass + SQL CASE.
+      //   • SOURCE-GUARD (2026-07-31): a stored 'live' row hit by a non-live write = collision, dropped whole.
+      //   • FIRE ADMISSION (2026-09-24, B1): a NEW key from a live-path writer ('live' | 'catchup')
+      //     is refused when a same-interval row lies within COOLDOWN_BARS × barSec (either side,
+      //     either direction) or a same-direction row is still open at its entry — the three
+      //     writers' phase-shifted replays can no longer union past the engine's own rules.
+      //   • PROVENANCE (2026-09-24, B2): a conflict write keeps the stored row's source; updated_at
+      //     moves only on a real change (a tab re-post relabelled catch-up rows 'live' forever).
+      const { accepted, effective, freshInserts, collisionKeys, admissionRejected } = await writeSignalRows(values as SignalWriteRow[]);
+      if (!accepted.length) {
+        res.json({ ok: true, inserted: 0, skipped, collisions: collisionKeys.length, collisionKeys, fresh: 0, admissionRejected: admissionRejected.length, admissionKeys: admissionRejected });
+        return;
+      }
+      // Push signal_new to all connected clients so consumers update immediately instead of
+      // waiting for the next bar_complete (up to 15 minutes on a 15m chart).
+      // PERF (2026-07-30): the message now CARRIES the upserted rows (`rows`) so web clients
+      // apply them incrementally instead of refetching the whole endpoint (the 1m interval is a
+      // ~2MB response — every live fire used to trigger a full re-download + re-filter in every
+      // open tab). Payload stays backward compatible: old consumers (iPhone) read only
+      // symbol/interval and refetch as before.
+      // OUTCOME-GUARD: broadcast the EFFECTIVE rows (rejected transitions carry the stored
+      // outcome/exit fields) so incremental tab updates can never display a rejected flip.
+      const bySymIv = new Map<string, typeof effective>();
+      for (const v of effective) {
+        const key = `${v.symbol}|${v.interval}`;
+        const arr = bySymIv.get(key);
+        if (arr) arr.push(v); else bySymIv.set(key, [v]);
+      }
+      for (const [key, rows] of bySymIv) {
+        const [symbol, interval] = key.split("|");
+        broadcast({ type: "signal_new", symbol, interval, rows });
+      }
+      // `inserted` = rows written (fresh + conflict updates, the historical meaning); `fresh` = new
+      // keys only; `admissionKeys` = new fires refused by admission (the live engine never orders them).
+      res.json({ ok: true, inserted: accepted.length, skipped, collisions: collisionKeys.length, collisionKeys, fresh: freshInserts, admissionRejected: admissionRejected.length, admissionKeys: admissionRejected });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // DELETE /api/signals/history — retract a persisted forming-bar (intra-candle) signal whose
+  // reaction cancelled before the bar closed (B2). Keyed by the natural unique index
+  // (symbol, interval, timestamp, direction). Broadcasts `signal_removed` so every consumer
+  // (terminal chart + Signals tab) drops the retracted signal immediately.
+  app.delete("/api/signals/history", async (req, res) => {
+    const { symbol, interval, timestamp, direction } = req.body as {
+      symbol?: string; interval?: string; timestamp?: number; direction?: string;
+    };
+    if (!symbol || !interval || !Number.isFinite(timestamp) || !direction) {
+      res.status(400).json({ error: "symbol, interval, timestamp, direction required" });
+      return;
+    }
+    try {
+      const sym = normalizeSignalSymbol(symbol);
+      const result = await db.delete(signalHistory).where(and(
+        eq(signalHistory.symbol, sym),
+        eq(signalHistory.interval, interval),
+        eq(signalHistory.timestamp, timestamp as number),
+        eq(signalHistory.direction, direction),
+      ));
+      const deleted = Number((result as any)?.changes ?? 0);
+      if (deleted > 0) broadcast({ type: "signal_removed", symbol: sym, interval, timestamp, direction });
+      res.json({ ok: true, deleted });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/signals/resync-broadcast — admin nudge fired by the regen harness AFTER a bulk
+  // --persist wipe+reinsert of signal_history (2026-07-30). Incremental WS updates cannot convey
+  // a mass replacement: the wipe runs on the harness's OWN DB connection (no signal_removed per
+  // row) and signal_new broadcasts are additive-only, so open tabs keep pre-regen rows forever.
+  // Broadcasts `signals_resync`; useTerminalData/SignalsView answer with a FULL signals refetch.
+  // Guarded/no-op-safe: broadcast() is a no-op with no WS server or zero clients, and a spurious
+  // call only costs each client one refetch of an endpoint it polls anyway.
+  app.post("/api/signals/resync-broadcast", (req, res) => {
+    const symRaw = (req.body as { symbol?: string } | undefined)?.symbol;
+    const symbol = typeof symRaw === "string" && symRaw.trim() ? normalizeSignalSymbol(symRaw) : undefined;
+    broadcast({ type: "signals_resync", ...(symbol ? { symbol } : {}) });
+    res.json({ ok: true, ...(symbol ? { symbol } : {}) });
   });
 
   // ── Live Edits — Claude-powered in-app code editor ───────────────────────
@@ -3110,16 +3778,22 @@ Critical rules:
   });
 
   // ── Strategy Guard routes ─────────────────────────────────────────────────
-  app.get("/api/strategies", (_req, res) => {
-    const { strategyGuard } = require("./strategy-guard");
-    res.json({ strategies: strategyGuard.getAll(), status: strategyGuard.getStatus() });
+  // AUDIT FIX (2026-08-12): `require()` is undefined under tsx ESM — both routes 500'd on
+  // ReferenceErrors (market.tsx consumes /api/strategies). Lazy-load via dynamic import.
+  app.get("/api/strategies", async (_req, res) => {
+    try {
+      const { strategyGuard } = await import("./strategy-guard");
+      res.json({ strategies: strategyGuard.getAll(), status: strategyGuard.getStatus() });
+    } catch (err: any) { res.status(500).json({ error: err.message }); }
   });
 
-  app.post("/api/strategies/check-mention", (req, res) => {
-    const { detectStrategyMention } = require("./strategy-aware-middleware");
-    const { prompt } = req.body ?? {};
-    if (!prompt) return res.json({ triggered: false, matchedStrategies: [] });
-    res.json(detectStrategyMention(String(prompt)));
+  app.post("/api/strategies/check-mention", async (req, res) => {
+    try {
+      const { detectStrategyMention } = await import("./strategy-aware-middleware");
+      const { prompt } = req.body ?? {};
+      if (!prompt) return res.json({ triggered: false, matchedStrategies: [] });
+      res.json(detectStrategyMention(String(prompt)));
+    } catch (err: any) { res.status(500).json({ error: err.message }); }
   });
 
   app.post("/api/strategies/:id/update", (req, res) => {
@@ -3190,14 +3864,13 @@ Critical rules:
   });
 
   // ── Learning engine routes ─────────────────────────────────────────────────
+  // SIGNAL-INTEGRITY (A1, 2026-07-14): backfillSignals is DELETED. It regenerated signal_history
+  // rows with the RETIRED close-vs-vector model (cooldown 10, fixed 8/16/5 exits, signalType
+  // "confluence", NULL label, no 15:15 gate) — a fabrication path reachable from three UI buttons.
+  // The route stays as a deprecation stub so old clients don't 404; it writes NOTHING.
+  // shared/fact-engine.ts is the ONLY legitimate signal source.
   app.post("/api/learn/backfill", async (_req, res) => {
-    try {
-      const { backfillSignals } = await import("./learn-engine");
-      const result = await backfillSignals();
-      res.json(result);
-    } catch (err: any) {
-      res.status(500).json({ error: String(err?.message ?? err) });
-    }
+    res.json({ inserted: 0, skipped: 0, deprecated: true, note: "backfill retired — signals come only from the fact engine" });
   });
 
   app.post("/api/learn/run", async (_req, res) => {
@@ -3477,10 +4150,11 @@ Critical rules:
 
   // GET /api/mc-calibration — return exit_strategy_calibration.json for the MC tab
   app.get("/api/mc-calibration", (_req, res) => {
+    // AUDIT FIX (2026-08-12): `__dirname` is undefined under tsx ESM — the route 500'd on a
+    // ReferenceError before it could return its documented null. cwd is the canonical root
+    // (boot guard) — the only sensible candidate.
     const candidates = [
       path.join(process.cwd(), "exit_strategy_calibration.json"),
-      path.join(__dirname, "..", "exit_strategy_calibration.json"),
-      path.join(__dirname, "exit_strategy_calibration.json"),
     ];
     const filePath = candidates.find(p => fs.existsSync(p));
     if (!filePath) {
@@ -3516,6 +4190,26 @@ Critical rules:
       .then(n => { if (n > 0) console.log(`[yahoo-backfill] ${sym}: +${n} bars`); })
       .catch(err => console.error(`[yahoo-backfill] ${sym} error:`, err?.message ?? err));
   }
+
+  // YAHOO-FALLBACK: continuous ES=F 1m live-poll while NO MW study connection exists — keeps
+  // MES candles advancing (~1min delayed) + the engine evaluating when MotiveWave is closed.
+  // Yields to MW the moment any study connects (server/yahoo-live.ts).
+  startYahooLiveFallback().catch(err => console.error("[yahoo-live] failed to arm:", err?.message ?? err));
+  // CONTRACT GUARD (2026-09-17): pairs MW's 1m closes with Yahoo's front month; a constant
+  // ≥10-pt offset = wrong contract month → MW quarantined, Yahoo drives, orders blocked.
+  try { startContractGuard(); } catch (err: any) { console.error("[contract-guard] failed to arm:", err?.message ?? err); }
+
+  // CONTRACT GUARD: heal a window two contract months interleaved (the 2026-09-14→17 incident).
+  // Body {fromTs?: epochSec, apply?: boolean}. apply defaults FALSE (dry run) — look first.
+  app.post("/api/data/roll-mismatch-repair", async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { fromTs?: number; apply?: boolean };
+      const report = await repairRollMismatch({ fromTs: Number.isFinite(body.fromTs) ? Number(body.fromTs) : undefined, apply: body.apply === true });
+      res.json(report);
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
 
   return httpServer;
 }

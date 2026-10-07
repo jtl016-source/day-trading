@@ -264,8 +264,9 @@ export default function BacktestScreen() {
                           </View>
                           <View style={s.sigLevels}>
                             <LvlCell label="ENTRY" value={sig.price.toFixed(2)} color={Trading.text} />
-                            <LvlCell label="TP1"   value={sig.tp1.toFixed(2)}   color={Trading.long} />
-                            <LvlCell label="TP2"   value={sig.tp2.toFixed(2)}   color='#16a34a' />
+                            <LvlCell label={sig.tp2 != null ? "TP1" : "TP"} value={sig.tp1.toFixed(2)} color={Trading.long} />
+                            {/* TP1-ONLY (2026-08-13): tp2 null on all post-policy signals */}
+                            {sig.tp2 != null && <LvlCell label="TP2" value={sig.tp2.toFixed(2)} color='#16a34a' />}
                             <LvlCell label="SL"    value={sig.sl.toFixed(2)}    color={Trading.short} />
                             {sig.points != null && (
                               <LvlCell label="PTS" value={fmtPts(sig.points)}

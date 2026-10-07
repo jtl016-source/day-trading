@@ -1,0 +1,702 @@
+{
+  "symbol": "MES",
+  "generatedAt": "2026-07-14T02:20:24.429Z",
+  "formula": "settle+-mean60mExt50",
+  "strategy": {
+    "entry": "first C-interval candle closing outside the yellow box during RTH (close time in (09:30,17:00] ET); long above / short below; one trade/day/interval",
+    "confirmation60mNote": "60m bars are :00-UTC-aligned; the first eligible 60m candle spans the open (09:00-10:00 ET) and is evaluated at its 10:00 close",
+    "stop": "opposite yellow-box edge",
+    "tp1": "init res (long) / init sup (short)",
+    "exitResolution": "1m bars; SL-first within-bar (conservative); EOD force-exit at day settle",
+    "modelB": "half at TP1, runner half targets max range with BE stop (BE-first within-bar); EOD applies",
+    "entryBeyondTp1": "TP1 unit fills at market=entry (pnl 0), runner proceeds",
+    "skipRule": "days with < 360/450 RTH 1m bars skipped"
+  },
+  "window": {
+    "firstTested": "2019-10-15",
+    "lastTested": "2026-07-13",
+    "daysTested": 1676
+  },
+  "runtimeSec": 5.53,
+  "perInterval": [
+    {
+      "interval": "1m",
+      "daysTested": 1676,
+      "trades": 1676,
+      "noSignalDays": 0,
+      "noSignalPct": 0,
+      "tp1Count": 1272,
+      "slCount": 371,
+      "eodCount": 33,
+      "tp1Rate": 75.89,
+      "slRate": 22.14,
+      "eodRate": 1.97,
+      "entryBeyondTp1Count": 678,
+      "avgWinPts": 8.08,
+      "avgLossPts": -15.4,
+      "expectancyPts": -0.67,
+      "cumPts": -1121.05,
+      "profitFactor": 0.81,
+      "maxDrawdownPts": 1241.07,
+      "longCount": 931,
+      "longWinRate": 34.16,
+      "shortCount": 745,
+      "shortWinRate": 38.66,
+      "medianEntryTimeET": "09:31",
+      "runnerMaxRangeCount": 46,
+      "runnerBECount": 1119,
+      "runnerEodCount": 107,
+      "runnerMaxRangeRate": 3.62,
+      "runnerBERate": 87.97,
+      "combinedExpectancyPts": -0.71,
+      "combinedCumPts": -1197.39
+    },
+    {
+      "interval": "5m",
+      "daysTested": 1676,
+      "trades": 1676,
+      "noSignalDays": 0,
+      "noSignalPct": 0,
+      "tp1Count": 1289,
+      "slCount": 349,
+      "eodCount": 38,
+      "tp1Rate": 76.91,
+      "slRate": 20.82,
+      "eodRate": 2.27,
+      "entryBeyondTp1Count": 688,
+      "avgWinPts": 7.77,
+      "avgLossPts": -15.85,
+      "expectancyPts": -0.69,
+      "cumPts": -1160.45,
+      "profitFactor": 0.8,
+      "maxDrawdownPts": 1255.51,
+      "longCount": 924,
+      "longWinRate": 34.63,
+      "shortCount": 752,
+      "shortWinRate": 39.1,
+      "medianEntryTimeET": "09:35",
+      "runnerMaxRangeCount": 47,
+      "runnerBECount": 1129,
+      "runnerEodCount": 113,
+      "runnerMaxRangeRate": 3.65,
+      "runnerBERate": 87.59,
+      "combinedExpectancyPts": -0.75,
+      "combinedCumPts": -1263.44
+    },
+    {
+      "interval": "15m",
+      "daysTested": 1676,
+      "trades": 1675,
+      "noSignalDays": 1,
+      "noSignalPct": 0.06,
+      "tp1Count": 1309,
+      "slCount": 314,
+      "eodCount": 52,
+      "tp1Rate": 78.15,
+      "slRate": 18.75,
+      "eodRate": 3.1,
+      "entryBeyondTp1Count": 724,
+      "avgWinPts": 7.24,
+      "avgLossPts": -15.69,
+      "expectancyPts": -0.64,
+      "cumPts": -1074.15,
+      "profitFactor": 0.8,
+      "maxDrawdownPts": 1290.96,
+      "longCount": 936,
+      "longWinRate": 35.58,
+      "shortCount": 739,
+      "shortWinRate": 36.54,
+      "medianEntryTimeET": "09:45",
+      "runnerMaxRangeCount": 52,
+      "runnerBECount": 1140,
+      "runnerEodCount": 117,
+      "runnerMaxRangeRate": 3.97,
+      "runnerBERate": 87.09,
+      "combinedExpectancyPts": -0.59,
+      "combinedCumPts": -990.1
+    },
+    {
+      "interval": "60m",
+      "daysTested": 1676,
+      "trades": 1670,
+      "noSignalDays": 6,
+      "noSignalPct": 0.36,
+      "tp1Count": 1335,
+      "slCount": 262,
+      "eodCount": 73,
+      "tp1Rate": 79.94,
+      "slRate": 15.69,
+      "eodRate": 4.37,
+      "entryBeyondTp1Count": 813,
+      "avgWinPts": 6.8,
+      "avgLossPts": -15.16,
+      "expectancyPts": -0.55,
+      "cumPts": -910.37,
+      "profitFactor": 0.8,
+      "maxDrawdownPts": 1061.69,
+      "longCount": 935,
+      "longWinRate": 31.44,
+      "shortCount": 735,
+      "shortWinRate": 34.56,
+      "medianEntryTimeET": "10:00",
+      "runnerMaxRangeCount": 49,
+      "runnerBECount": 1182,
+      "runnerEodCount": 104,
+      "runnerMaxRangeRate": 3.67,
+      "runnerBERate": 88.54,
+      "combinedExpectancyPts": -0.52,
+      "combinedCumPts": -873.42
+    }
+  ],
+  "perYear5m": [
+    {
+      "year": "2019",
+      "trades": 52,
+      "winRatePct": 40.38,
+      "cumPts": -45.48
+    },
+    {
+      "year": "2020",
+      "trades": 248,
+      "winRatePct": 37.9,
+      "cumPts": 6.87
+    },
+    {
+      "year": "2021",
+      "trades": 251,
+      "winRatePct": 37.05,
+      "cumPts": -82.98
+    },
+    {
+      "year": "2022",
+      "trades": 250,
+      "winRatePct": 33.6,
+      "cumPts": -302.63
+    },
+    {
+      "year": "2023",
+      "trades": 248,
+      "winRatePct": 38.71,
+      "cumPts": -123.81
+    },
+    {
+      "year": "2024",
+      "trades": 249,
+      "winRatePct": 37.35,
+      "cumPts": -100.54
+    },
+    {
+      "year": "2025",
+      "trades": 247,
+      "winRatePct": 35.22,
+      "cumPts": -319.75
+    },
+    {
+      "year": "2026",
+      "trades": 131,
+      "winRatePct": 35.11,
+      "cumPts": -192.13
+    }
+  ],
+  "variants": {
+    "skipDegenerate": {
+      "rule": "a break closing at/beyond TP1 burns that side (no trade); only a later opposite-side valid break may trade; first-valid-break-only, one/day",
+      "perInterval": [
+        {
+          "interval": "1m",
+          "daysTested": 1676,
+          "trades": 1175,
+          "noSignalDays": 501,
+          "noSignalPct": 29.89,
+          "tp1Count": 688,
+          "slCount": 442,
+          "eodCount": 45,
+          "tp1Rate": 58.55,
+          "slRate": 37.62,
+          "eodRate": 3.83,
+          "entryBeyondTp1Count": 0,
+          "avgWinPts": 8.58,
+          "avgLossPts": -15.08,
+          "expectancyPts": -0.79,
+          "cumPts": -930.24,
+          "profitFactor": 0.87,
+          "maxDrawdownPts": 1077.05,
+          "longCount": 572,
+          "longWinRate": 62.41,
+          "shortCount": 603,
+          "shortWinRate": 58.37,
+          "medianEntryTimeET": "09:31",
+          "runnerMaxRangeCount": 46,
+          "runnerBECount": 510,
+          "runnerEodCount": 132,
+          "runnerMaxRangeRate": 6.69,
+          "runnerBERate": 74.13,
+          "combinedExpectancyPts": -0.9,
+          "combinedCumPts": -1062.64
+        },
+        {
+          "interval": "5m",
+          "daysTested": 1676,
+          "trades": 1156,
+          "noSignalDays": 520,
+          "noSignalPct": 31.03,
+          "tp1Count": 699,
+          "slCount": 404,
+          "eodCount": 53,
+          "tp1Rate": 60.47,
+          "slRate": 34.95,
+          "eodRate": 4.58,
+          "entryBeyondTp1Count": 0,
+          "avgWinPts": 8.12,
+          "avgLossPts": -15.54,
+          "expectancyPts": -0.79,
+          "cumPts": -907.91,
+          "profitFactor": 0.87,
+          "maxDrawdownPts": 1089.54,
+          "longCount": 566,
+          "longWinRate": 64.66,
+          "shortCount": 590,
+          "shortWinRate": 60.17,
+          "medianEntryTimeET": "09:35",
+          "runnerMaxRangeCount": 45,
+          "runnerBECount": 517,
+          "runnerEodCount": 137,
+          "runnerMaxRangeRate": 6.44,
+          "runnerBERate": 73.96,
+          "combinedExpectancyPts": -0.82,
+          "combinedCumPts": -949.44
+        },
+        {
+          "interval": "15m",
+          "daysTested": 1676,
+          "trades": 1089,
+          "noSignalDays": 587,
+          "noSignalPct": 35.02,
+          "tp1Count": 678,
+          "slCount": 343,
+          "eodCount": 68,
+          "tp1Rate": 62.26,
+          "slRate": 31.5,
+          "eodRate": 6.24,
+          "entryBeyondTp1Count": 0,
+          "avgWinPts": 7.46,
+          "avgLossPts": -15.34,
+          "expectancyPts": -0.61,
+          "cumPts": -667.93,
+          "profitFactor": 0.89,
+          "maxDrawdownPts": 1001.79,
+          "longCount": 564,
+          "longWinRate": 66.84,
+          "shortCount": 525,
+          "shortWinRate": 61.9,
+          "medianEntryTimeET": "09:45",
+          "runnerMaxRangeCount": 47,
+          "runnerBECount": 494,
+          "runnerEodCount": 137,
+          "runnerMaxRangeRate": 6.93,
+          "runnerBERate": 72.86,
+          "combinedExpectancyPts": -0.55,
+          "combinedCumPts": -597.55
+        },
+        {
+          "interval": "60m",
+          "daysTested": 1676,
+          "trades": 956,
+          "noSignalDays": 720,
+          "noSignalPct": 42.96,
+          "tp1Count": 580,
+          "slCount": 283,
+          "eodCount": 93,
+          "tp1Rate": 60.67,
+          "slRate": 29.6,
+          "eodRate": 9.73,
+          "entryBeyondTp1Count": 0,
+          "avgWinPts": 6.98,
+          "avgLossPts": -15.09,
+          "expectancyPts": -0.8,
+          "cumPts": -769.07,
+          "profitFactor": 0.85,
+          "maxDrawdownPts": 976.89,
+          "longCount": 484,
+          "longWinRate": 65.7,
+          "shortCount": 472,
+          "shortWinRate": 62.29,
+          "medianEntryTimeET": "10:00",
+          "runnerMaxRangeCount": 35,
+          "runnerBECount": 425,
+          "runnerEodCount": 120,
+          "runnerMaxRangeRate": 6.03,
+          "runnerBERate": 73.28,
+          "combinedExpectancyPts": -0.82,
+          "combinedCumPts": -788.23
+        }
+      ]
+    },
+    "openInsideBox": {
+      "rule": "only days whose 09:30 ET RTH open prints inside the yellow box (base entry rule applies on those days)",
+      "daysPassing": 377,
+      "daysPassingPct": 22.49,
+      "perInterval": [
+        {
+          "interval": "1m",
+          "daysTested": 377,
+          "trades": 377,
+          "noSignalDays": 0,
+          "noSignalPct": 0,
+          "tp1Count": 182,
+          "slCount": 178,
+          "eodCount": 17,
+          "tp1Rate": 48.28,
+          "slRate": 47.21,
+          "eodRate": 4.51,
+          "entryBeyondTp1Count": 3,
+          "avgWinPts": 10.72,
+          "avgLossPts": -14.07,
+          "expectancyPts": -1.62,
+          "cumPts": -611.85,
+          "profitFactor": 0.77,
+          "maxDrawdownPts": 661.25,
+          "longCount": 197,
+          "longWinRate": 53.3,
+          "shortCount": 180,
+          "shortWinRate": 45.56,
+          "medianEntryTimeET": "09:36",
+          "runnerMaxRangeCount": 20,
+          "runnerBECount": 116,
+          "runnerEodCount": 46,
+          "runnerMaxRangeRate": 10.99,
+          "runnerBERate": 63.74,
+          "combinedExpectancyPts": -1.32,
+          "combinedCumPts": -499.32
+        },
+        {
+          "interval": "5m",
+          "daysTested": 377,
+          "trades": 377,
+          "noSignalDays": 0,
+          "noSignalPct": 0,
+          "tp1Count": 206,
+          "slCount": 151,
+          "eodCount": 20,
+          "tp1Rate": 54.64,
+          "slRate": 40.05,
+          "eodRate": 5.31,
+          "entryBeyondTp1Count": 15,
+          "avgWinPts": 9.61,
+          "avgLossPts": -14.85,
+          "expectancyPts": -1.35,
+          "cumPts": -507.42,
+          "profitFactor": 0.79,
+          "maxDrawdownPts": 554.35,
+          "longCount": 200,
+          "longWinRate": 57,
+          "shortCount": 177,
+          "shortWinRate": 48.02,
+          "medianEntryTimeET": "09:40",
+          "runnerMaxRangeCount": 17,
+          "runnerBECount": 135,
+          "runnerEodCount": 54,
+          "runnerMaxRangeRate": 8.25,
+          "runnerBERate": 65.53,
+          "combinedExpectancyPts": -1.07,
+          "combinedCumPts": -403.2
+        },
+        {
+          "interval": "15m",
+          "daysTested": 377,
+          "trades": 376,
+          "noSignalDays": 1,
+          "noSignalPct": 0.27,
+          "tp1Count": 230,
+          "slCount": 122,
+          "eodCount": 24,
+          "tp1Rate": 61.17,
+          "slRate": 32.45,
+          "eodRate": 6.38,
+          "entryBeyondTp1Count": 38,
+          "avgWinPts": 8.67,
+          "avgLossPts": -15.02,
+          "expectancyPts": -0.78,
+          "cumPts": -291.49,
+          "profitFactor": 0.86,
+          "maxDrawdownPts": 540.1,
+          "longCount": 211,
+          "longWinRate": 56.4,
+          "shortCount": 165,
+          "shortWinRate": 50.3,
+          "medianEntryTimeET": "10:00",
+          "runnerMaxRangeCount": 17,
+          "runnerBECount": 157,
+          "runnerEodCount": 56,
+          "runnerMaxRangeRate": 7.39,
+          "runnerBERate": 68.26,
+          "combinedExpectancyPts": -0.48,
+          "combinedCumPts": -179.07
+        },
+        {
+          "interval": "60m",
+          "daysTested": 377,
+          "trades": 372,
+          "noSignalDays": 5,
+          "noSignalPct": 1.33,
+          "tp1Count": 244,
+          "slCount": 94,
+          "eodCount": 34,
+          "tp1Rate": 65.59,
+          "slRate": 25.27,
+          "eodRate": 9.14,
+          "entryBeyondTp1Count": 78,
+          "avgWinPts": 7.06,
+          "avgLossPts": -14.85,
+          "expectancyPts": -1.02,
+          "cumPts": -377.86,
+          "profitFactor": 0.77,
+          "maxDrawdownPts": 495.36,
+          "longCount": 210,
+          "longWinRate": 51.43,
+          "shortCount": 162,
+          "shortWinRate": 44.44,
+          "medianEntryTimeET": "10:00",
+          "runnerMaxRangeCount": 10,
+          "runnerBECount": 193,
+          "runnerEodCount": 41,
+          "runnerMaxRangeRate": 4.1,
+          "runnerBERate": 79.1,
+          "combinedExpectancyPts": -0.87,
+          "combinedCumPts": -324.24
+        }
+      ]
+    },
+    "overlap": {
+      "openInsideBoxDays": 377,
+      "openInsideBoxDaysPct": 22.49,
+      "perInterval": [
+        {
+          "interval": "1m",
+          "skipDegenerateValidTradeDaysPct": 70.11,
+          "bothFiltersPct": 22.43
+        },
+        {
+          "interval": "5m",
+          "skipDegenerateValidTradeDaysPct": 68.97,
+          "bothFiltersPct": 21.9
+        },
+        {
+          "interval": "15m",
+          "skipDegenerateValidTradeDaysPct": 64.98,
+          "bothFiltersPct": 20.76
+        },
+        {
+          "interval": "60m",
+          "skipDegenerateValidTradeDaysPct": 57.04,
+          "bothFiltersPct": 18.08
+        }
+      ]
+    },
+    "perYear5mBestPF": {
+      "variant": "skipDegenerate",
+      "pf5m": {
+        "skipDegenerate": 0.87,
+        "openInsideBox": 0.79
+      },
+      "rows": [
+        {
+          "year": "2019",
+          "trades": 40,
+          "winRatePct": 52.5,
+          "cumPts": -45.48
+        },
+        {
+          "year": "2020",
+          "trades": 157,
+          "winRatePct": 67.52,
+          "cumPts": 8.97
+        },
+        {
+          "year": "2021",
+          "trades": 172,
+          "winRatePct": 62.79,
+          "cumPts": -66.16
+        },
+        {
+          "year": "2022",
+          "trades": 175,
+          "winRatePct": 62.29,
+          "cumPts": -114.28
+        },
+        {
+          "year": "2023",
+          "trades": 181,
+          "winRatePct": 60.22,
+          "cumPts": -139.69
+        },
+        {
+          "year": "2024",
+          "trades": 173,
+          "winRatePct": 61.85,
+          "cumPts": -146.75
+        },
+        {
+          "year": "2025",
+          "trades": 169,
+          "winRatePct": 61.54,
+          "cumPts": -251.89
+        },
+        {
+          "year": "2026",
+          "trades": 89,
+          "winRatePct": 64.04,
+          "cumPts": -152.63
+        }
+      ]
+    }
+  },
+  "sanity": [
+    {
+      "date": "2026-07-10",
+      "ours": {
+        "ybBottom": 7577.01,
+        "ybTop": 7595.04,
+        "initRes": 7615.72,
+        "initSup": 7559,
+        "mrUp": 7671.15,
+        "mrDn": 7483.88,
+        "nrDn": 7519.25,
+        "mtUp": 7690.53
+      },
+      "renderer": {
+        "ybBottom": 7577.01,
+        "ybTop": 7595.04,
+        "initRes": 7615.72,
+        "initSup": 7559,
+        "mrUp": 7671.15,
+        "mrDn": 7483.88,
+        "nrDn": 7519.25,
+        "mtUp": 7690.53
+      },
+      "exactMatch": true
+    },
+    {
+      "date": "2026-07-13",
+      "ours": {
+        "ybBottom": 7616.51,
+        "ybTop": 7634.53,
+        "initRes": 7655.22,
+        "initSup": 7595.01,
+        "mrUp": 7710.65,
+        "mrDn": 7523.38,
+        "nrDn": 7558.75,
+        "mtUp": 7730.03
+      },
+      "renderer": {
+        "ybBottom": 7616.51,
+        "ybTop": 7634.53,
+        "initRes": 7655.22,
+        "initSup": 7595.01,
+        "mrUp": 7710.65,
+        "mrDn": 7523.38,
+        "nrDn": 7558.75,
+        "mtUp": 7730.03
+      },
+      "exactMatch": true
+    }
+  ],
+  "spotChecks": [
+    {
+      "date": "2021-06-29",
+      "interval": "5m",
+      "dir": "long",
+      "box": "4276.81-4284.91",
+      "tp1": 4291.54,
+      "sl": 4276.81,
+      "runnerTarget": 4321.59,
+      "settle": 4284.25,
+      "entryCandleCloseET": "09:35",
+      "entryTimeUtc": "2021-06-29T13:35:00Z",
+      "entry": 4288,
+      "modelA": {
+        "exit": "eod",
+        "price": 4284.25,
+        "pnl": -3.75
+      },
+      "modelB": {
+        "runner": null,
+        "runnerPnl": null,
+        "combinedPnl": -3.75
+      }
+    },
+    {
+      "date": "2020-05-22",
+      "interval": "5m",
+      "dir": "long",
+      "box": "2924.5-2948.69",
+      "tp1": 2964.35,
+      "sl": 2924.5,
+      "runnerTarget": 3055.36,
+      "settle": 2956.5,
+      "entryCandleCloseET": "14:10",
+      "entryTimeUtc": "2020-05-22T18:10:00Z",
+      "entry": 2949.5,
+      "modelA": {
+        "exit": "eod",
+        "price": 2956.5,
+        "pnl": 7
+      },
+      "modelB": {
+        "runner": null,
+        "runnerPnl": null,
+        "combinedPnl": 7
+      }
+    },
+    {
+      "date": "2023-09-05",
+      "interval": "5m",
+      "dir": "short",
+      "box": "4514.65-4523.17",
+      "tp1": 4508.01,
+      "sl": 4523.17,
+      "runnerTarget": 4480.09,
+      "settle": 4500.5,
+      "entryCandleCloseET": "09:40",
+      "entryTimeUtc": "2023-09-05T13:40:00Z",
+      "entry": 4511,
+      "modelA": {
+        "exit": "tp1",
+        "price": 4508.01375,
+        "pnl": 2.99
+      },
+      "modelB": {
+        "runner": "be",
+        "runnerPnl": 0,
+        "combinedPnl": 1.49
+      }
+    }
+  ],
+  "skippedDaysByYear": {
+    "2019": {
+      "insufficientHistory": 51,
+      "incomplete1m": 3
+    },
+    "2020": {
+      "incomplete1m": 11
+    },
+    "2021": {
+      "incomplete1m": 8
+    },
+    "2022": {
+      "incomplete1m": 8
+    },
+    "2023": {
+      "incomplete1m": 10
+    },
+    "2024": {
+      "incomplete1m": 10
+    },
+    "2025": {
+      "incomplete1m": 11
+    },
+    "2026": {
+      "incomplete1m": 6
+    }
+  }
+}

@@ -115,7 +115,21 @@ export default function TradeScreen() {
         try {
           const pr = await fetch(`${apiBaseUrl}/api/live/bar/${encodeURIComponent(tr.symbol)}`);
           const pd = await pr.json();
-          const p = typeof pd?.price === 'number' ? pd.price : (typeof pd?.bar?.close === 'number' ? pd.bar.close : null);
+          // BRACKET BASIS (2026-09-18, contract guard). /api/live/bar now answers
+          // {bar, price, rawPrice?, offsetPts?, stale?}: `price` / `bar` are CHART basis (the
+          // front-month equivalent — MotiveWave's print + the measured roll spread while its
+          // chart is on the wrong month), `rawPrice` is MotiveWave's OWN basis and is present only
+          // while that translation is active. The bracket (entry / tp / sl) was worked in
+          // MotiveWave's basis, so the progress readout must compare like with like — against the
+          // chart-basis price it sat a whole roll spread (~66 pts) off: "TARGET REACHED" on an
+          // untouched trade, or a TP leg that never fills. rawPrice when present; if translation
+          // is on but no raw tick exists yet, un-shift the chart-basis value by offsetPts.
+          // On-contract the fields are absent and this is the old read. ({stale:true} → no price
+          // at all: keep the last one rather than show a wrong-month number.)
+          const off = typeof pd?.offsetPts === 'number' && Number.isFinite(pd.offsetPts) ? pd.offsetPts : 0;
+          const p = typeof pd?.rawPrice === 'number' && Number.isFinite(pd.rawPrice) && pd.rawPrice > 0 ? pd.rawPrice
+            : typeof pd?.price === 'number' ? pd.price - off
+            : (typeof pd?.bar?.close === 'number' ? pd.bar.close - off : null);
           if (p != null) setPrice(p);
         } catch {}
       } else {
@@ -186,7 +200,7 @@ function NoTrade() {
 function TradeCard({ trade, isLong, elapsed, price, apiBaseUrl }: { trade: CurrentTrade; isLong: boolean; elapsed: number; price: number | null; apiBaseUrl: string }) {
   const slPts  = Math.abs(trade.entry - trade.sl);
   const tp1Pts = Math.abs(trade.entry - trade.tp1);
-  const tp2Pts = Math.abs(trade.entry - trade.tp2);
+  const tp2Pts = Math.abs(trade.entry - (trade.tp2 ?? trade.tp1)); // TP1-only: tp2 may be null (rr2 unused then)
   const rr1    = slPts > 0 ? (tp1Pts / slPts).toFixed(1) : '—';
   const rr2    = slPts > 0 ? (tp2Pts / slPts).toFixed(1) : '—';
   const sc     = statusColor(trade.status);
@@ -250,7 +264,7 @@ function TradeCard({ trade, isLong, elapsed, price, apiBaseUrl }: { trade: Curre
         {/* R:R row */}
         <View style={t.rrRow}>
           <View style={t.rrChip}><Text style={t.rrText}>R:R  1 : {rr1}</Text></View>
-          {!trade.tp1Only && (
+          {!trade.tp1Only && trade.tp2 != null && (
             <View style={t.rrChip}><Text style={t.rrText}>TP2  1 : {rr2}  ·  {trade.tp2.toFixed(2)}</Text></View>
           )}
           {trade.tp1Only && <Text style={[t.rrText, { color: Trading.risky }]}>TP1-only mode</Text>}
@@ -281,7 +295,7 @@ function TradeCard({ trade, isLong, elapsed, price, apiBaseUrl }: { trade: Curre
 function NextTargetCard({ trade, isLong, price }: { trade: CurrentTrade; isLong: boolean; price: number | null }) {
   const tp1Hit = trade.status === 'tp1_hit' || trade.status === 'tp2_hit';
   const targetingTp2 = tp1Hit && !trade.tp1Only;
-  const nextTp = targetingTp2 ? trade.tp2 : trade.tp1;
+  const nextTp = (targetingTp2 ? trade.tp2 : trade.tp1) ?? trade.tp1; // TP1-only: tp2 may be null
   const nextLabel = targetingTp2 ? 'TP2' : 'TP1';
   const cur = price ?? trade.entry;
   // Progress measured from ENTRY → next TP (full leg), clamped 0–100.
@@ -316,8 +330,10 @@ function NextTargetCard({ trade, isLong, price }: { trade: CurrentTrade; isLong:
 
 // ── Horizontal price track ────────────────────────────────────────────────────
 function PositionTrack({ trade, isLong }: { trade: CurrentTrade; isLong: boolean }) {
-  const lo    = Math.min(trade.sl, trade.tp2, trade.entry) - 1;
-  const hi    = Math.max(trade.sl, trade.tp2, trade.entry) + 1;
+  // TP1-only: tp2 null coerces to 0 inside Math.min and destroyed the track's scale.
+  const tpFar = trade.tp2 ?? trade.tp1;
+  const lo    = Math.min(trade.sl, tpFar, trade.tp1, trade.entry) - 1;
+  const hi    = Math.max(trade.sl, tpFar, trade.tp1, trade.entry) + 1;
   const range = hi - lo || 1;
   const pct   = (v: number) => Math.max(0, Math.min(100, ((v - lo) / range) * 100));
 
@@ -342,7 +358,7 @@ function PositionTrack({ trade, isLong }: { trade: CurrentTrade; isLong: boolean
           backgroundColor: Trading.long + '22',
         }]} />
         {/* Reward fill (TP2) */}
-        {!trade.tp1Only && (
+        {!trade.tp1Only && trade.tp2 != null && (
           <View style={[pt.fill, {
             left: `${Math.min(pct(trade.tp1), pct(trade.tp2))}%` as any,
             width: `${Math.abs(pct(trade.tp2) - pct(trade.tp1))}%` as any,
@@ -354,7 +370,7 @@ function PositionTrack({ trade, isLong }: { trade: CurrentTrade; isLong: boolean
           { label: 'SL',    price: trade.sl,    color: slHit  ? Trading.short : Trading.short + '99', filled: slHit },
           { label: 'Entry', price: trade.entry,  color: Trading.text },
           { label: 'TP1',   price: trade.tp1,    color: tp1Hit ? Trading.long : Trading.long + '99',   filled: tp1Hit },
-          ...(!trade.tp1Only ? [{ label: 'TP2', price: trade.tp2, color: tp2Hit ? Trading.long : Trading.long + '66', filled: tp2Hit }] : []),
+          ...(!trade.tp1Only && trade.tp2 != null ? [{ label: 'TP2', price: trade.tp2, color: tp2Hit ? Trading.long : Trading.long + '66', filled: tp2Hit }] : []),
         ].map(m => (
           <View key={m.label} style={[pt.marker, { left: `${pct(m.price)}%` as any, borderColor: m.color }]}>
             {(m as any).filled && <View style={[pt.markerFill, { backgroundColor: m.color }]} />}
@@ -364,9 +380,9 @@ function PositionTrack({ trade, isLong }: { trade: CurrentTrade; isLong: boolean
       </View>
       {/* Legend */}
       <View style={pt.legend}>
-        <Text style={[pt.legendPrice, { color: Trading.short, fontFamily: Fonts?.mono }]}>{Math.min(trade.sl, trade.tp2).toFixed(2)}</Text>
+        <Text style={[pt.legendPrice, { color: Trading.short, fontFamily: Fonts?.mono }]}>{Math.min(trade.sl, tpFar).toFixed(2)}</Text>
         <Text style={[pt.legendPrice, { color: Trading.text,  fontFamily: Fonts?.mono }]}>{trade.entry.toFixed(2)}</Text>
-        <Text style={[pt.legendPrice, { color: Trading.long,  fontFamily: Fonts?.mono }]}>{Math.max(trade.tp1, trade.tp2).toFixed(2)}</Text>
+        <Text style={[pt.legendPrice, { color: Trading.long,  fontFamily: Fonts?.mono }]}>{Math.max(trade.tp1, tpFar).toFixed(2)}</Text>
       </View>
     </View>
   );

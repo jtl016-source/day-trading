@@ -2,49 +2,65 @@
 // lo / ATR-14) + the active-strategies strip. The chart itself is the full-screen
 // background (TerminalLiveChart), so this panel floats over it. All numbers are derived
 // from REAL candles.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { C } from "./terminalStyles";
 import { Ico } from "./icons";
 import { STRATS } from "./strategyMeta";
 import { marketSession } from "./Clock";
-import type { TerminalCandle } from "@/hooks/useTerminalData";
+import type { TerminalCandle, TerminalGuard } from "@/hooks/useTerminalData";
 import type { StrategyToggles } from "@/lib/terminalSettings";
 
 // Persisted position + size of the floating market HUD (drag to move, corner to resize).
 const HUD_BOX_KEY = "meridian_hud_box";
 interface HudBox { x: number; y: number; w: number; h: number | null; hidden?: boolean }
 const DEFAULT_HUD_BOX: HudBox = { x: 240, y: 96, w: 560, h: null };
-function loadHudBox(): HudBox {
-  try { const r = localStorage.getItem(HUD_BOX_KEY); if (r) return { ...DEFAULT_HUD_BOX, ...JSON.parse(r) }; } catch { /* ignore */ }
-  return DEFAULT_HUD_BOX;
+/** OFF-SCREEN RECOVERY (2026-08-12 — same latent bug the THOUGHTS panel exposed): clamp the
+ *  persisted position to the CURRENT viewport on load, so a box saved on a wider screen (or
+ *  before a phone rotation) can never strand the panel/chip beyond the visible area. */
+function clampHudBox(b: HudBox): HudBox {
+  const maxX = Math.max(0, window.innerWidth - 90);
+  const maxY = Math.max(44, window.innerHeight - 70);
+  return { ...b, x: Math.min(Math.max(0, b.x), maxX), y: Math.min(Math.max(44, b.y), maxY) };
 }
+function loadHudBox(): HudBox {
+  try { const r = localStorage.getItem(HUD_BOX_KEY); if (r) return clampHudBox({ ...DEFAULT_HUD_BOX, ...JSON.parse(r) }); } catch { /* ignore */ }
+  return clampHudBox(DEFAULT_HUD_BOX);
+}
+
+// PERF (2026-09-18 — "laggy"): ONE module-level formatter. Intl.DateTimeFormat CONSTRUCTION is
+// ms-scale (the 2026-07-30 fmtEtTime lesson) and this ran on EVERY render — the HUD re-renders
+// on every live tick (lastPrice changes per tick).
+const _etClockFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+});
 
 /** Unix seconds at the most recent ET midnight (DST-safe). */
 function etDayStartSec(): number {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-  }).formatToParts(new Date());
+  const parts = _etClockFmt.formatToParts(new Date());
   const g = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
   return Math.floor(Date.now() / 1000) - (g("hour") * 3600 + g("minute") * 60 + g("second"));
 }
 
-/** Wilder ATR-14 on the supplied candles (returns null when too few bars). */
+/** Wilder ATR-14 on the supplied candles (returns null when too few bars).
+ *  PERF (2026-09-18): only the LAST 14 true ranges are averaged, so only the last 15 candles are
+ *  walked — the old form built a true-range array over the WHOLE dataset (100k+ bars with deep
+ *  history) on every render. Same 14 values summed in the same order → identical result. */
 function atr14(candles: TerminalCandle[]): number | null {
-  if (candles.length < 15) return null;
-  const trs: number[] = [];
-  for (let i = 1; i < candles.length; i++) {
+  const n = candles.length;
+  if (n < 15) return null;
+  let sum = 0;
+  for (let i = n - 14; i < n; i++) {
     const cur = candles[i], prev = candles[i - 1];
-    trs.push(Math.max(cur.h - cur.l, Math.abs(cur.h - prev.c), Math.abs(cur.l - prev.c)));
+    sum += Math.max(cur.h - cur.l, Math.abs(cur.h - prev.c), Math.abs(cur.l - prev.c));
   }
-  const last14 = trs.slice(-14);
-  return last14.reduce((a, b) => a + b, 0) / last14.length;
+  return sum / 14;
 }
 
 const INTERVALS = ["1m", "5m", "15m", "60m"] as const;
 
 export function MarketView({
-  symbol, candles, lastPrice, onReload, strategies, source, connected, feedStatus,
+  symbol, candles, lastPrice, onReload, strategies, source, connected, feedStatus, guard,
   interval, onIntervalChange,
 }: {
   symbol: string;
@@ -55,6 +71,8 @@ export function MarketView({
   source: string;
   connected?: boolean;
   feedStatus?: "live" | "stale" | "unknown";
+  /** CONTRACT GUARD state (useTerminalData `guard`, 2026-09-18) — null/undefined = unknown. */
+  guard?: TerminalGuard | null;
   interval: string;
   onIntervalChange: (iv: string) => void;
 }) {
@@ -62,24 +80,44 @@ export function MarketView({
   const has = n > 0;
   // HUD stats reflect TODAY's session. With a 600-bar scroll window the candle array can
   // span many days, so filter to today (ET); fall back to the last ~64 bars when today is empty.
-  const dayStart = etDayStartSec();
-  const today = has ? candles.filter((c) => c.time >= dayStart) : [];
-  const statBars = today.length ? today : candles.slice(-64);
-  const first = statBars.length ? statBars[0].o : 0;
+  // PERF (2026-09-18 — "laggy"): this HUD re-renders on EVERY live tick (lastPrice), and each
+  // render used to filter the whole candle array, spread today's bars into Math.max/min twice
+  // and rebuild the ATR true-range list — O(dataset) work per tick, 100k+ bars once deep history
+  // is loaded. The candle-derived stats are memoised on the array identity (it changes ≤8×/s,
+  // and not at all on a price-only render) and "today" is a binary search — the array is
+  // time-sorted — instead of a full filter. Same numbers as before.
+  const { hasStatBars, first, dayHi, dayLo, atr } = useMemo(() => {
+    const dayStart = etDayStartSec();
+    let lo = 0, hi = candles.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (candles[mid].time < dayStart) lo = mid + 1; else hi = mid; }
+    const statBars = lo < candles.length ? candles.slice(lo) : candles.slice(-64);
+    let mx = -Infinity, mn = Infinity;
+    for (const d of statBars) { if (d.h > mx) mx = d.h; if (d.l < mn) mn = d.l; }
+    return {
+      hasStatBars: statBars.length > 0,
+      first: statBars.length ? statBars[0].o : 0,
+      dayHi: statBars.length ? mx : 0,
+      dayLo: statBars.length ? mn : 0,
+      atr: atr14(candles),
+    };
+  }, [candles]);
   const last = lastPrice ?? (has ? candles[n - 1].c : 0);
-  const chg = statBars.length ? last - first : 0;
+  const chg = hasStatBars ? last - first : 0;
   const pct = first ? (chg / first) * 100 : 0;
   const up = chg >= 0;
-  const dayHi = statBars.length ? Math.max(...statBars.map((d) => d.h)) : 0;
-  const dayLo = statBars.length ? Math.min(...statBars.map((d) => d.l)) : 0;
-  const atr = atr14(candles);
   const active = STRATS.filter((s) => strategies[s.key]);
   const session = marketSession(); // "RTH" | "ETH" | "CLOSED" — full CME futures session
   // LIVE reflects the actual feed, NOT just RTH hours — futures stream in ETH too.
   // Live when the WS is connected, we have a real data source, and the server's MW
   // feed isn't reporting "stale". The "· RTH/ETH" suffix still shows the session.
   const hasSource = source !== "none" && source !== "";
-  const live = (connected ?? true) && hasSource && feedStatus !== "stale";
+  // CONTRACT GUARD (2026-09-18): MotiveWave off-contract with NO tick translation (roll pending /
+  // no trusted offset) means nothing MW sends reaches this chart — Yahoo's CME feed drives and
+  // it runs ~10 minutes behind. The WS is connected and the source is real, so the old rule read
+  // LIVE over a ten-minute-old candle. (While translation IS active the chart is tick-live on
+  // the front month, so that state stays LIVE.)
+  const yahooDriving = !!guard && guard.offContract && !guard.translationActive;
+  const live = (connected ?? true) && hasSource && feedStatus !== "stale" && !yahooDriving;
 
   // ── Draggable + resizable floating panel (position/size persisted) ──────────
   const hudRef = useRef<HTMLDivElement>(null);
@@ -160,7 +198,8 @@ export function MarketView({
       <div className="tt-mkt-head">
         <div className="tt-mkt-id">
           <div className="tt-mkt-sym">{symbol}<span className="tt-mkt-tag">FRONT MONTH · FUTURES</span></div>
-          <div className={"tt-live" + (live && session !== "CLOSED" ? "" : " closed")}>
+          <div className={"tt-live" + (live && session !== "CLOSED" ? "" : " closed")}
+            title={yahooDriving ? "MotiveWave is on a different contract month — Yahoo's ~10-minute-delayed feed is driving the chart. Roll the MotiveWave chart to the front month to go live again." : undefined}>
             <span className="tt-live-dot" />
             {session === "CLOSED" ? "MARKET CLOSED" : `${live ? "LIVE" : "DELAYED"} · ${session}`}
           </div>

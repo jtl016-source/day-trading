@@ -100,7 +100,7 @@ function buildSession(candles: FootprintCandle[], anchorTime: number, label: "RT
     high: prices[prices.length - 1], low: prices[0],
     totalBidVol: prices.reduce((s, p) => s + combined.get(p)!.bid, 0),
     totalAskVol: prices.reduce((s, p) => s + combined.get(p)!.ask, 0),
-    candleDelta: 0, absorption: null, unfinishedAuction: null, complete: true, imbalances,
+    absorption: null, unfinishedAuction: null, complete: true, imbalances,
   };
 }
 

@@ -26,6 +26,8 @@ import { cachedCandles } from "@shared/schema";
 import { normalizeSymbol } from "@shared/symbol";
 import { isSaneBarTime, validateBar } from "@shared/bar-time";
 import { deriveRange } from "./derive-bars"; // 1M-DERIVE: re-derive 5m/15m/60m from 1m on every 1m write
+import { cacheInvalidate } from "./cache"; // (2026-09-18) a persisted tick-built bar drops the shared cached-continuous bodies
+import { isMwQuarantined, translationActive, frontMonthOffset, noteMwBar1m } from "./contract-guard"; // CONTRACT GUARD (2026-09-17/18): MW bars are never PERSISTED while it is on the wrong month; they are broadcast spread-shifted (provisional) so the chart stays tick-live
 import { sql } from "drizzle-orm";
 import { type Express }    from "express";
 import { type Server as HttpServer } from "http";
@@ -361,8 +363,125 @@ const prevFeedStatus     = new Map<string, string>();  // symbol → last broadc
 const lastExternalTickMs     = new Map<string, number>();  // symbol → last tick from TickRelay WebSocket
 const lastFormingBroadcastMs = new Map<string, number>();  // symbol → last forming-bar broadcast time
 
+// BAR-CLOSE LATENCY FIX (2026-08-07): wall-clock boundary finalization.
+// The tick-built 1m/5m/60m buckets used to complete ONLY when the first tick of the NEXT
+// bucket arrived (rollover-on-tick) — at a quiet boundary the completed-bar broadcast (and
+// the client engine pass it triggers) waited for the next tick, potentially tens of seconds.
+// finalizeBar* below is the SINGLE completion path (persist + broadcast, idempotent via
+// finalizedBucket*); the tick-rollover path and the boundary timer both call it, whichever
+// runs first wins. Ticks are bucketed by ARRIVAL time, so once a bucket's wall-clock end has
+// passed no tick can ever mutate it — finalizing at boundary+grace is race-free.
+const finalizedBucket1m  = new Map<string, number>(); // symbol → last finalized 1m bucket timeSec
+const finalizedBucket5m  = new Map<string, number>();
+const finalizedBucket60m = new Map<string, number>();
+const BOUNDARY_GRACE_MS = 400;   // wait for stragglers in the same event-loop burst
+const BOUNDARY_TICK_MS  = 250;   // timer resolution — worst-case close ≈ boundary + 650ms
+let boundaryTimer: NodeJS.Timeout | null = null;
+
+/** CONTRACT GUARD (2026-09-18, broadcast-time translation): every in-memory bar and the last
+ *  tick stay RAW — MotiveWave's own basis, the basis its brackets are worked in and the only MW
+ *  price the guard's verdict ever pairs against Yahoo (so translation can never feed back into
+ *  its own trigger, and a verdict flip needs no bar reset). While MW is on the wrong month the
+ *  measured spread is added HERE, at the broadcast, so browsers get front-month-equivalent
+ *  bars tagged `provisional` (display-only: never stored, never an engine bar close — Yahoo's
+ *  canonical bar for the bucket follows ~10 min later). Returns null when nothing MW sends may
+ *  reach clients (off-contract with no trusted offset: roll pending / mixed months). */
+function wireBar(sym: string, bar: MinBar, complete: boolean): object | null {
+  const off = isMwQuarantined(sym);
+  if (off && !translationActive()) return null;
+  const o = off ? frontMonthOffset() : 0;
+  return {
+    symbol: sym, time: bar.timeSec,
+    open: bar.open + o, high: bar.high + o, low: bar.low + o, close: bar.close + o,
+    volume: bar.volume, complete, ...(off ? { provisional: true } : {}),
+  };
+}
+
+function finalizeBar1m(sym: string, bar: MinBar): void {
+  if (finalizedBucket1m.get(sym) === bar.timeSec) return; // already finalized (timer or rollover)
+  finalizedBucket1m.set(sym, bar.timeSec);
+  if (!(bar.timeSec > 0 && bar.open > 0)) return;
+  // CONTRACT GUARD (2026-09-17): every completed RAW tick-built 1m close feeds the MW-vs-Yahoo
+  // pairing — this is how a wrong-month chart is detected AND how its recovery is confirmed.
+  // While off-contract the bar is NEVER persisted (Yahoo's 1m poll is the canonical writer).
+  if (bar.volume > 0) noteMwBar1m(sym, bar.timeSec, bar.close); // volume 0 = boot-seeded from a stale tick file, never a traded minute
+  const completed1mTs = bar.timeSec;
+  // 1M-DERIVE: 1m is the single source of truth; recompute the 5m/15m/60m buckets containing
+  // this just-completed 1m bar AFTER it commits. MES only (see notifyExternalTick note).
+  if (!isMwQuarantined(sym)) {
+    // cacheInvalidate AFTER the commit (2026-09-18): cached-continuous bodies are now shared
+    // across consumers under an hour-floored key — without this the engine pass at boundary+3s
+    // could be served a body cached a second before this bar landed.
+    bulkUpsert(sym, "1", [bar])
+      .then(() => { if (sym === "MES") deriveRange(sym, completed1mTs, completed1mTs); cacheInvalidate(sym); })
+      .catch(() => {});
+  }
+  const wb = _broadcast ? wireBar(sym, bar, true) : null;
+  if (wb) _broadcast!({ type: "bar", resolution: "1", bar: wb });
+}
+
+function finalizeBar5m(sym: string, bar: MinBar): void {
+  if (finalizedBucket5m.get(sym) === bar.timeSec) return;
+  finalizedBucket5m.set(sym, bar.timeSec);
+  if (!(bar.timeSec > 0 && bar.open > 0)) return;
+  // CONTRACT GUARD: a wrong-month bar is never persisted; latestBar5 stays RAW (MW basis).
+  if (!isMwQuarantined(sym)) persistCompletedBar5(sym, bar);
+  latestBar5.set(sym, bar);
+  // Only broadcast the 5m resolution — never send a 5m bar as resolution "1" (the 1m chart
+  // would insert it at the 5m boundary and corrupt individual 1m candles).
+  const wb = _broadcast ? wireBar(sym, bar, true) : null;
+  if (wb) _broadcast!({ type: "bar", resolution: "5", bar: wb });
+}
+
+function finalizeBar60m(sym: string, bar: MinBar): void {
+  if (finalizedBucket60m.get(sym) === bar.timeSec) return;
+  finalizedBucket60m.set(sym, bar.timeSec);
+  if (!(bar.timeSec > 0 && bar.open > 0)) return;
+  // CONTRACT GUARD: a wrong-month bar is never persisted.
+  if (!isMwQuarantined(sym)) bulkUpsert(sym, "60", [bar]).then(() => cacheInvalidate(sym)).catch(() => {});
+  const wb = _broadcast ? wireBar(sym, bar, true) : null;
+  if (wb) _broadcast!({ type: "bar", resolution: "60", bar: wb });
+}
+
+/** Arm the wall-clock boundary timer (called once from setupLiveBars). Every 250ms, any
+ *  in-progress bucket whose wall-clock end passed ≥400ms ago is finalized from the ticks
+ *  received — the completed bar reaches clients within ~0.7s of the boundary even if no
+ *  further tick ever arrives (quiet ETH minute, session close, feed pause). */
+export function startBarBoundaryTimer(): void {
+  if (boundaryTimer) return;
+  boundaryTimer = setInterval(() => {
+    const nowMs = Date.now();
+    for (const [sym, bar] of inProgressBar1m) {
+      if (bar.timeSec > 0 && nowMs >= (bar.timeSec + 60) * 1000 + BOUNDARY_GRACE_MS) finalizeBar1m(sym, bar);
+    }
+    for (const [sym, bar] of inProgressBar5m) {
+      if (bar.timeSec > 0 && nowMs >= (bar.timeSec + 300) * 1000 + BOUNDARY_GRACE_MS) finalizeBar5m(sym, bar);
+    }
+    for (const [sym, bar] of inProgressBar60m) {
+      if (bar.timeSec > 0 && nowMs >= (bar.timeSec + 3600) * 1000 + BOUNDARY_GRACE_MS) finalizeBar60m(sym, bar);
+    }
+  }, BOUNDARY_TICK_MS);
+  console.log(`[mw-reader] bar-boundary timer armed (tick ${BOUNDARY_TICK_MS}ms, grace ${BOUNDARY_GRACE_MS}ms)`);
+}
+
 // TickRelay connection state — true while MW study WS is open; disk polling suppressed during this time
 let tickRelayConnected = false;
+
+/** YAHOO-FALLBACK: live view of the TickRelay/mw-feed WS state — any /ws/mw-feed socket
+ *  (TickRelay OR LiveBarRelay) flips this true. yahoo-live.ts yields to MW while true. */
+export function isTickRelayConnected(): boolean {
+  return tickRelayConnected;
+}
+
+/** YAHOO-FALLBACK (2026-08-10): ms since the last EXTERNAL (TickRelay WS) tick across ALL
+ *  symbols — Infinity when none seen since boot. Connection state alone is NOT liveness: a
+ *  wedged MW that holds its socket open while sending nothing starved the fallback for a
+ *  whole RTH morning. yahoo-live.ts treats MW as active only while ticks are RECENT. */
+export function msSinceAnyExternalTick(): number {
+  let latest = 0;
+  for (const at of lastExternalTickMs.values()) if (at > latest) latest = at;
+  return latest ? Date.now() - latest : Infinity;
+}
 
 export function setTickRelayConnected(connected: boolean): void {
   if (tickRelayConnected === connected) return;
@@ -376,6 +495,35 @@ export function setTickRelayConnected(connected: boolean): void {
     inProgressBar60m.clear();
     console.log("[mw-reader] Cleared in-progress bars — TickRelay is now authoritative");
   }
+}
+
+/** CONTRACT GUARD (2026-09-17): the price regime of incoming ticks just changed (raw ↔
+ *  translated onto the front month) — drop the in-progress bars so the next tick self-seeds
+ *  instead of printing one bar that spans the whole roll spread. */
+export function resetInProgressBars(symbol?: string): void {
+  // The last tick price / last completed 5m bar belong to the old regime too — /api/live/bar
+  // must not keep serving them (the iPhone pins its last candle to that price every 4s).
+  if (symbol) {
+    const sym = symbol.toUpperCase();
+    inProgressBar1m.delete(sym); inProgressBar5m.delete(sym); inProgressBar60m.delete(sym);
+    lastTickPrice.delete(sym); lastTickAt.delete(sym); latestBar5.delete(sym);
+  } else {
+    inProgressBar1m.clear(); inProgressBar5m.clear(); inProgressBar60m.clear();
+    lastTickPrice.clear(); lastTickAt.clear(); latestBar5.clear();
+  }
+  console.log(`[mw-reader] in-progress bars reset${symbol ? ` for ${symbol}` : ""} (contract guard regime change)`);
+}
+
+/** Current MW feed liveness for a symbol — the same classification the 15s heartbeat
+ *  broadcasts, so a freshly connected browser can be given a snapshot instead of "unknown".
+ *  CONTRACT GUARD: MW on the wrong month with translation OFF (roll pending) is reported
+ *  "stale" even if raw ticks still arrive — none of them reach clients. */
+export function getFeedStatus(symbol: string): "live" | "stale" | "unknown" {
+  const sym = symbol.toUpperCase();
+  if (isMwQuarantined(sym) && !translationActive()) return "stale";
+  const last = lastTickAt.get(sym);
+  if (last === undefined) return "unknown";
+  return Date.now() - last > 60_000 ? "stale" : "live";
 }
 
 // Track current active tick file per instrument so we don't scan the directory on every event
@@ -675,7 +823,7 @@ function persistCompletedBar5(symbol: string, bar: MinBar) {
       return;
     }
   }
-  bulkUpsert(symbol, "5", [bar]).catch(() => {});
+  bulkUpsert(symbol, "5", [bar]).then(() => cacheInvalidate(sym)).catch(() => {});
 }
 
 /**
@@ -720,19 +868,9 @@ export function notifyExternalTick(symbol: string, price: number) {
       prev1m.volume += 1;
     }
   } else {
-    // Completed 1m bar — persist and broadcast
-    if (prev1m && prev1m.timeSec > 0 && prev1m.open > 0) {
-      const completed1mTs = prev1m.timeSec;
-      // 1M-DERIVE: 1m is the single source of truth; recompute the 5m/15m/60m buckets containing
-      // this just-completed 1m bar AFTER it commits. MES only — ES/contract-keyed symbols have
-      // sparse 1m and their native higher-TF rows must not be overwritten by a thin derivation.
-      bulkUpsert(sym, "1", [prev1m])
-        .then(() => { if (sym === "MES") deriveRange(sym, completed1mTs, completed1mTs); })
-        .catch(() => {});
-      if (_broadcast) {
-        _broadcast({ type: "bar", resolution: "1", bar: { symbol: sym, time: prev1m.timeSec, open: prev1m.open, high: prev1m.high, low: prev1m.low, close: prev1m.close, volume: prev1m.volume, complete: true } });
-      }
-    }
+    // Completed 1m bar — finalize (persist + broadcast). Idempotent: the boundary timer
+    // usually got here first at boundary+~0.7s; this call is then a no-op.
+    if (prev1m) finalizeBar1m(sym, prev1m);
     // CANDLE FIX: only chain prev close as open when consecutive buckets — gap means self-seed
     const is1mContiguous = prev1m != null && (bucket1m - prev1m.timeSec <= 60);
     inProgressBar1m.set(sym, { timeSec: bucket1m, open: is1mContiguous ? prev1m.close : price, high: price, low: price, close: price, volume: 1 }); // volume = tick count (see above)
@@ -751,17 +889,8 @@ export function notifyExternalTick(symbol: string, price: number) {
       prev5m.volume += 1; // tick count as volume proxy — see 1m note above
     }
   } else {
-    // Bucket rolled over — persist and broadcast the completed bar
-    if (prev5m && prev5m.timeSec > 0 && prev5m.open > 0) {
-      persistCompletedBar5(sym, prev5m);
-      latestBar5.set(sym, prev5m);
-      if (_broadcast) {
-        // Only broadcast the 5m resolution — never send a 5m bar as resolution "1" because
-        // the 1m chart would insert it at the 5m boundary and corrupt individual 1m candles.
-        // The 1m completion is handled separately above (line ~487).
-        _broadcast({ type: "bar", resolution: "5", bar: { symbol: sym, time: prev5m.timeSec, open: prev5m.open, high: prev5m.high, low: prev5m.low, close: prev5m.close, volume: prev5m.volume, complete: true } });
-      }
-    }
+    // Bucket rolled over — finalize (persist + broadcast). Idempotent vs the boundary timer.
+    if (prev5m) finalizeBar5m(sym, prev5m);
     // CANDLE FIX: only chain prev close as open when consecutive buckets — gap means self-seed
     const is5mContiguous = prev5m != null && (bucket5m - prev5m.timeSec <= 300);
     inProgressBar5m.set(sym, { timeSec: bucket5m, open: is5mContiguous ? prev5m.close : price, high: price, low: price, close: price, volume: 1 }); // volume = tick count
@@ -783,35 +912,33 @@ export function notifyExternalTick(symbol: string, price: number) {
       prev60m.volume += 1; // tick count as volume proxy — see 1m note above
     }
   } else {
-    if (prev60m && prev60m.timeSec > 0 && prev60m.open > 0) {
-      bulkUpsert(sym, "60", [prev60m]).catch(() => {});
-      if (_broadcast) {
-        _broadcast({ type: "bar", resolution: "60", bar: { symbol: sym, time: prev60m.timeSec, open: prev60m.open, high: prev60m.high, low: prev60m.low, close: prev60m.close, volume: prev60m.volume, complete: true } });
-      }
-    }
+    // Bucket rolled over — finalize (persist + broadcast). Idempotent vs the boundary timer.
+    if (prev60m) finalizeBar60m(sym, prev60m);
     const is60mContiguous = prev60m != null && (bucket60m - prev60m.timeSec <= 3600);
     inProgressBar60m.set(sym, { timeSec: bucket60m, open: is60mContiguous ? prev60m.close : price, high: price, low: price, close: price, volume: 1 }); // volume = tick count
   }
 
   // Broadcast the forming bars so the browser's liveCandles stays in sync (for signal computation).
   // Throttled to once per second — the tick fast path already handles the Y-axis in real time.
+  // CONTRACT GUARD: forming bars go out through wireBar — raw when MW is authoritative,
+  // spread-shifted + `provisional` while it is on the wrong month, nothing at all while no
+  // trusted offset exists (roll pending / mixed months).
   if (_broadcast) {
     const now = Date.now();
     if (now - (lastFormingBroadcastMs.get(sym) ?? 0) >= 1_000) {
       lastFormingBroadcastMs.set(sym, now);
-      const cur5m = inProgressBar5m.get(sym)!;
-      _broadcast({ type: "bar", resolution: "5",  bar: { symbol: sym, time: cur5m.timeSec, open: cur5m.open, high: cur5m.high, low: cur5m.low, close: cur5m.close, volume: cur5m.volume, complete: false } });
-      const cur1m = inProgressBar1m.get(sym)!;
-      _broadcast({ type: "bar", resolution: "1",  bar: { symbol: sym, time: cur1m.timeSec, open: cur1m.open, high: cur1m.high, low: cur1m.low, close: cur1m.close, volume: cur1m.volume, complete: false } });
+      const w5 = wireBar(sym, inProgressBar5m.get(sym)!, false);
+      if (w5) _broadcast({ type: "bar", resolution: "5", bar: w5 });
+      const w1 = wireBar(sym, inProgressBar1m.get(sym)!, false);
+      if (w1) _broadcast({ type: "bar", resolution: "1", bar: w1 });
       const cur60m = inProgressBar60m.get(sym);
-      if (cur60m) {
-        _broadcast({ type: "bar", resolution: "60", bar: { symbol: sym, time: cur60m.timeSec, open: cur60m.open, high: cur60m.high, low: cur60m.low, close: cur60m.close, volume: cur60m.volume, complete: false } });
-      }
+      const w60 = cur60m ? wireBar(sym, cur60m, false) : null;
+      if (w60) _broadcast({ type: "bar", resolution: "60", bar: w60 });
     }
   }
 
-  // FOOTPRINT-MIDTRADE: check for mid-trade delta divergence on each external tick
-  _checkMidTradeDivergence?.(sym, price); // FOOTPRINT-MIDTRADE:
+  // (Mid-trade delta-divergence check DELETED 2026-07-13 — rule 7: no delta logic in any
+  //  signal path; the alert also advised tightening the now-deleted trailer.)
 }
 
 // ── Broadcast hook (set by live-bars.ts after WebSocket server is up) ─────────
@@ -821,11 +948,6 @@ let _broadcast: ((msg: object) => void) | null = null;
 export function setMWBroadcast(fn: (msg: object) => void) {
   _broadcast = fn;
 }
-
-// Pre-resolve footprint engine import so notifyExternalTick never creates a
-// dynamic-import Promise microtask on every MW tick (same pattern as live-bars.ts _fpAddBar).
-let _checkMidTradeDivergence: ((sym: string, price: number) => void) | null = null;
-import("./footprint-engine").then(m => { _checkMidTradeDivergence = (m as any).checkMidTradeDivergence ?? null; }).catch(() => {});
 
 // ── Binary parser ─────────────────────────────────────────────────────────────
 
@@ -1402,9 +1524,7 @@ export function setupMWReader(_httpServer: HttpServer, _app: Express) {
         const sym    = symbol.toUpperCase();
         const last   = lastTickAt.get(sym);
         const elapsed = last !== undefined ? Date.now() - last : Infinity;
-        const status  = last === undefined ? "unknown"
-                      : elapsed > 60_000   ? "stale"
-                      :                      "live";
+        const status  = getFeedStatus(sym); // incl. the contract-guard roll-pending → "stale" rule
         if (status !== prevFeedStatus.get(sym) && _broadcast) {
           _broadcast({
             type:   "feedStatus",

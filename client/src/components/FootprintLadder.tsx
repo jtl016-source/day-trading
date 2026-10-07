@@ -143,7 +143,7 @@ function getCurrentSessionStart(nowSec: number): number {
   const now    = new Date(nowSec * 1000);
   const nowDay = now.getUTCDay();
   const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
-  const inRth  = nowDay >= 1 && nowDay <= 5 && nowMin >= 13 * 60 + 30 && nowMin < 20 * 60 + 30;
+  const inRth  = nowDay >= 1 && nowDay <= 5 && nowMin >= 13 * 60 + 30 && nowMin < 21 * 60; // 9:30 AM – 5:00 PM ET (EDT)
 
   if (inRth) {
     // Current session = RTH; it started at 13:30 UTC today

@@ -41,8 +41,9 @@ function sigAgeHours(s: MobileSignal): number {
   return (Date.now() / 1000 - s.time) / 3600;
 }
 function statusOf(s: MobileSignal): { label: string; color: string; active: boolean } {
-  if (s.outcome === 'Win')  return { label: 'TP1 WIN', color: Trading.long,  active: false };
-  if (s.outcome === 'Loss') return { label: 'LOSS',    color: Trading.short, active: false };
+  if (s.outcome === 'Win')  return { label: s.tpHit === 2 ? 'TP2 WIN' : 'TP1 WIN', color: Trading.long, active: false };
+  if (s.outcome === 'Loss') return { label: 'LOSS', color: Trading.short, active: false };
+  if (s.outcome === 'EOD')  return { label: 'EOD',  color: Trading.dim,   active: false }; // settled at the 17:00 ET close
   if (sigAgeHours(s) > ACTIVE_WINDOW_HOURS) return { label: 'EXPIRED', color: Trading.dim, active: false };
   return { label: 'ACTIVE', color: Trading.amber, active: true };
 }
@@ -152,7 +153,7 @@ export default function SignalsScreen() {
                       <Text style={[s.side, { color: long ? Trading.long : Trading.short, backgroundColor: (long ? Trading.long : Trading.short) + '1a' }]}>
                         {sig.direction.toUpperCase()}
                       </Text>
-                      <Text style={s.strat}>{primaryStrat(sig)}</Text>
+                      <Text style={s.strat}>{sig.comboKey ?? primaryStrat(sig)}</Text>
                       <TierPill tier={sig.riskLevel} />
                     </View>
                     <Text style={s.time}>{fmtTime(sig.time)}</Text>
@@ -160,8 +161,10 @@ export default function SignalsScreen() {
                   <View style={s.grid}>
                     <Cell label="ENTRY" value={sig.price.toFixed(2)} />
                     <Cell label="STOP"  value={sig.sl.toFixed(2)}  color={Trading.short} />
-                    <Cell label="TP1"   value={sig.tp1.toFixed(2)} color={Trading.long} />
-                    <Cell label="TP2"   value={sig.tp2.toFixed(2)} color={Trading.long} />
+                    {/* TP1-only (2026-08-13): tp2 is null on every current signal — the raw
+                        .toFixed here crashed the whole Signals tab (fixed 2026-08-18). */}
+                    <Cell label={sig.tp2 != null ? 'TP1' : 'TP'} value={sig.tp1.toFixed(2)} color={Trading.long} />
+                    {sig.tp2 != null && <Cell label="TP2" value={sig.tp2.toFixed(2)} color={Trading.long} />}
                   </View>
                   <View style={s.foot}>
                     <View style={[s.status, { backgroundColor: st.color + '1a' }]}>
@@ -212,8 +215,9 @@ function DetailModal({ sig, onClose }: { sig: MobileSignal; onClose: () => void 
   const usd = (pts: number) => `$${Math.abs(pts * MES_PER_PT).toFixed(0)}`;
   const levels = [
     { label: 'Entry', value: sig.price, color: Trading.text },
-    { label: 'TP1', value: sig.tp1, color: Trading.long },
-    { label: 'TP2', value: sig.tp2, color: Trading.long },
+    { label: sig.tp2 != null ? 'TP1' : 'TP', value: sig.tp1, color: Trading.long },
+    // TP1-only: no TP2 row when null (row.value.toFixed crashed the detail modal)
+    ...(sig.tp2 != null ? [{ label: 'TP2', value: sig.tp2, color: Trading.long }] : []),
     { label: 'SL', value: sig.sl, color: Trading.short },
   ];
   return (
@@ -231,6 +235,12 @@ function DetailModal({ sig, onClose }: { sig: MobileSignal; onClose: () => void 
           </View>
           <Text style={d.sub}>{fmtDate(sig.time)} · {fmtTime(sig.time)} ET</Text>
 
+          {/* Engine fact-list label — the real "why" behind the signal (replaces derived guesses). */}
+          {sig.label && <Text style={d.label}>{sig.label}</Text>}
+          {sig.riskFlags.length > 0 && (
+            <Text style={d.flags}>⚠ {sig.riskFlags.join(' · ')}</Text>
+          )}
+
           <View style={d.table}>
             {levels.map((row, i) => (
               <View key={row.label} style={[d.tRow, i === levels.length - 1 && { borderBottomWidth: 0 }]}>
@@ -247,17 +257,24 @@ function DetailModal({ sig, onClose }: { sig: MobileSignal; onClose: () => void 
           {rr !== null && <Text style={d.rr}>Risk / Reward · 1 : {rr}</Text>}
 
           <View style={d.outRow}>
-            <Text style={[d.outTxt, { color: sig.outcome === 'Win' ? Trading.long : sig.outcome === 'Loss' ? Trading.short : sigAgeHours(sig) > ACTIVE_WINDOW_HOURS ? Trading.dim : tc }]}>
-              {sig.outcome === 'Win' ? 'Win — TP1'
+            <Text style={[d.outTxt, { color: sig.outcome === 'Win' ? Trading.long : sig.outcome === 'Loss' ? Trading.short : sig.outcome === 'EOD' ? Trading.dim : sigAgeHours(sig) > ACTIVE_WINDOW_HOURS ? Trading.dim : tc }]}>
+              {sig.outcome === 'Win' ? `Win — TP${sig.tpHit ?? 1}`
                : sig.outcome === 'Loss' ? 'Loss'
+               : sig.outcome === 'EOD' ? 'EOD close'
                : sigAgeHours(sig) > ACTIVE_WINDOW_HOURS ? 'Expired' : 'Active trade'}
             </Text>
             {sig.points != null && (
               <Text style={[d.pnl, { color: sig.points >= 0 ? Trading.long : Trading.short }]}>
-                {sig.points >= 0 ? '+' : ''}{sig.points.toFixed(2)} pts
+                {sig.points >= 0 ? '+' : ''}{sig.points.toFixed(2)} pts · {sig.points >= 0 ? '+' : '−'}${Math.abs(sig.points * MES_PER_PT).toFixed(0)}
               </Text>
             )}
           </View>
+          {/* Real recorded exit (exit-field migration) — shown when the row carries it. */}
+          {sig.exitPrice != null && (
+            <Text style={d.exit}>
+              Exit {sig.exitPrice.toFixed(2)}{sig.exitTs != null ? ` · ${fmtTime(sig.exitTs)} ET` : ''}{sig.barsToExit != null ? ` · ${sig.barsToExit} bars` : ''}
+            </Text>
+          )}
         </Animated.View>
       </Pressable>
     </Modal>
@@ -305,6 +322,9 @@ const s = StyleSheet.create({
 
 const d = StyleSheet.create({
   backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
+  label: { color: Trading.text, fontSize: 12, lineHeight: 17, marginTop: 10, opacity: 0.9 },
+  flags: { color: Trading.amber, fontSize: 11, marginTop: 6, fontWeight: '600' },
+  exit: { color: Trading.muted, fontSize: 11, marginTop: 8, textAlign: 'right' },
   sheet: { backgroundColor: '#0a0c12', borderTopLeftRadius: 20, borderTopRightRadius: 20, borderTopWidth: 1, borderColor: 'rgba(45,212,191,0.2)', paddingHorizontal: 20, paddingTop: 18, paddingBottom: 40 },
   header: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   dirChip: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1 },

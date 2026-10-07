@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.*;
   id             = "AUTO_TRADER",
   name           = "Auto Trader",
   label          = "AutoTrader",
+  menu           = "Custom",
   desc           = "Receives order commands from Milks Yellow Box app and places bracket orders via MotiveWave",
   overlay        = true,
   signals        = true,
@@ -41,10 +42,14 @@ public class AutoTrader extends Study {
     }
   }
 
-  // pendingTrade is static — ensures only one trade queued at a time across all instances.
-  // instanceOrderCtx is per-instance — the WS message handler uses THIS instance's own ctx,
-  // so the instance that receives the order command places it with its own MotiveWave context.
-  private static final AtomicReference<PendingTrade> pendingTrade = new AtomicReference<>();
+  // MULTI-TRADE QUEUE (2026-08-14, user directive: "every interval fires with no thoughts of
+  // other intervals — I want all of those trades at once"): the old single-slot
+  // AtomicReference meant a second order_command arriving before a callback drained the slot
+  // silently OVERWROTE the first (same-second multi-interval signals lost trades). Every
+  // queued command now places, each getting its own independent BracketState.
+  // Static — shared across instances; the draining instance places with its own ctx.
+  private static final java.util.concurrent.ConcurrentLinkedQueue<PendingTrade> pendingTrades =
+      new java.util.concurrent.ConcurrentLinkedQueue<>();
   private volatile Object instanceOrderCtx = null; // set by this instance's own lifecycle callbacks
   private volatile WebSocket ws;
   private ScheduledExecutorService scheduler;
@@ -57,6 +62,28 @@ public class AutoTrader extends Study {
   private volatile double       trailPeak          = 0;     // highest (long) or lowest (short) since arming
   private volatile boolean      nativeTrailActive  = false; // true if MW trailing stop order was submitted
 
+  // ── OCO bracket state (per-instance): ONE record PER CONCURRENT TRADE. The exit legs are
+  // submitted UNLINKED (MW SDK has no native OCO), so onOrderFilled is the OCO manager: the
+  // instant either side of a bracket fills, THAT BRACKET's survivors are cancelled — targeted,
+  // never account-wide (2026-08-04 incident: overlapping trades + cancel-all stripped the OTHER
+  // trade's stop, leaving 7 naked lots). Remaining-qty math uses the KNOWN leg quantities, NOT
+  // ctx.getPosition(), because the position value may not yet reflect the triggering fill.
+  private static final class BracketState {
+    final PendingTrade trade;
+    volatile Object entryRef, slRef, tp1Ref, tp2Ref, trailExitRef;
+    volatile int slQty, tp1Qty, tp2Qty;
+    volatile int exitFilled; // sum of filled TP-leg qty (SL/trailer fills close the rest)
+    BracketState(PendingTrade t) { trade = t; }
+    boolean owns(Object order) {
+      return sameOrder(order, entryRef) || sameOrder(order, slRef)
+          || sameOrder(order, tp1Ref)   || sameOrder(order, tp2Ref)
+          || sameOrder(order, trailExitRef);
+    }
+  }
+  private final java.util.concurrent.CopyOnWriteArrayList<BracketState> brackets =
+      new java.util.concurrent.CopyOnWriteArrayList<>();
+  private volatile BracketState trailerBracket = null; // bracket of the active trailer trade (if any)
+
   private static void logFile(String msg) {
     try {
       java.nio.file.Files.writeString(
@@ -68,9 +95,10 @@ public class AutoTrader extends Study {
 
   @Override
   public void initialize(Defaults defaults) {
-    logFile("=== AutoTrader v18 initialize() called ===");
-    pendingTrade.set(null);
+    logFile("=== AutoTrader v21 (multi-trade queue) initialize() called ===");
+    pendingTrades.clear();
     resetTrailerState();
+    clearBracketState();
     createSD();
     connect();
     scheduler = Executors.newScheduledThreadPool(1, r -> {
@@ -83,36 +111,41 @@ public class AutoTrader extends Study {
 
   // ── Strategy lifecycle callbacks — any that receive OrderContext are usable for orders ──
 
+  /** Drain and place EVERY queued trade (multi-trade queue 2026-08-14) — each gets its own
+   *  independent BracketState; concurrent multi-interval signals all place. */
+  private void drainQueue(OrderContext ctx, String where) {
+    PendingTrade trade;
+    while ((trade = pendingTrades.poll()) != null) {
+      logFile(where + " — placing queued order (" + pendingTrades.size() + " more waiting)");
+      placeOrder(ctx, trade);
+    }
+  }
+
   @Override
   public void onActivate(OrderContext ctx) {
     logFile("onActivate(OrderContext) ctx=" + ctx.getClass().getName());
     instanceOrderCtx = ctx;
-    // If a trade was queued before activation, place it now
-    PendingTrade trade = pendingTrade.getAndSet(null);
-    if (trade != null) { logFile("onActivate — placing queued order"); placeOrder(ctx, trade); }
+    drainQueue(ctx, "onActivate");
   }
 
   @Override
   public void onBarOpen(OrderContext ctx) {
     logFile("onBarOpen(OrderContext)");
     instanceOrderCtx = ctx;
-    PendingTrade trade = pendingTrade.getAndSet(null);
-    if (trade != null) { logFile("onBarOpen — placing order"); placeOrder(ctx, trade); }
+    drainQueue(ctx, "onBarOpen");
   }
 
   @Override
   public void onBarClose(OrderContext ctx) {
     logFile("onBarClose(OrderContext)");
     instanceOrderCtx = ctx;
-    PendingTrade trade = pendingTrade.getAndSet(null);
-    if (trade != null) { logFile("onBarClose — placing order"); placeOrder(ctx, trade); }
+    drainQueue(ctx, "onBarClose");
   }
 
   @Override
   public void onBarUpdate(OrderContext ctx) {
     instanceOrderCtx = ctx;
-    PendingTrade trade = pendingTrade.getAndSet(null);
-    if (trade != null) { logFile("onBarUpdate — placing order"); placeOrder(ctx, trade); }
+    drainQueue(ctx, "onBarUpdate");
 
     // ── Trailer monitoring: runs on every bar update while a trailer trade is active ──
     PendingTrade t = activeTrailerTrade;
@@ -166,20 +199,254 @@ public class AutoTrader extends Study {
   public void onSignal(OrderContext ctx, Object signal) {
     logFile("onSignal() fired signal=" + signal);
     instanceOrderCtx = ctx;
-    PendingTrade trade = (signal instanceof PendingTrade) ? (PendingTrade) signal : pendingTrade.get();
-    pendingTrade.set(null);
-    if (trade != null) { logFile("onSignal — placing order"); placeOrder(ctx, trade); }
+    if (signal instanceof PendingTrade) { logFile("onSignal — placing passed order"); placeOrder(ctx, (PendingTrade) signal); }
+    drainQueue(ctx, "onSignal");
   }
 
   @Override
   public void onPositionClosed(OrderContext ctx) {
-    logFile("onPositionClosed — cancelling remaining orders, staying active for next signal");
-    cancelAllOrders(ctx);   // cancel TP1/TP2 limits that may still be open after SL fills
-    pendingTrade.set(null);
-    resetTrailerState();
-    sendMsg("{\"type\":\"position_closed\"}");
+    // MULTI-TRADE MODE (2026-08-14, user directive: independent brackets per interval, all at
+    // once): NET-flat is a NORMAL intermediate state when opposing brackets coexist — a Short
+    // entry nets against an open Long at the account level while BOTH brackets keep working
+    // and each round trip completes at its own TP or SL. The old backstop cancelled EVERY
+    // resting order here, which destroyed all concurrent brackets the moment the net touched
+    // zero (observed live 2026-08-13 21:00 ET). The orphan sweep now runs ONLY when no
+    // brackets are tracked. The pending queue is NEVER cleared here — queued trades place.
+    if (brackets.isEmpty()) {
+      logFile("onPositionClosed — no tracked brackets; sweeping orphan orders");
+      cancelAllOrders(ctx);
+      resetTrailerState();
+      sendMsg("{\"type\":\"position_closed\"}");
+    } else {
+      logFile("onPositionClosed — NET flat but " + brackets.size() + " bracket(s) still working; leaving every leg alone (multi-trade mode)");
+    }
     // Do NOT deactivate — strategy stays live so it can receive the next order_command
     // without requiring a manual reload of the study in MotiveWave.
+  }
+
+  // ── OCO bracket manager: react to the FILL EVENT itself, not onPositionClosed ──
+  // onPositionClosed can lag a fill by minutes (observed 2026-08-03: TP filled, the
+  // full-qty stop stayed WORKING while flat — a touch would have opened a fresh
+  // position). The moment any exit leg fills: flat → cancel every survivor NOW;
+  // still holding (split-mode partial take-profit) → shrink the stop to what's left.
+
+  @Override
+  public void onOrderFilled(OrderContext ctx, Order order) {
+    instanceOrderCtx = ctx;
+    try { handleFill(ctx, order); }
+    catch (Exception e) { logFile("onOrderFilled handler FAILED: " + e.getMessage()); }
+  }
+
+  @Override
+  public void onOrderCancelled(OrderContext ctx, Order order) { logFile("onOrderCancelled: " + orderDesc(order)); }
+
+  @Override
+  public void onOrderModified(OrderContext ctx, Order order) { logFile("onOrderModified: " + orderDesc(order)); }
+
+  @Override
+  public void onOrderRejected(OrderContext ctx, Order order) {
+    logFile("onOrderRejected: " + orderDesc(order));
+    for (BracketState b : brackets) {
+      if (sameOrder(order, b.slRef) || sameOrder(order, b.tp1Ref) || sameOrder(order, b.tp2Ref)) {
+        sendMsg("{\"type\":\"order_error\",\"error\":\"bracket exit order REJECTED — check MotiveWave\"}");
+        return;
+      }
+    }
+  }
+
+  private void handleFill(Object ctx, Object order) {
+    logFile("onOrderFilled: " + orderDesc(order));
+    if (brackets.isEmpty()) return; // no brackets in flight (e.g. manual trading)
+
+    // Find the ONE bracket this fill belongs to. Fills that match no tracked bracket
+    // (e.g. a manual order) never touch any bracket.
+    BracketState bs = null;
+    for (BracketState b : brackets) if (b.owns(order)) { bs = b; break; }
+    if (bs == null) {
+      logFile("fill does not match any tracked bracket — ignored by OCO manager (" + brackets.size() + " tracked)");
+      return;
+    }
+
+    if (sameOrder(order, bs.entryRef)) {
+      logFile("entry filled — OCO manager armed for this bracket (slQty=" + bs.slQty
+        + " tp1Qty=" + bs.tp1Qty + " tp2Qty=" + bs.tp2Qty + "; " + brackets.size() + " bracket(s) tracked)");
+      // FILL CONFIRMATION (2026-08-14): tell the server the entry is REAL — the server's
+      // active-trade gate treats unconfirmed records as phantoms and expires them (the
+      // phantom-5m-Long lesson: a sent-but-never-filled order must not gate real signals).
+      sendMsg(String.format("{\"type\":\"order_filled\",\"direction\":\"%s\",\"entry\":%.2f}",
+        bs.trade.direction, bs.trade.entry));
+      return;
+    }
+
+    boolean isSl        = sameOrder(order, bs.slRef);
+    boolean isTp1       = sameOrder(order, bs.tp1Ref);
+    boolean isTp2       = sameOrder(order, bs.tp2Ref);
+    boolean isTrailExit = sameOrder(order, bs.trailExitRef);
+
+    // Deterministic remaining-qty bookkeeping from the KNOWN leg quantities OF THIS BRACKET.
+    int rest;
+    if (isTp1)      { bs.exitFilled += bs.tp1Qty; rest = bs.trade.contracts - bs.exitFilled; }
+    else if (isTp2) { bs.exitFilled += bs.tp2Qty; rest = bs.trade.contracts - bs.exitFilled; }
+    else            rest = 0; // SL and trailer exits close this bracket's entire remainder
+
+    int pos = getPositionQty(ctx); // cross-check only — may still show the pre-fill position
+    logFile(String.format("OCO after fill: leg=%s rest=%d (bracket entry=%.2f; ctx position=%s; %d tracked)",
+      isSl ? "SL" : isTp1 ? "TP1" : isTp2 ? "TP2" : "TRAIL", rest, bs.trade.entry,
+      pos == Integer.MIN_VALUE ? "n/a" : String.valueOf(pos), brackets.size()));
+
+    if (rest <= 0) {
+      String reason = isSl ? "sl_filled" : isTrailExit ? "trailer_exit" : "tp_filled";
+      // TARGETED flatten: cancel ONLY this bracket's surviving legs. Other concurrent
+      // trades' brackets keep their own protection (2026-08-04 lesson — cancel-all here
+      // stripped a sibling trade's stop and left 7 lots naked).
+      logFile("OCO FLATTEN (" + reason + ") — cancelling THIS bracket's remaining legs only");
+      for (Object leg : new Object[]{ bs.slRef, bs.tp1Ref, bs.tp2Ref }) {
+        if (leg != null && leg != order && !isOrderDone(leg)) cancelSingleOrder(ctx, leg);
+      }
+      brackets.remove(bs);
+      if (trailerBracket == bs) { trailerBracket = null; resetTrailerState(); }
+      sendMsg("{\"type\":\"bracket_flattened\",\"reason\":\"" + reason + "\",\"entry\":" + bs.trade.entry
+        + ",\"remaining_brackets\":" + brackets.size() + "}");
+    } else {
+      reduceStopTo(ctx, bs, rest);
+    }
+  }
+
+  /** True if the order is already filled or cancelled (reflective isFilled()/isCancelled()). */
+  private static boolean isOrderDone(Object o) {
+    for (String m : new String[]{"isFilled", "isCancelled"}) {
+      try { if (Boolean.TRUE.equals(o.getClass().getMethod(m).invoke(o))) return true; }
+      catch (Exception ignored) {}
+    }
+    return false;
+  }
+
+  /** Shrink THIS bracket's working stop to `rest` contracts after a partial take-profit fill. */
+  private void reduceStopTo(Object ctx, BracketState bs, int rest) {
+    Object sl = bs.slRef;
+    if (sl == null || rest >= bs.slQty) return;
+    try {
+      Method setAdj = null;
+      for (Method m : sl.getClass().getMethods()) {
+        if (!"setAdjQuantity".equals(m.getName()) || m.getParameterCount() != 1) continue;
+        if (m.getParameterTypes()[0] == int.class) { setAdj = m; break; }
+        if (setAdj == null) setAdj = m; // float overload fallback
+      }
+      if (setAdj == null) throw new Exception("setAdjQuantity not found on " + sl.getClass().getName());
+      setAdj.invoke(sl, toNum(setAdj.getParameterTypes()[0], rest));
+      submitSingle(ctx, sl); // re-submit applies the adjusted qty (MW modify pattern)
+      bs.slQty = rest;
+      logFile("OCO stop REDUCED to " + rest + " after partial take-profit (bracket entry=" + bs.trade.entry + ")");
+      sendMsg("{\"type\":\"stop_reduced\",\"qty\":" + rest + "}");
+    } catch (Exception e) {
+      logFile("stop reduce FAILED (" + e.getMessage() + ") — fallback: cancel+recreate stop for " + rest);
+      rebuildReducedStop(ctx, bs, rest);
+    }
+  }
+
+  /** Fallback when in-place modify fails: cancel THIS bracket's stop, submit a fresh one for `rest`. */
+  @SuppressWarnings({"unchecked","rawtypes"})
+  private void rebuildReducedStop(Object ctx, BracketState bs, int rest) {
+    try {
+      PendingTrade t = bs.trade;
+      cancelSingleOrder(ctx, bs.slRef);
+      Method mkStop = null;
+      for (Method m : ctx.getClass().getMethods())
+        if ("createStopOrder".equals(m.getName()) && m.getParameterCount() == 4) { mkStop = m; break; }
+      if (mkStop == null) {
+        logFile("rebuildReducedStop: createStopOrder(4) not found — THIS BRACKET UNPROTECTED, close manually");
+        sendMsg("{\"type\":\"order_error\",\"error\":\"stop rebuild failed — position unprotected, close manually\"}");
+        return;
+      }
+      boolean isLong    = "Long".equals(t.direction);
+      Object exitAction = Enum.valueOf((Class<Enum>) mkStop.getParameterTypes()[0], isLong ? "SELL" : "BUY");
+      Object gtc        = Enum.valueOf((Class<Enum>) mkStop.getParameterTypes()[1], "GTC");
+      Object newStop    = mkStop.invoke(ctx, exitAction, gtc,
+        toNum(mkStop.getParameterTypes()[2], rest), toNum(mkStop.getParameterTypes()[3], t.sl));
+      submitSingle(ctx, newStop);
+      bs.slRef = newStop;
+      bs.slQty = rest;
+      logFile("OCO stop REBUILT at " + t.sl + " for qty " + rest + " (bracket entry=" + t.entry + ")");
+      sendMsg("{\"type\":\"stop_reduced\",\"qty\":" + rest + "}");
+    } catch (Exception e) {
+      logFile("rebuildReducedStop FAILED: " + e.getMessage() + " — POSITION MAY BE UNPROTECTED");
+      sendMsg("{\"type\":\"order_error\",\"error\":" + jsonStr("stop rebuild failed: " + e.getMessage()) + "}");
+    }
+  }
+
+  /** Submit one order via whichever submitOrders overload the runtime exposes. */
+  private void submitSingle(Object ctx, Object order) throws Exception {
+    Method submit = null;
+    for (Method m : ctx.getClass().getMethods()) {
+      if (!"submitOrders".equals(m.getName())) continue;
+      if (submit == null) submit = m;
+      else if (m.getParameterCount() == 1 && m.getParameterTypes()[0].isArray()) submit = m;
+    }
+    if (submit == null) throw new Exception("submitOrders not found");
+    if (submit.getParameterCount() == 1 && submit.getParameterTypes()[0].isArray()) {
+      Object arr = Array.newInstance(submit.getParameterTypes()[0].getComponentType(), 1);
+      Array.set(arr, 0, order);
+      submit.invoke(ctx, new Object[]{arr});
+    } else {
+      submit.invoke(ctx, order);
+    }
+  }
+
+  /** Cancel exactly one order via cancelOrders(Order...) — never the whole book. */
+  private void cancelSingleOrder(Object ctx, Object order) {
+    if (order == null) return;
+    try {
+      for (Method m : ctx.getClass().getMethods()) {
+        if (!"cancelOrders".equals(m.getName()) || m.getParameterCount() != 1 || !m.getParameterTypes()[0].isArray()) continue;
+        Object arr = Array.newInstance(m.getParameterTypes()[0].getComponentType(), 1);
+        Array.set(arr, 0, order);
+        m.invoke(ctx, new Object[]{arr});
+        logFile("cancelSingleOrder OK: " + orderDesc(order));
+        return;
+      }
+      logFile("cancelSingleOrder: cancelOrders(Order[]) not found");
+    } catch (Exception e) { logFile("cancelSingleOrder FAILED: " + e.getMessage()); }
+  }
+
+  private int getPositionQty(Object ctx) {
+    try {
+      for (Method m : ctx.getClass().getMethods()) {
+        if (!"getPosition".equals(m.getName()) || m.getParameterCount() != 0) continue;
+        Object v = m.invoke(ctx);
+        if (v instanceof Number) return ((Number) v).intValue();
+      }
+    } catch (Exception ignored) {}
+    return Integer.MIN_VALUE;
+  }
+
+  private static boolean sameOrder(Object a, Object b) {
+    if (a == null || b == null) return false;
+    if (a == b) return true;
+    String ia = orderId(a), ib = orderId(b);
+    return ia != null && ia.equals(ib);
+  }
+
+  private static String orderId(Object o) {
+    try {
+      Object v = o.getClass().getMethod("getOrderId").invoke(o);
+      return v == null ? null : v.toString();
+    } catch (Exception e) { return null; }
+  }
+
+  private static String orderDesc(Object o) {
+    if (o == null) return "null";
+    StringBuilder sb = new StringBuilder(o.getClass().getSimpleName());
+    sb.append(" id=").append(orderId(o));
+    for (String g : new String[]{"getQuantity","getFilled","getAvgFillPrice"}) {
+      try { sb.append(" ").append(g.substring(3)).append("=").append(o.getClass().getMethod(g).invoke(o)); }
+      catch (Exception ignored) {}
+    }
+    return sb.toString();
+  }
+
+  private void clearBracketState() {
+    brackets.clear();
+    trailerBracket = null;
   }
 
   @Override
@@ -194,8 +461,7 @@ public class AutoTrader extends Study {
 
   private void placeOrder(Object ctx, PendingTrade trade) {
     try {
-      submitBracket(ctx, "Long".equals(trade.direction),
-        trade.contracts, trade.entry, trade.tp1, trade.tp2, trade.sl, trade.tp1Only, trade.useTrailer);
+      submitBracket(ctx, trade);
       // Arm the trailer state so onBarUpdate starts monitoring price
       if (trade.useTrailer) {
         activeTrailerTrade = trade;
@@ -293,9 +559,12 @@ public class AutoTrader extends Study {
    * loader mismatch that causes instanceof OrderContext to return false.
    */
   @SuppressWarnings({"unchecked","rawtypes"})
-  private void submitBracket(Object ctx, boolean isLong, int qty,
-                              double entry, double tp1, double tp2, double sl,
-                              boolean tp1Only, boolean useTrailer) throws Exception {
+  private void submitBracket(Object ctx, PendingTrade trade) throws Exception {
+    final boolean isLong     = "Long".equals(trade.direction);
+    final int     qty        = trade.contracts;
+    final double  entry      = trade.entry, tp1 = trade.tp1, tp2 = trade.tp2, sl = trade.sl;
+    final boolean tp1Only    = trade.tp1Only;
+    final boolean useTrailer = trade.useTrailer;
     Class<?> ctxCls = ctx.getClass();
 
     // Discover all needed methods by name — never load types by name since they
@@ -361,7 +630,13 @@ public class AutoTrader extends Study {
     Object mktQty = toNum(mktP[1], qty);
     Object tp1Arg = toNum(limitP[3], tp1);
 
+    // Fresh per-trade bracket record — refs assigned as each leg is created. Registered in
+    // `brackets` just before submit so the first fill callback can find it. Other concurrent
+    // brackets are untouched.
+    final BracketState bs = new BracketState(trade);
+
     Object entryOrder = mkMkt.invoke(ctx, entryAction, mktQty);
+    bs.entryRef = entryOrder;
 
     // Use stop-LIMIT order if available — caps fill slippage to STOP_SLIP_PTS beyond the SL.
     // Stop-market orders can fill several points past SL in fast markets; stop-limit prevents this.
@@ -384,6 +659,8 @@ public class AutoTrader extends Study {
       stopOrder = mkStop.invoke(ctx, exitAction, gtc, stopQty, slArg);
       logFile(String.format("Stop-MARKET order (fallback): stop=%.2f — slippage not bounded", sl));
     }
+    bs.slRef = stopOrder;
+    bs.slQty = qty;
 
     // Log which submitOrders we found
     Class<?>[] submitP = submit.getParameterTypes();
@@ -405,6 +682,8 @@ public class AutoTrader extends Study {
     } else if (tp1Only) {
       Object lmAll = toNum(limitP[2], qty);
       Object tp1OrderFull = mkLimit.invoke(ctx, exitAction, gtc, lmAll, tp1Arg);
+      bs.tp1Ref = tp1OrderFull;
+      bs.tp1Qty = qty;
       orders.add(tp1OrderFull);
       logFile(String.format("submitOrders tp1Only: %s entry=%.2f tp1=%.2f sl=%.2f qty=%d",
         isLong ? "LONG" : "SHORT", entry, tp1, sl, qty));
@@ -416,6 +695,10 @@ public class AutoTrader extends Study {
       Object tp2Arg = toNum(limitP[3], tp2);
       Object tp1Order = mkLimit.invoke(ctx, exitAction, gtc, lmHalf, tp1Arg);
       Object tp2Order = mkLimit.invoke(ctx, exitAction, gtc, lmRest, tp2Arg);
+      bs.tp1Ref = tp1Order;
+      bs.tp1Qty = half;
+      bs.tp2Ref = tp2Order;
+      bs.tp2Qty = rest > 0 ? rest : half;
       orders.add(tp1Order);
       orders.add(tp2Order);
       logFile(String.format("submitOrders: %s entry=%.2f tp1=%.2f tp2=%.2f sl=%.2f qty=%d",
@@ -426,15 +709,25 @@ public class AutoTrader extends Study {
     Object ordersArr = Array.newInstance(orderCls, orders.size());
     for (int i = 0; i < orders.size(); i++) Array.set(ordersArr, i, orders.get(i));
 
-    if (submitP.length == 1 && submitP[0].isArray()) {
-      // submitOrders(Order[]) or submitOrders(Order...) — pass array as single arg
-      // new Object[]{ordersArr} prevents reflection from spreading Order[] as individual args
-      submit.invoke(ctx, new Object[]{ordersArr});
-    } else {
-      // submitOrders(Order, Order, ...) — pass individually
-      submit.invoke(ctx, orders.toArray());
+    // Register the bracket BEFORE submit so a same-thread fill callback can find it;
+    // deregister if the submit itself fails.
+    brackets.add(bs);
+    if (useTrailer) trailerBracket = bs;
+    try {
+      if (submitP.length == 1 && submitP[0].isArray()) {
+        // submitOrders(Order[]) or submitOrders(Order...) — pass array as single arg
+        // new Object[]{ordersArr} prevents reflection from spreading Order[] as individual args
+        submit.invoke(ctx, new Object[]{ordersArr});
+      } else {
+        // submitOrders(Order, Order, ...) — pass individually
+        submit.invoke(ctx, orders.toArray());
+      }
+    } catch (Exception e) {
+      brackets.remove(bs);
+      if (trailerBracket == bs) trailerBracket = null;
+      throw e;
     }
-    logFile("submitOrders() OK");
+    logFile("submitOrders() OK (" + brackets.size() + " bracket(s) tracked)");
   }
 
   /** Convert a numeric value to exactly the primitive type the method parameter expects. */
@@ -504,6 +797,8 @@ public class AutoTrader extends Study {
       Object exitAction = Enum.valueOf((Class<Enum>) actionCls, isLong ? "SELL" : "BUY");
       Object qtyArg     = toNum(mkMkt.getParameterTypes()[1], trade.contracts);
       Object exitOrder  = mkMkt.invoke(ctx, exitAction, qtyArg);
+      BracketState tb = trailerBracket;
+      if (tb != null) tb.trailExitRef = exitOrder; // so onOrderFilled flattens this bracket when it fills
 
       Class<?> orderCls  = mkMkt.getReturnType();
       Object   ordersArr = Array.newInstance(orderCls, 1);
@@ -583,6 +878,10 @@ public class AutoTrader extends Study {
       }
       logFile(String.format("Native trailing stop submitted: trail=%.2f activation=%.2f",
         trade.trailingOffset, currentPrice));
+      // The trailing stop REPLACES the fixed SL — cancel it, or two full-qty stops work
+      // simultaneously and the survivor re-opens a position after the other fills.
+      BracketState tb2 = trailerBracket;
+      if (tb2 != null) { cancelSingleOrder(ctx, tb2.slRef); tb2.slRef = trailOrder; }
       sendMsg(String.format(
         "{\"type\":\"trailer_armed\",\"activation\":%.2f,\"trail\":%.2f,\"native\":true}",
         currentPrice, trade.trailingOffset));
@@ -618,8 +917,8 @@ public class AutoTrader extends Study {
   private void handleMessage(String json) {
     logFile("Recv: " + json.substring(0, Math.min(json.length(), 120)));
     if (json.contains("reset_flag")) {
-      pendingTrade.set(null);
-      logFile("pending trade cleared by app");
+      pendingTrades.clear();
+      logFile("pending trade queue cleared by app");
       sendMsg("{\"type\":\"flag_reset\"}");
       return;
     }
@@ -648,9 +947,9 @@ public class AutoTrader extends Study {
     // OrderContext is only valid on MotiveWave's own callback threads (onBarUpdate, onBarClose,
     // onBarOpen, onActivate). Calling submitOrders from a cached ref on the WS thread causes
     // MotiveWave to reject with "Order can be placed by administrators only".
-    pendingTrade.set(trade);
-    logFile("Trade queued — waiting for OrderContext callback (onActivate/onBarClose/etc)");
-    sendMsg(String.format("{\"type\":\"order_queued\",\"direction\":\"%s\",\"entry\":%.2f}", direction, entry));
+    pendingTrades.add(trade);
+    logFile("Trade queued (" + pendingTrades.size() + " in queue) — waiting for OrderContext callback");
+    sendMsg(String.format("{\"type\":\"order_queued\",\"direction\":\"%s\",\"entry\":%.2f,\"queued\":%d}", direction, entry, pendingTrades.size()));
   }
 
   private void sendMsg(String msg) {

@@ -22,4 +22,12 @@ export const Ico = {
   info: (p?: IcoProps) => (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><circle cx="12" cy="12" r="9" /><path d="M12 11v5" /><path d="M12 7.5h.01" /></svg>
   ),
+  // LEDGER (2026-08-02): ruled account book — the forward-validation Ledger tab.
+  ledger: (p?: IcoProps) => (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M5 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5z" /><path d="M5 4v16" /><path d="M9 9h6M9 12.5h6M9 16h4" /></svg>
+  ),
+  // JOURNAL (2026-08-07): open notebook — the daily trading-journal tab.
+  journal: (p?: IcoProps) => (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M12 5c-1.6-1.2-3.6-1.8-6-1.8V19c2.4 0 4.4.6 6 1.8 1.6-1.2 3.6-1.8 6-1.8V3.2c-2.4 0-4.4.6-6 1.8z" /><path d="M12 5v15.8" /></svg>
+  ),
 };

@@ -41,20 +41,29 @@ export function isRTH(timestampSec: number): boolean {
   return etMins >= 9 * 60 + 30 && etMins < 17 * 60; // 9:30 AM – 5:00 PM ET
 }
 
-/** Returns the Unix timestamp of 21:00 UTC (RTH close) on the same calendar day as `ts`. */
+// DST-safe ET calendar-day anchor: unix seconds of a wall-clock time (h:min) on the ET day of `ts`.
+function etWallSecOfDay(ts: number, h: number, min: number): number {
+  const [y, mo, d] = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" })
+    .format(new Date(ts * 1000)).split("-").map(Number);
+  const edt = Date.UTC(y, mo - 1, d, h + 4, min, 0) / 1000; // assume EDT (UTC-4)
+  const wallH = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false }).format(new Date(edt * 1000)));
+  return wallH === h ? edt : Date.UTC(y, mo - 1, d, h + 5, min, 0) / 1000; // else EST (UTC-5)
+}
+
+/** Unix ts of the 5:00 PM ET RTH close on the ET calendar day of `ts` (DST-safe). */
 export function rthCloseOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 21 * 3600;
+  return etWallSecOfDay(ts, 17, 0);
 }
 
-/** Returns the Unix timestamp of 20:30 UTC (4:30 PM EDT / CME settlement) on the same calendar day as `ts`.
- *  Milk zones are scoped to the regular session and must end at market close (4:30 PM ET). */
+/** Unix ts of the 5:00 PM ET session settle / force-close on the ET calendar day of `ts` (DST-safe).
+ *  Moved 4:30 PM → 5:00 PM ET with the new signal model. */
 export function rthSettleOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 20 * 3600 + 30 * 60;
+  return etWallSecOfDay(ts, 17, 0);
 }
 
-/** Returns the Unix timestamp of 13:30 UTC (9:30 AM ET / RTH open) on the same calendar day as `ts`. */
+/** Unix ts of the 9:30 AM ET RTH open on the ET calendar day of `ts` (DST-safe). */
 export function rthOpenOfDay(ts: number): number {
-  return Math.floor(ts / 86400) * 86400 + 13 * 3600 + 30 * 60;
+  return etWallSecOfDay(ts, 9, 30);
 }
 
 // ── Vector computation ────────────────────────────────────────────────────────
@@ -100,15 +109,14 @@ export function detectMilkZones(candles: CandleBar[], historyBars = 234, display
   const rth = [...candles].sort((a, b) => a.time - b.time).filter(c => c.rth !== false);
   const zones: ZoneBand[] = [];
 
-  const lastRthBarBefore430 = new Map<number, number>();
+  const lastRthBarBeforeClose = new Map<number, number>();
   for (const c of rth) {
-    const secsIntoDay = c.time % 86400;
-    if (secsIntoDay >= 20 * 3600 + 30 * 60) continue;
+    if (c.time > rthCloseOfDay(c.time)) continue; // skip bars after 5:00 PM ET close
     const day = Math.floor(c.time / 86400);
-    lastRthBarBefore430.set(day, c.time);
+    lastRthBarBeforeClose.set(day, c.time);
   }
   const sessionEndOf = (ts: number): number =>
-    lastRthBarBefore430.get(Math.floor(ts / 86400)) ?? rthSettleOfDay(ts);
+    lastRthBarBeforeClose.get(Math.floor(ts / 86400)) ?? rthSettleOfDay(ts);
 
   const atrAt = (i: number): number => {
     let s = 0, n = 0;

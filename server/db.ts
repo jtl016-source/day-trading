@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "@shared/schema";
 import path from "path";
+import { isMainThread } from "worker_threads";
 
 // DB lives at <projectRoot>/data/app.db. Resolve from cwd — both `npm run dev` (tsx) and the
 // production `node dist/index.cjs` are launched from the project root — with a DB_PATH env
@@ -20,6 +21,12 @@ const sqlite = new Database(DB_PATH);
 // WAL mode for better concurrent read performance
 sqlite.pragma("journal_mode = WAL");
 sqlite.pragma("synchronous = NORMAL");
+// Explicit write-lock tolerance (2026-07-30). This matches better-sqlite3's constructor default
+// (timeout: 5000 → busy_timeout 5000) but is pinned here so it can never regress silently:
+// the regen harness (scripts/fact-engine-backtest.ts --persist) and backfill scripts open their
+// OWN write connections on this file, and without a busy_timeout a colliding write lock surfaces
+// as an instant SQLITE_BUSY 500 instead of a short wait. Readers never block writers under WAL.
+sqlite.pragma("busy_timeout = 5000");
 
 // Create tables if they don't exist (idempotent, runs synchronously on startup)
 sqlite.exec(`
@@ -67,6 +74,12 @@ sqlite.exec(`
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS push_tokens (
+    token      TEXT PRIMARY KEY,
+    platform   TEXT,
+    created_at INTEGER,
+    last_seen  INTEGER
+  );
   CREATE TABLE IF NOT EXISTS signal_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -77,7 +90,7 @@ sqlite.exec(`
     signal_type TEXT,
     entry REAL NOT NULL,
     tp1 REAL NOT NULL,
-    tp2 REAL NOT NULL,
+    tp2 REAL,            -- TP1-ONLY policy (2026-08-13): null = one target only (all new rows)
     sl REAL NOT NULL,
     outcome TEXT,
     pattern_bars INTEGER,
@@ -156,6 +169,36 @@ try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN footprint_reading TEXT`
 // PC↔iPhone parity: persist the confirmation breakdown so the phone shows the same
 // MilkZone/Vector/Footprint chips the PC computed (idempotent).
 try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN confirmations TEXT`); } catch {}
+// FACT-ENGINE: composite fact-list label (replaces tier badge in the Signals UI) — additive (idempotent).
+try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN label TEXT`); } catch {}
+// BACKTEST-GRADE EXIT DETAIL (2026-07-29): outcome + P&L per trade in the app, matching the
+// workbook — written by --persist and by the live outcome-resolution pass (idempotent).
+for (const col of [
+  "exit_price REAL",
+  "exit_ts INTEGER",
+  "points_result REAL",
+  "mae REAL",
+  "mfe REAL",
+  "bars_to_exit INTEGER",
+]) {
+  try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN ${col}`); } catch {}
+}
+// RISK DISPLAY (2026-07-30): display-only per-signal risk info — the fire-time canonical
+// fact-family combo key (quality-gate comboKeyOf, e.g. "FG+Fr+YB") + the situational risk
+// flags as a JSON string array (shared/fact-engine computeRiskFlags). Written by the live
+// engine POST, --persist, and the one-time analysis backfill. Additive (idempotent).
+for (const col of ["combo_key TEXT", "risk_flags TEXT"]) {
+  try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN ${col}`); } catch {}
+}
+// SOURCE PROVENANCE (2026-07-31): 'live' | 'regen' | NULL(legacy=regen) — live rows are
+// permanent (wipe-exempt, collision-yielding, source immutable once 'live'). Additive.
+try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN source TEXT`); } catch {}
+// POSITION SIZING (2026-08-02): engine-suggested contract count from the combo tier
+// (display/config-only — see shared/schema.ts). Additive (idempotent).
+try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN suggested_contracts INTEGER`); } catch {}
+// SHADOW TAGS (2026-10-01): record-only fire-time shadow-rule tags (JSON string array; NULL =
+// pre-feature row). Additive (idempotent) — see shared/schema.ts.
+try { sqlite.exec(`ALTER TABLE signal_history ADD COLUMN shadow_tags TEXT`); } catch {}
 
 // TRADE-JOURNAL: user trade log table
 sqlite.exec(`
@@ -229,6 +272,87 @@ sqlite.exec(`
   );
 `); // FOOTPRINT-STRATEGY:
 
+// YELLOW-BOX: per-trading-day walk-forward zone cache (GET /api/yellowbox/day-zones).
+// Completed days are IMMUTABLE (each day derived only from bars strictly before its own session),
+// so once a day's session has ended its row is frozen — warm requests read here in sub-ms without
+// touching cached_candles. `traded=0` marks a known non-trading weekday (holiday) so the endpoint
+// never re-scans bars for it. Today's/forming day is recomputed on request and NOT persisted here.
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS yellowbox_day_zones (
+    symbol          TEXT NOT NULL,
+    day_key         TEXT NOT NULL,
+    traded          INTEGER NOT NULL DEFAULT 1,
+    session_start   INTEGER,
+    session_end     INTEGER,
+    settle          REAL,
+    box_top         REAL,
+    box_bottom      REAL,
+    init_res        REAL,
+    init_sup        REAL,
+    max_range_up    REAL,
+    max_range_dn    REAL,
+    normal_range_dn REAL,
+    max_trend_up    REAL,
+    ver             INTEGER,
+    long_ave        REAL,
+    short_ave       REAL,
+    normal_range_up REAL,
+    bands           TEXT,
+    PRIMARY KEY (symbol, day_key)
+  );
+`); // YELLOW-BOX:
+// YELLOW-BOX v2 columns (idempotent — SQLite has no ADD COLUMN IF NOT EXISTS; the "duplicate
+// column" error on an already-migrated DB is expected and swallowed). `ver` is the cache-payload
+// version: rows whose ver != the server's YB_CACHE_VER are treated as uncached and regenerate.
+// v3 adds `import_hash` (hash of the mwml figure set the day's bands were built from — a new or
+// updated .mwml file changes the hash so affected days lazily regenerate instead of staying
+// frozen) and `low_conf` (day derived from <20 prior trading days — flagged in the payload).
+for (const col of [
+  "ver INTEGER", "long_ave REAL", "short_ave REAL", "normal_range_up REAL", "bands TEXT",
+  "import_hash TEXT", "low_conf INTEGER",
+]) {
+  try { sqlite.exec(`ALTER TABLE yellowbox_day_zones ADD COLUMN ${col}`); } catch { /* exists */ }
+}
+
+// CANDLE GRID GUARD: the single lowest-level cached_candles write backstop. Every INSERT —
+// drizzle, raw prepared statements, scripts, future code — passes through this BEFORE INSERT
+// trigger: a row whose timestamp is not aligned to its resolution grid (res minutes × 60) is
+// logged to candle_write_rejects and DROPPED (RAISE(IGNORE)), never stored. This is what killed
+// the Yahoo forming-bar snapshot rows (O=H=L=C V=0 stamped at the fetch wall-clock second).
+// NOTE on RAISE(IGNORE) semantics: it abandons the REMAINDER of the statement that fired the
+// trigger — for a multi-row INSERT the rows after the offending one are skipped too. Every bulk
+// write path therefore pre-filters off-grid rows in JS (validateBar / explicit % checks) so the
+// trigger only ever fires on single stray rows from future bugs. DROP+CREATE keeps the definition
+// current across deploys (idempotent).
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS candle_write_rejects (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    timestamp  INTEGER NOT NULL,
+    reason     TEXT NOT NULL,
+    seen_at    INTEGER NOT NULL
+  );
+`);
+// (2026-09-18) This module now also loads inside the live-engine WORKER thread (its own
+// connection). The DROP+CREATE below is only needed once per process start, and outside a
+// transaction it left a moment with NO grid guard while the main thread's writers were live —
+// so it runs on the main thread only, and atomically.
+if (isMainThread) sqlite.exec(`
+  BEGIN IMMEDIATE;
+  DROP TRIGGER IF EXISTS trg_cached_candles_grid_guard;
+  CREATE TRIGGER trg_cached_candles_grid_guard
+  BEFORE INSERT ON cached_candles FOR EACH ROW
+  WHEN NEW.resolution IN ('1','5','15','60')
+   AND (NEW.timestamp % (CAST(NEW.resolution AS INTEGER) * 60)) != 0
+  BEGIN
+    INSERT INTO candle_write_rejects (symbol, resolution, timestamp, reason, seen_at)
+    VALUES (NEW.symbol, NEW.resolution, NEW.timestamp, 'off-grid', strftime('%s','now'));
+    SELECT RAISE(IGNORE);
+  END;
+  COMMIT;
+`); // CANDLE GRID GUARD:
+
 // MW-SYNC: server-driven backfill bookkeeping tables (additive, idempotent — never drops data).
 // sync_state tracks the earliest/latest bar per (symbol, resolution) and the deep-history cap;
 // unfillable_ranges remembers ranges MW cannot supply so the auditor stops re-requesting them;
@@ -261,6 +385,86 @@ sqlite.exec(`
   );
 `); // MW-SYNC:
 
+// SHADOW EXITS (2026-10-01): per-fire alternative-exit records (server/shadow-exits.ts) — keyed by
+// the signal natural key × variant × mode. Record-only: nothing reads it for trading. Additive.
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS signal_shadow_exits (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT NOT NULL,
+    interval    TEXT NOT NULL,
+    timestamp   INTEGER NOT NULL,
+    direction   TEXT NOT NULL,
+    variant     TEXT NOT NULL,
+    mode        TEXT NOT NULL,
+    session     TEXT,
+    ref_entry   REAL NOT NULL,
+    ref_tp1     REAL NOT NULL,
+    ref_sl      REAL NOT NULL,
+    tp_price    REAL,
+    sl_price    REAL,
+    outcome     TEXT NOT NULL,
+    exit_reason TEXT,
+    exit_ts     INTEGER,
+    exit_price  REAL,
+    points      REAL,
+    mae         REAL,
+    mfe         REAL,
+    updated_at  TEXT DEFAULT (datetime('now')),
+    UNIQUE(symbol, interval, timestamp, direction, variant, mode)
+  );
+  CREATE INDEX IF NOT EXISTS idx_signal_shadow_exits_ts ON signal_shadow_exits(symbol, timestamp);
+  -- COVERING index for the pending-fire scan (shadow-exits.ts resolvePending): 371 ms → 28 ms
+  -- measured on a 5k-fire / 70k-row copy — without it every pass re-reads the table per fire.
+  CREATE INDEX IF NOT EXISTS idx_signal_shadow_exits_done ON signal_shadow_exits(
+    symbol, interval, timestamp, direction, variant, ref_entry, ref_tp1, ref_sl, outcome, exit_reason);
+`); // SHADOW EXITS:
+
+// SHADOW SCALPS (2026-10-06): record-only S1 ORB-30 / S2 yellow-box edge-fade trades + hour-matched
+// random nulls (server/shadow-scalps.ts) — the ONLY table that module writes. Additive.
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS shadow_scalps (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol       TEXT NOT NULL,
+    day_key      TEXT NOT NULL,
+    era          TEXT NOT NULL,
+    strategy     TEXT NOT NULL,
+    variant      TEXT NOT NULL,
+    direction    TEXT NOT NULL,
+    signal_ts    INTEGER NOT NULL,
+    seq          INTEGER NOT NULL DEFAULT 0,
+    cell         TEXT NOT NULL,
+    tp           REAL NOT NULL,
+    sl           REAL NOT NULL,
+    fill_model   TEXT NOT NULL,
+    level        REAL,
+    entry_ts     INTEGER NOT NULL,
+    entry_price  REAL NOT NULL,
+    tp_price     REAL NOT NULL,
+    sl_price     REAL NOT NULL,
+    outcome      TEXT NOT NULL,
+    exit_ts      INTEGER NOT NULL,
+    exit_price   REAL NOT NULL,
+    points       REAL NOT NULL,
+    minutes_held INTEGER NOT NULL,
+    run_at       INTEGER NOT NULL,
+    zone_state   TEXT,
+    zone_top     REAL,
+    zone_bottom  REAL,
+    UNIQUE(symbol, day_key, strategy, variant, direction, signal_ts, seq, cell, fill_model)
+  );
+  CREATE INDEX IF NOT EXISTS idx_shadow_scalps_day ON shadow_scalps(symbol, day_key);
+`); // SHADOW SCALPS:
+// zone_state ('cached' | 'pending' | 'none') + the RAW day box (zone_top / zone_bottom) the day's S2
+// rows were built from — S2 reads only a box FROZEN in yellowbox_day_zones; 'pending' days are re-run
+// once it is. Added after the table first shipped (empty) → idempotent ALTERs for an existing table.
+for (const col of ["zone_state TEXT", "zone_top REAL", "zone_bottom REAL"]) {
+  try { sqlite.exec(`ALTER TABLE shadow_scalps ADD COLUMN ${col}`); } catch { /* exists */ }
+}
+sqlite.exec(`
+  CREATE INDEX IF NOT EXISTS idx_shadow_scalps_era ON shadow_scalps(symbol, era, fill_model);
+  CREATE INDEX IF NOT EXISTS idx_shadow_scalps_zone ON shadow_scalps(symbol, zone_state, day_key);
+`); // SHADOW SCALPS: digest (live + pessimistic) and deferred-S2 retry reads
+
 // STORAGE FIX: Do NOT wipe cached_candles on startup.
 // MW's persistBulk/persistBar use onConflictDoUpdate — they overwrite individual rows when
 // MW re-syncs, so historical Polygon-downloaded data is never lost across server restarts.
@@ -268,3 +472,8 @@ sqlite.exec(`
 console.log("[db] cached_candles intact — historical data preserved across restarts");
 
 export const db = drizzle(sqlite, { schema });
+
+// RISK DISPLAY (2026-07-30): the raw better-sqlite3 handle, for read-only helpers that share
+// code with the backtest harness (shared/day-range-median.ts — the dead-tape baseline served
+// by GET /api/risk/combo-stats must be computed by the SAME implementation the harness uses).
+export const sqliteRaw = sqlite;

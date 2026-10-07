@@ -6,7 +6,7 @@ import { C } from "./terminalStyles";
 
 interface PriceLevel { price: number; bidVol: number; askVol: number; delta: number; imbalance: "buy" | "sell" | "none"; }
 interface FpCandle {
-  time: number; levels: PriceLevel[]; poc: number; candleDelta: number;
+  time: number; levels: PriceLevel[]; poc: number;
   totalBidVol: number; totalAskVol: number;
 }
 
@@ -50,7 +50,7 @@ export function FootprintPanel({ symbol, interval }: { symbol: string; interval:
     rows = sorted.slice(start, start + MAX_ROWS);
   }
   const maxVol = Math.max(1, ...rows.flatMap((l) => [l.bidVol, l.askVol]));
-  const delta = fc.candleDelta ?? (fc.totalAskVol - fc.totalBidVol);
+  const delta = fc.totalAskVol - fc.totalBidVol; // net delta computed from totals (rule 7: no delta field)
 
   return (
     <div className="tt-fp">
