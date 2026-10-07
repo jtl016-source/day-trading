@@ -54,6 +54,22 @@ export interface EngineGates {
   body?: boolean;
   /** Proxy-footprint delta agreement + divergence veto + exit adjustments. Default true. */
   footprint?: boolean;
+  /** Optional intraday ENTRY windows as UTC minutes-of-day, half-open [from, to).
+   *  Bars outside every window never fire (exits still walk forward normally).
+   *  Used by the 1m scalp component to trade only the kill zones. Default: none. */
+  entryWindowsUtc?: ReadonlyArray<readonly [number, number]>;
+  /** Session-VWAP side filter: Longs only above the running session VWAP,
+   *  Shorts only below it (VWAP resets at each RTH/ETH session start; bars
+   *  without volume fall back to equal weights). Default false. */
+  vwapSide?: boolean;
+  /** Minimum |close−open| / (high−low) of the signal bar (0–1). Rejects
+   *  doji-like "holds" with no conviction. Default 0 (off). */
+  minBodyFrac?: number;
+  /** Per-direction cooldown in bars of the trading interval. Default COOLDOWN_BARS (10). */
+  cooldownBars?: number;
+  /** Maximum high−low of the signal bar in points; wider bars are skipped
+   *  (a scalp stop sits inside normal bar noise otherwise). Default: none. */
+  maxRangePts?: number;
 }
 
 // ── Constants (identical to backtest.tsx) ─────────────────────────────────────
@@ -295,17 +311,27 @@ export function computeYellowBoxDisplayBands(candles: EngineCandle[], opts: Yell
  *  kept as an explicit ICT strategy component for backtesting/combos. */
 export const detectIctZones = detectMilkZones;
 
-// ── THE PROGRAM STRATEGY (optimized 2026-07-16, dual-interval 2026-07-17) ─────
+// ── THE PROGRAM STRATEGY (optimized 2026-07-16, dual-interval 2026-07-17, scalp 2026-10-07)
 // Winner of the 480-configuration train/test search (scripts/optimize-signals.ts):
 // ICT Zones + Candle Body during RTH. Entry rule: an RTH candle tests-and-holds
 // an ICT zone (FVG / Order Block / structural level, ±2 pts) AND closes in the
 // trade direction. No vector gate, no footprint gate. Baseline risk filters
 // (cooldown, HOD suppression, 60m declining veto, settlement skip) stay active.
 //
-// The strategy trades TWO intervals, each with its own grid-calibrated exits
-// (both validated on an untouched test window):
+// The strategy trades THREE intervals, each with its own grid-calibrated exits
+// (each validated on an untouched test window):
 //   15m: TP1 +8 / TP2 +16 / SL −4  → +412 pts @ 52.5% WR on the benchmark month
 //   5m:  TP1 +4 / TP2 +8  / SL −4  → +332 pts @ 58.3% WR (test window 60.7% WR)
+//   1m SCALP: TP1 +4 / TP2 +6 / SL −4 on 1m RTH bars, same entry rule PLUS the
+//        scalp filters in OPTIMIZED_GATES_1M (see below). Calibrated 2026-10-07
+//        by scripts/calibrate-scalp.ts on 28 days of 1m MES data (3,840 configs,
+//        train 19 d / test 9 d), ranked on the PESSIMISTIC walk-forward (a bar
+//        spanning both TP and SL = loss) net of 0.75 pt/trade costs:
+//        train 84 trades 64.3% WR +55 net · test 40 trades 62.5% WR +24 net ·
+//        full 124 trades 63.7% WR, +172 pts pessimistic, +79 net (+110 @ 0.5 pt).
+//        SL 3 and TP2 8 neighbours validate too (stable, not a spike). Sub-3-pt
+//        targets do NOT survive MES costs; the afternoon 14:00–15:00 window and
+//        the unfiltered rule (19 signals/day) were net losers — hence the filters.
 // The 15m exits on 5m bars were re-tested and FAIL (+56 pts @ 34.9%) — never
 // share exit parameters across intervals.
 export const OPTIMIZED_GATES: EngineGates = { vector: false, zone: "required", body: true, footprint: false };
@@ -318,20 +344,60 @@ export const OPTIMIZED_EXITS_5M: ExitProfile = {
   eth: { tp1Safe: 2.4, tp1: 2.4, tp2: 4.8, sl: 2.4 }, // unused (RTH-only strategy)
 };
 
-export type OptimizedInterval = "5m" | "15m";
-export const OPTIMIZED_INTERVALS: ReadonlyArray<{ sec: number; label: OptimizedInterval; exits: ExitProfile }> = [
-  { sec: 300, label: "5m",  exits: OPTIMIZED_EXITS_5M },
-  { sec: 900, label: "15m", exits: OPTIMIZED_EXITS },
+// ── 1m SCALP component ────────────────────────────────────────────────────────
+// Entry window (fixed-UTC like isRTH, no DST shift): the opening drive only,
+// 09:30–11:00 ET. The 14:00–15:00 ET window and midday both tested negative.
+export const SCALP_WINDOWS_UTC: ReadonlyArray<readonly [number, number]> = [
+  [13 * 60 + 30, 15 * 60], // 09:30–11:00 ET
 ];
+export const SCALP_MAX_RANGE_PTS = 3; // signal bar must be ≤ 3 pts high-to-low
+/** Scalp gates = program gates + kill-zone window + session-VWAP side filter
+ *  (longs above / shorts below VWAP) + narrow signal bar. Each filter roughly
+ *  halves the trade count; together they turn a net-losing 19-signals/day rule
+ *  into ~6 validated signals/day. */
+export const OPTIMIZED_GATES_1M: EngineGates = {
+  ...OPTIMIZED_GATES,
+  entryWindowsUtc: SCALP_WINDOWS_UTC,
+  vwapSide: true,
+  maxRangePts: SCALP_MAX_RANGE_PTS,
+};
+export const OPTIMIZED_EXITS_1M: ExitProfile = {
+  rth: { tp1Safe: 4,   tp1: 4,   tp2: 6,   sl: 4 },
+  eth: { tp1Safe: 2.4, tp1: 2.4, tp2: 3.6, sl: 2.4 }, // unused (RTH-only strategy)
+};
+
+export type OptimizedInterval = "1m" | "5m" | "15m";
+export const OPTIMIZED_INTERVALS: ReadonlyArray<{ sec: number; label: OptimizedInterval; exits: ExitProfile; gates: EngineGates }> = [
+  { sec: 60,  label: "1m",  exits: OPTIMIZED_EXITS_1M, gates: OPTIMIZED_GATES_1M },
+  { sec: 300, label: "5m",  exits: OPTIMIZED_EXITS_5M, gates: OPTIMIZED_GATES },
+  { sec: 900, label: "15m", exits: OPTIMIZED_EXITS,    gates: OPTIMIZED_GATES },
+];
+/** Exits + gates for one program interval (backtest page, scripts). */
+export function optimizedConfigFor(interval: OptimizedInterval) {
+  return OPTIMIZED_INTERVALS.find(x => x.label === interval)!;
+}
 
 export type OptimizedSignal = EngineSignal & { interval: OptimizedInterval };
 
-/** Compute THE program's signals from any candle set at 5m resolution or finer.
- *  For each trading interval (5m and 15m) the candles are aggregated (idempotent
- *  for matching input), ICT zones are detected, and the engine runs RTH-only
- *  with the optimized gates and that interval's exits. Results are tagged with
- *  their interval and merged chronologically. Every surface (chart, signals
- *  tab, backtest, notifications, auto-trade) calls this. */
+/** Native bar spacing of a sorted candle array: the smallest positive delta
+ *  between consecutive bars (scanned over the first 200). Infinity when unknown. */
+export function nativeIntervalSec(sorted: EngineCandle[]): number {
+  let min = Infinity;
+  for (let i = 1; i < Math.min(sorted.length, 200); i++) {
+    const d = sorted[i].time - sorted[i - 1].time;
+    if (d > 0 && d < min) min = d;
+  }
+  return min;
+}
+
+/** Compute THE program's signals from any candle set. For each trading interval
+ *  (1m scalp, 5m, 15m) the candles are aggregated (idempotent for matching
+ *  input), ICT zones are detected, and the engine runs RTH-only with that
+ *  interval's gates and exits. A component whose interval is FINER than the
+ *  input's native resolution is skipped (5m bars cannot be disaggregated into
+ *  1m scalps), so callers may pass their best-available dataset. Results are
+ *  tagged with their interval and merged chronologically. Every surface
+ *  (chart, signals tab, backtest, notifications, auto-trade) calls this. */
 export function computeOptimizedSignals(
   candles: EngineCandle[],
   nowSec: number = Math.floor(Date.now() / 1000),
@@ -343,20 +409,22 @@ export function computeOptimizedSignals(
 }
 
 /** One trading interval of THE program strategy. `candles` must be at that
- *  interval's resolution or finer (5m bars for the 5m component; 5m or 15m
- *  bars for the 15m component — aggregation is idempotent for matching input).
- *  Used by market.tsx, which has different best-available datasets per chart
- *  interval (e.g. the 15m chart's main dataset cannot be disaggregated to 5m). */
+ *  interval's resolution or finer (1m bars for the scalp component; 5m bars for
+ *  the 5m component; 5m or 15m bars for the 15m component — aggregation is
+ *  idempotent for matching input). Coarser input returns [] instead of
+ *  mislabeled signals. Used by market.tsx, which has different best-available
+ *  datasets per chart interval. */
 export function computeOptimizedSignalsForInterval(
   candles: EngineCandle[],
   interval: OptimizedInterval,
   nowSec: number = Math.floor(Date.now() / 1000),
 ): OptimizedSignal[] {
   if (!candles.length) return [];
-  const iv = OPTIMIZED_INTERVALS.find(x => x.label === interval)!;
+  const iv = optimizedConfigFor(interval);
   const agg = aggregateToInterval(candles, iv.sec);
+  if (nativeIntervalSec(agg) > iv.sec) return []; // input coarser than this component
   const zones = detectIctZones(agg);
-  return computeEngineSignals(agg, zones, iv.exits, "rth", OPTIMIZED_GATES, nowSec)
+  return computeEngineSignals(agg, zones, iv.exits, "rth", iv.gates, nowSec)
     .map(s => ({ ...s, interval: iv.label }));
 }
 
@@ -401,6 +469,11 @@ export function computeEngineSignals(
   const gZone      = gates.zone      ?? "tier";
   const gBody      = gates.body      ?? true;
   const gFootprint = gates.footprint ?? true;
+  const gWindows   = gates.entryWindowsUtc?.length ? gates.entryWindowsUtc : null;
+  const gVwap      = gates.vwapSide ?? false;
+  const gMinBody   = gates.minBodyFrac ?? 0;
+  const gCooldown  = gates.cooldownBars ?? COOLDOWN_BARS;
+  const gMaxRange  = gates.maxRangePts ?? Infinity;
 
   const sorted = [...candles].sort((a, b) => a.time - b.time);
   const vecMap = computeVectorLine(sorted);
@@ -470,6 +543,20 @@ export function computeEngineSignals(
     return { zonesActiveAt };
   });
 
+  // Session VWAP (per UTC day × RTH/ETH half), only when the gate is on
+  const vwapMap = new Map<number, number>();
+  if (gVwap) {
+    let key = "", pv = 0, vol = 0;
+    for (const c of sorted) {
+      const k = `${Math.floor(c.time / 86400)}_${isRTH(c.time) ? 1 : 0}`;
+      if (k !== key) { key = k; pv = 0; vol = 0; }
+      const v = c.volume && c.volume > 0 ? c.volume : 1;
+      pv += ((c.high + c.low + c.close) / 3) * v;
+      vol += v;
+      vwapMap.set(c.time, pv / vol);
+    }
+  }
+
   const exitProfile = profile[session];
   const signals: EngineSignal[] = [];
   let lastLongBar = -10, lastShortBar = -10;
@@ -481,6 +568,11 @@ export function computeEngineSignals(
     if (session === "eth" &&  rth) continue;
     // Skip CME settlement break (20:30–22:00 UTC) even in ETH mode
     if (new Date(c.time * 1000).getUTCHours() >= 20 && new Date(c.time * 1000).getUTCHours() < 22) continue;
+    if (gWindows) {
+      const d = new Date(c.time * 1000);
+      const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+      if (!gWindows.some(([a, b]) => mins >= a && mins < b)) continue;
+    }
     const lb     = vecMap.get(c.time);
     if (lb == null) continue;
     const prevLb = vecMap.get(sorted[i - 1].time);
@@ -512,11 +604,18 @@ export function computeEngineSignals(
     // 60m hard veto for longs
     const vec60mVetoed = get60mDecline(c.time);
 
+    // Scalp-style conviction/trend filters (off unless the gates enable them)
+    const range = c.high - c.low;
+    const bodyOk = (gMinBody <= 0 || (range > 0 ? Math.abs(c.close - c.open) / range >= gMinBody : false)) && range <= gMaxRange;
+    const vwap = gVwap ? vwapMap.get(c.time) : undefined;
+    const vwapLongOk  = !gVwap || (vwap != null && c.close > vwap);
+    const vwapShortOk = !gVwap || (vwap != null && c.close < vwap);
+
     // ── LONG ──────────────────────────────────────────────────────────────
     const longVecOk  = !gVector || (c.close > lb && (prevLb == null || lb >= prevLb));
     const longZoneOk = gZone === "required" ? allBullOk : true;
     const longBodyOk = !gBody || c.close >= c.open;
-    if (longVecOk && longZoneOk && longBodyOk && i - lastLongBar >= COOLDOWN_BARS && !nearHodLong && !vec60mVetoed) {
+    if (longVecOk && longZoneOk && longBodyOk && bodyOk && vwapLongOk && i - lastLongBar >= gCooldown && !nearHodLong && !vec60mVetoed) {
       // Require bullish close: bearish candles touching a zone are rejections, not bounces
       let fp: ReturnType<typeof analyzeFootprint> | null = null;
       if (gFootprint) {
@@ -548,7 +647,7 @@ export function computeEngineSignals(
     const shortVecOk  = !gVector || (c.close < lb && (prevLb == null || lb <= prevLb));
     const shortZoneOk = gZone === "off" ? true : gZone === "required" ? allBearOk : milkBearOk;
     const shortBodyOk = !gBody || c.close <= c.open;
-    if (shortZoneOk && shortVecOk && shortBodyOk && i - lastShortBar >= COOLDOWN_BARS) {
+    if (shortZoneOk && shortVecOk && shortBodyOk && bodyOk && vwapShortOk && i - lastShortBar >= gCooldown) {
       let fp: ReturnType<typeof analyzeFootprint> | null = null;
       if (gFootprint) {
         const fpCandle = buildProxyFootprintCandle(c);

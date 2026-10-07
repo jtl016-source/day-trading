@@ -60,18 +60,24 @@ MotiveWave (Java study)
 - Forward-fill coarser vectors onto finer chart times using `forwardFillVector(vec, chartTimes)`
 - Pre-allocate exactly 3 extra `LineSeries` at chart init — update data only, never add/remove
 
-### Signals — THE program strategy (optimized 2026-07-16, dual-interval 2026-07-17)
+### Signals — THE program strategy (optimized 2026-07-16, dual-interval 2026-07-17, scalp 2026-10-07)
 - ONE signal source for chart, Signals tab, backtest and notifications:
   `computeOptimizedSignals` in `client/src/lib/signal-engine.ts`
 - Rule: an RTH candle tests-and-holds an ICT zone (FVG/Order Block/structural, ±2 pts)
   AND closes in the trade direction. No vector gate, no footprint gate.
-- Trades TWO intervals, each with grid-calibrated exits (never share exits across intervals):
+- Trades THREE intervals, each with grid-calibrated exits (never share exits across intervals):
   · 15m: TP1 +8 / TP2 +16 / SL −4 (`OPTIMIZED_EXITS`)
   · 5m:  TP1 +4 / TP2 +8  / SL −4 (`OPTIMIZED_EXITS_5M`)
+  · 1m SCALP: TP1 +4 / TP2 +6 / SL −4 (`OPTIMIZED_EXITS_1M`) with extra gates in
+    `OPTIMIZED_GATES_1M`: entry window 09:30–11:00 ET only, longs above / shorts below
+    session VWAP, signal bar ≤ 3 pts. Calibrated by `scripts/calibrate-scalp.ts`
+    (pessimistic walk-forward, 0.75 pt/trade costs) — re-run it before changing anything
 - Signals are tagged with their interval; the auto-trader's "Trade on intervals"
-  setting (5m/15m checkboxes) gates which ones fire orders
-- The 5m strategy component needs ≤5m candles — the 15m chart's dataset is 15m,
-  so market.tsx sources the raw 5m fetch there (60m chart: background 15m fetch)
+  setting (1m/5m/15m checkboxes) gates which ones fire orders. 1m is OPT-IN for orders
+- Each component needs bars at its resolution or finer; `computeOptimizedSignalsForInterval`
+  returns [] for coarser input (5m bars can't make 1m scalps). market.tsx sources the 1m
+  scalp from the chart bars on the 1m chart, else the background 1m fetch; the 5m
+  component from the raw 5m fetch on the 15m chart (60m chart: background 15m fetch)
 - Cooldown: 10 bars between signals per direction (prevents clustering)
 - Baseline risk filters always on: HOD long suppression (5 pts), 60m declining-vector
   long veto, CME settlement-break skip, session-settle exits

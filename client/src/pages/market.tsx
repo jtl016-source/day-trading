@@ -774,8 +774,11 @@ export default function MarketPage() {
   const [autoTradeContracts, setAutoTradeContracts]     = useState(() => getPersistedSetting("autoTradeContracts", 1));
   const [autoTradeContractType, setAutoTradeContractType] = useState<"MES" | "ES">(() => getPersistedSetting<"MES"|"ES">("autoTradeContractType", "MES"));
   const [autoTradeRiskLevels, setAutoTradeRiskLevels]   = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeRiskLevels", ["safe"])));
-  // THE program strategy trades 5m and 15m — both enabled by default; the
-  // "Trade on intervals" setting below gates which ones auto-trade fires.
+  // THE program strategy trades 1m (scalp), 5m and 15m. 5m and 15m are enabled
+  // by default; the 1m scalp is OPT-IN for live orders (shipped 2026-10-07 on
+  // a single 28-day calibration — signals, notifications and Discord alerts
+  // still fire for it; only order placement is gated here). The "Trade on
+  // intervals" setting below gates which ones auto-trade fires.
   const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => {
     // One-time migration: builds before 2026-07-17 persisted ["5m"] as the
     // then-default, which silently blocks all 15m trades under the dual-interval
@@ -2191,23 +2194,32 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
     interval?: string;
   };
 
-  // ── Confluence signals — THE PROGRAM STRATEGY (optimized, dual-interval) ────
+  // ── Confluence signals — THE PROGRAM STRATEGY (optimized, tri-interval) ─────
   // ONE signal source for the whole app: the optimized engine strategy —
-  // ICT Zones + Candle Body during RTH, trading BOTH 5m (TP1 +4/TP2 +8/SL −4)
-  // and 15m (TP1 +8/TP2 +16/SL −4), each tagged with its interval so the
-  // auto-trader's "Trade on intervals" setting can gate which ones fire.
-  // Per-interval data sources: the 5m component needs ≤5m bars (the 15m chart's
-  // main dataset is already 15m and cannot be disaggregated, so it uses the raw
-  // 5m fetch; the 60m chart uses the bg15m query's raw 5m payload — the query's
-  // `candles` field is ALREADY aggregated to 15m and must not feed the 5m component).
+  // ICT Zones + Candle Body during RTH, trading the 1m SCALP (TP1 +4/TP2 +6/
+  // SL −4, 09:30–11:00 ET only, VWAP-side + narrow-bar filters), 5m (TP1 +4/
+  // TP2 +8/SL −4) and 15m (TP1 +8/TP2 +16/SL −4), each tagged with its interval
+  // so the auto-trader's "Trade on intervals" setting can gate which ones fire.
+  // Per-interval data sources: each component needs bars at ITS resolution or
+  // finer (the engine returns [] for coarser input rather than mislabeled
+  // signals). The 1m scalp uses the chart's own bars on the 1m chart and the
+  // background 1m fetch elsewhere (raw1mData as fallback while it loads). The
+  // 5m component needs ≤5m bars (the 15m chart's main dataset is already 15m
+  // and cannot be disaggregated, so it uses the raw 5m fetch; the 60m chart uses
+  // the bg15m query's raw 5m payload — the query's `candles` field is ALREADY
+  // aggregated to 15m and must not feed the 5m component).
   const allConfluenceSignals = useMemo((): CSig[] => {
+    const source1m: CandleBar[] =
+      interval === "1m" ? allBarsForVector
+      : (bg1mData?.candles ?? raw1mData?.candles ?? []);
     const source5m: CandleBar[] =
       interval === "1m" || interval === "5m" ? allBarsForVector
       : interval === "15m" ? (rawCandleData?.candles ?? [])
       : (bg15mData?.raw5m ?? bg15mData?.candles ?? []);
     const source15m: CandleBar[] = interval === "15m" ? allBarsForVector : source5m;
-    if (!source5m.length && !source15m.length) return [];
+    if (!source1m.length && !source5m.length && !source15m.length) return [];
     const engineSigs = [
+      ...computeOptimizedSignalsForInterval([...source1m].sort((a, b) => a.time - b.time), "1m"),
       ...computeOptimizedSignalsForInterval([...source5m].sort((a, b) => a.time - b.time), "5m"),
       ...computeOptimizedSignalsForInterval([...source15m].sort((a, b) => a.time - b.time), "15m"),
     ].sort((a, b) => a.time - b.time);
@@ -2220,7 +2232,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
       outcome: s.outcome,
       interval: s.interval,
     }));
-  }, [allBarsForVector, rawCandleData, bg15mData, interval]);
+  }, [allBarsForVector, rawCandleData, bg1mData, raw1mData, bg15mData, interval]);
 
   // Keep ref mirror in sync so the WS tick handler always has current signals
   useEffect(() => { confluenceSignalsRef.current = allConfluenceSignals; }, [allConfluenceSignals]);
@@ -2498,15 +2510,15 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
   };
 
   // Primary: watch allConfluenceSignals — fires the moment a new signal bar appears.
-  // Signals are grouped by THEIR OWN interval (5m/15m — the strategy's trading
-  // intervals), NOT the viewed chart interval, so the auto-trader's
-  // "Trade on intervals" setting gates exactly the trades the user selected.
-  // lastNotifiedRef + lastNotifiedRiskRef prevent any double-firing.
+  // Signals are grouped by THEIR OWN interval (1m scalp / 5m / 15m — the
+  // strategy's trading intervals), NOT the viewed chart interval, so the
+  // auto-trader's "Trade on intervals" setting gates exactly the trades the
+  // user selected. lastNotifiedRef + lastNotifiedRiskRef prevent any double-firing.
   useEffect(() => {
     if (!allConfluenceSignals.length) return;
     const nowSec = Math.floor(Date.now() / 1000);
-    for (const ivKey of ["5m", "15m"] as const) {
-      const ivSec = ivKey === "5m" ? 300 : 900;
+    for (const ivKey of ["1m", "5m", "15m"] as const) {
+      const ivSec = ivKey === "1m" ? 60 : ivKey === "5m" ? 300 : 900;
       // Check Long and Short independently — a recent Long must not block a Short (and vice-versa)
       for (const dir of ["Long", "Short"] as const) {
         const notifyKey = `${ivKey}_${dir}`;
@@ -3748,11 +3760,11 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                 ))}
               </div>
 
-              {/* Interval filter — the strategy trades 5m and 15m only */}
+              {/* Interval filter — the strategy trades 1m scalp, 5m and 15m */}
               <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals (strategy fires 5m &amp; 15m)</div>
+                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals (strategy fires 1m scalp, 5m &amp; 15m — 1m is opt-in)</div>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {(["5m", "15m"] as const).map(iv => (
+                  {(["1m", "5m", "15m"] as const).map(iv => (
                     <label key={iv} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
                       <input
                         type="checkbox"
@@ -3766,7 +3778,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
                         }}
                         style={{ accentColor: MW.accent }}
                       />
-                      <span style={{ fontSize: 11, color: MW.text }}>{iv}</span>
+                      <span style={{ fontSize: 11, color: MW.text }}>{iv === "1m" ? "1m scalp" : iv}</span>
                     </label>
                   ))}
                 </div>
