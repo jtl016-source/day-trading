@@ -742,7 +742,9 @@ export default function BacktestPage() {
 
         {/* Exit strategy — fixed by the optimized program strategy, per interval */}
         <span style={{ fontSize: 11, color: MW.muted, padding: "2px 8px", border: `1px solid ${MW.border}`, borderRadius: 4 }}>
-          {interval === "5m" ? "Exits: TP1 +4 · TP2 +8 · SL −4 (optimized 5m)" : "Exits: TP1 +8 · TP2 +16 · SL −4 (optimized 15m)"}
+          {interval === "1m" ? "Exits: TP1 +4 · TP2 +6 · SL −4 (1m scalp · 09:30–11:00 ET · VWAP side · bar ≤ 3 pts)"
+            : interval === "5m" ? "Exits: TP1 +4 · TP2 +8 · SL −4 (optimized 5m)"
+            : "Exits: TP1 +8 · TP2 +16 · SL −4 (optimized 15m)"}
         </span>
 
         {/* Session toggle — RTH / ETH */}

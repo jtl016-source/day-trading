@@ -73,7 +73,9 @@ MotiveWave (Java study)
     session VWAP, signal bar ≤ 3 pts. Calibrated by `scripts/calibrate-scalp.ts`
     (pessimistic walk-forward, 0.75 pt/trade costs) — re-run it before changing anything
 - Signals are tagged with their interval; the auto-trader's "Trade on intervals"
-  setting (1m/5m/15m checkboxes) gates which ones fire orders. 1m is OPT-IN for orders
+  setting (1m/5m/15m checkboxes) gates which ones fire orders. All three are MAIN
+  strategies, on by default (v3 settings migration adds "1m" to older persisted sets)
+- Strategy reference for humans/ML: `STRATEGIES.md` §4b (keep it in sync with the engine)
 - Each component needs bars at its resolution or finer; `computeOptimizedSignalsForInterval`
   returns [] for coarser input (5m bars can't make 1m scalps). market.tsx sources the 1m
   scalp from the chart bars on the 1m chart, else the background 1m fetch; the 5m

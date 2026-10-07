@@ -774,18 +774,22 @@ export default function MarketPage() {
   const [autoTradeContracts, setAutoTradeContracts]     = useState(() => getPersistedSetting("autoTradeContracts", 1));
   const [autoTradeContractType, setAutoTradeContractType] = useState<"MES" | "ES">(() => getPersistedSetting<"MES"|"ES">("autoTradeContractType", "MES"));
   const [autoTradeRiskLevels, setAutoTradeRiskLevels]   = useState<Set<string>>(() => new Set(getPersistedSetting<string[]>("autoTradeRiskLevels", ["safe"])));
-  // THE program strategy trades 1m (scalp), 5m and 15m. 5m and 15m are enabled
-  // by default; the 1m scalp is OPT-IN for live orders (shipped 2026-10-07 on
-  // a single 28-day calibration — signals, notifications and Discord alerts
-  // still fire for it; only order placement is gated here). The "Trade on
-  // intervals" setting below gates which ones auto-trade fires.
+  // THE program strategy trades three MAIN intervals — 1m scalp, 5m and 15m —
+  // all enabled by default. The "Trade on intervals" setting below gates which
+  // ones auto-trade fires.
   const [autoTradeIntervals, setAutoTradeIntervals]     = useState<Set<string>>(() => {
-    // One-time migration: builds before 2026-07-17 persisted ["5m"] as the
-    // then-default, which silently blocks all 15m trades under the dual-interval
-    // strategy. Re-seed to both intervals unless the settings carry the v2 flag
-    // (written on every persist below), so choices made after this ship stick.
-    if (!getPersistedSetting<boolean>("autoTradeIntervalsV2", false)) return new Set(["5m", "15m"]);
-    return new Set(getPersistedSetting<string[]>("autoTradeIntervals", ["5m", "15m"]));
+    // Versioned migrations (lesson 2026-08-06: when a persisted default changes
+    // meaning, migrate with a flag — never assume an old default is a user choice):
+    //  · v2 (2026-07-17): pre-dual-interval builds persisted ["5m"] as the
+    //    then-default, silently blocking all 15m trades → re-seed to 5m+15m.
+    //  · v3 (2026-10-07): the 1m scalp became a main strategy; sets persisted
+    //    before it existed can't contain "1m" → add it, keeping the user's
+    //    5m/15m choices. Both flags are written on every persist below.
+    const v2 = getPersistedSetting<boolean>("autoTradeIntervalsV2", false);
+    const v3 = getPersistedSetting<boolean>("autoTradeIntervalsV3", false);
+    if (!v2) return new Set(["1m", "5m", "15m"]);
+    const persisted = getPersistedSetting<string[]>("autoTradeIntervals", ["5m", "15m"]);
+    return new Set(v3 ? persisted : [...persisted, "1m"]);
   });
   const [autoTradeConnected, setAutoTradeConnected]     = useState(false);
   const [mwSyncStatus, setMwSyncStatus] = useState<"pending" | "syncing" | "done">("pending");
@@ -961,6 +965,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
         autoTradeRiskLevels: [...autoTradeRiskLevels],
         autoTradeIntervals:  [...autoTradeIntervals],
         autoTradeIntervalsV2: true,
+        autoTradeIntervalsV3: true,
         autoTradeTp1Only,
         autoTradeDirection,
         useTrailer,
@@ -3762,7 +3767,7 @@ const [showFpPanel, setShowFpPanel]                     = useState(false); // FO
 
               {/* Interval filter — the strategy trades 1m scalp, 5m and 15m */}
               <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals (strategy fires 1m scalp, 5m &amp; 15m — 1m is opt-in)</div>
+                <div style={{ fontSize: 10, color: MW.muted, marginBottom: 6 }}>Trade on intervals (strategy fires 1m scalp, 5m &amp; 15m)</div>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                   {(["1m", "5m", "15m"] as const).map(iv => (
                     <label key={iv} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>

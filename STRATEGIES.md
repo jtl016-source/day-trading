@@ -148,6 +148,70 @@ The milk zone filter removes signals where price is in a structural no-man's lan
 
 ---
 
+## 4b. THE Program Strategy — three main intervals (15m · 5m · 1m scalp)
+
+**This section supersedes §3/§4 for live signals.** Since 2026-07-16 every
+signal surface (chart, Signals tab, Backtest, notifications, auto-trade) runs
+`computeOptimizedSignals` in `client/src/lib/signal-engine.ts`. The entry rule
+is the same on all three intervals; exits and extra gates are per interval and
+must never be shared across intervals (the 15m exits on 5m bars lose money).
+
+**Entry rule (all intervals):** an RTH candle tests-and-holds an ICT zone
+(Fair Value Gap / Order Block / structural level, ±2 pts) AND closes in the
+trade direction. No vector gate, no footprint gate. Baseline filters always on:
+10-bar per-direction cooldown, HOD long suppression (5 pts), 60m
+declining-vector long veto, CME settlement-break skip, session-settle exits.
+
+| Interval | Role | TP1 | TP2 | SL | Extra gates | Validation |
+|---|---|---|---|---|---|---|
+| **15m** | swing-of-the-day | +8 | +16 | −4 | none | +412 pts @ 52.5% WR, benchmark month |
+| **5m** | intraday | +4 | +8 | −4 | none | +332 pts @ 58.3% WR (test 60.7%) |
+| **1m scalp** | opening-drive scalps | +4 | +6 | −4 | 09:30–11:00 ET window · VWAP side · bar ≤ 3 pts | 124 trades, 63.7% WR, +172 pts pessimistic, +79 net of costs (test +24) |
+
+### The 1m scalp (added 2026-10-07 — a main strategy, on by default)
+
+**What it is:** the program's entry rule applied to 1m RTH bars, restricted to
+the setups scalpers actually take. Three gates in `OPTIMIZED_GATES_1M` turn a
+net-losing 19-signals/day rule into ~6 validated signals/day:
+
+1. **Kill-zone window — 09:30 to 11:00 ET only.** The opening drive is where
+   1m structure resolves fast enough for a 4-pt target. The 14:00–15:00 ET
+   window and midday both tested net-negative and are excluded.
+2. **Session-VWAP side.** Longs only when the signal bar closes above the
+   running RTH VWAP, shorts only below it. Scalps go WITH the session's
+   value, never against it.
+3. **Narrow signal bar — high−low ≤ 3 pts.** A 4-pt stop placed off a 6-pt
+   bar sits inside normal noise; a tight test-and-hold bar means the zone
+   actually held.
+
+**Exits:** TP1 +4 / TP2 +6 / SL −4 (`OPTIMIZED_EXITS_1M`). Sub-3-pt targets
+were tested and never survive MES costs — on MES, "scalp" means the FILTERS are
+tight, not the targets.
+
+**How it was calibrated (`scripts/calibrate-scalp.ts`):** 28 days of 1m MES
+bars, 3,840 configurations, train 19 d / test 9 d, ranked on the PESSIMISTIC
+walk-forward (a bar that spans both TP and SL counts as a LOSS) net of
+0.75 pt/trade costs; a config only validates if train AND test are positive.
+Neighbouring configs (SL 3, TP2 8, TP1 3) also validate — not an isolated spike.
+What hurt on 1m: the vector gate, the proxy footprint gate, the afternoon window.
+Re-run the script before changing any of these numbers.
+
+**Where it shows up:** chart markers (snapped to the containing bar on coarser
+charts), the Signals tab (tagged `1m`), the Backtest page on the 1m interval,
+notifications and Discord. Auto-trade gates it with the "1m scalp" checkbox in
+"Trade on intervals" (on by default via the v3 settings migration).
+
+**Data requirement:** the scalp needs 1m bars. The engine returns nothing for
+coarser input (5m bars cannot be disaggregated), so market.tsx feeds it the
+chart's own bars on the 1m chart and the background 1m fetch everywhere else.
+
+**Caveat:** one month of 1m history is all Yahoo serves. Treat the scalp's
+numbers as one month of evidence and watch its live win rate against the
+63.7% calibration figure; sustained performance below ~55% is a signal to
+re-calibrate, not to widen the stop.
+
+---
+
 ## 5. Multi-Interval Vector System
 
 All four intervals are shown simultaneously on every chart:
